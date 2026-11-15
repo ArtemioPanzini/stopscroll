@@ -49,3 +49,21 @@ class CLITests(unittest.TestCase):
     def test_doctor_failure(self):
         with patch.object(cli,'exchange',return_value=dict(ok=True,checks=[dict(ok=False,name='dns',detail='сбой')])),contextlib.redirect_stdout(io.StringIO()) as out: self.assertEqual(cli.main(['doctor']),1)
         self.assertIn('СБОЙ',out.getvalue())
+
+    def test_remove_exception_command_and_confirmation(self):
+        args = ['remove-exception', 'youtube', 'https://accounts.youtube.com/path']
+        expected = dict(cmd='change', change=dict(kind='remove_exception', site='youtube', domain='accounts.youtube.com'))
+        self.assertEqual(cli.build_request(args), expected)
+        self.assertTrue(cli.needs_confirmation(args))
+        self.assertFalse(cli.needs_confirmation(args+['--yes']))
+        with patch.object(cli, 'exchange', return_value=dict(ok=True, applied=True, summary='removed')) as exchange, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(args+['--yes']), 0)
+        exchange.assert_called_once_with(expected)
+
+    def test_remove_exception_interactive_confirmation(self):
+        args = ['remove-exception', 'youtube', 'accounts.youtube.com']
+        for answer, expected_code in [('y', 0), ('n', 2)]:
+            with self.subTest(answer=answer), patch('sys.stdin.isatty', return_value=True), patch('builtins.input', return_value=answer), patch.object(cli, 'exchange', return_value=dict(ok=True, applied=True, summary='removed')) as exchange, contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(cli.main(args), expected_code)
+                self.assertIn('accounts.youtube.com', output.getvalue())
+                self.assertEqual(exchange.call_count, int(answer=='y'))

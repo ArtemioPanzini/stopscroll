@@ -36,3 +36,21 @@ Verification:
 - `python3 -m unittest tests.test_system tests.test_daemon tests.test_model tests.test_store -q`: 51 tests passed (GREEN).
 - `python3 -m unittest discover -s tests -q`: 129 tests passed, 0.748 seconds.
 - `git diff --check`: clean.
+
+## Owner-delegated accounting and minor interface decisions
+
+The controller conveyed explicit owner delegation to decide accounting, doctor behavior and exception removal autonomously. This supersedes the earlier pending-decision notes above.
+
+- Routine automatic expiry now charges through the scheduled end, avoiding an extra rounded budget minute for normal scheduler jitter. The Engine keeps one runtime-only previous tick observation; routine means matching boot identity, nonnegative wall and BOOTTIME gaps no greater than two seconds, and agreement within 0.25 seconds. A new Engine, changed boot identity, missed ticks, or wall-clock jump uses actual closure time, preserving genuine outage/overrun accounting. Manual closure behavior and persisted schema remain unchanged.
+- Doctor selects a currently blocked policy-site domain rather than assuming twitch.tv is always blocked. With an allowed pause or no closed policy-site domain, blocked_dns remains present and explicitly reports that it is not applicable. Normal DNS and direct DNS probes still run.
+- Added `stopscroll remove-exception SITE DOMAIN`, mapping to the existing immediate remove_exception change. Domain normalization, interactive confirmation and --yes use the existing tightening command path. Help and README document it and the accounting/doctor behavior. No installation-result section was added.
+
+RED/GREEN verification:
+- `python3 -m unittest tests.test_engine_sessions tests.test_doctor tests.test_cli -q` before implementation: 42 tests, 5 failures and 1 error. Confirmed scheduler jitter charged 120 instead of 60 seconds, doctor probed removed Twitch/failed during pause, and remove-exception was unavailable.
+- Same focused command after implementation: 42 tests passed.
+- Added short-overrun restart/boot-change and missed-tick boundary tests, plus no-policy-site doctor applicability coverage.
+- `python3 -m unittest tests.test_engine_sessions tests.test_engine_queue tests.test_doctor tests.test_cli -q`: 56 tests passed.
+- `python3 -m unittest discover -s tests -q`: 139 tests passed, 0.446 seconds. Existing downtime-at-T+1500 test remains passing.
+- `git diff --check`: clean.
+
+No live installation, state, services, browser acceptance, or active timed sessions were changed. The two-second routine threshold deliberately treats larger scheduler interruptions as overrun rather than silently forgiving them.

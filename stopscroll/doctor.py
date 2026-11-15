@@ -1,6 +1,8 @@
 """Read-only checks of the live DNS, firewall and browser policy setup."""
 import json
 import re
+import time
+from .blocklist import blocked_domains
 from .system import DNS_UNIT, FIREFOX_POLICY, CHROME_POLICIES
 
 
@@ -30,7 +32,16 @@ def run_checks(runner, state):
     except Exception as exc:
         for name in ('global_dns', 'link_dns'):
             checks.append(dict(name=name, ok=False, detail=f'Не удалось проверить системный DNS: {exc}'))
-    check('blocked_dns', lambda: runner.run(['resolvectl','query','twitch.tv']).returncode != 0, 'twitch.tv разрешается')
+    blocked = set(blocked_domains(state, time.time()))
+    # Probe policy sites, not permanent seed assumptions or service DoH domains.
+    domain = next((domain for site in state.sites.values() for domain in site.domains
+                   if domain in blocked and domain not in site.exceptions), None)
+    if domain is None:
+        checks.append(dict(name='blocked_dns', ok=True,
+                           detail='Не применяется: сейчас нет закрытого домена сайта'))
+    else:
+        check('blocked_dns', lambda: runner.run(['resolvectl','query',domain]).returncode != 0,
+              f'{domain} разрешается')
     check('normal_dns', lambda: runner.run(['resolvectl','query','example.com']).returncode == 0, 'example.com не разрешается')
     check('direct_dns', lambda: runner.run(['dig','+time=2','+tries=1','@1.1.1.1','example.com']).returncode != 0, 'Прямой DNS доступен')
     check('firewall', lambda: runner.run(['nft','list','table','inet','stopscroll']).returncode == 0, 'Нет таблицы inet stopscroll')

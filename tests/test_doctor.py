@@ -27,3 +27,30 @@ class DoctorTests(unittest.TestCase):
         def missing(*a,**kw): raise FileNotFoundError('нет команды')
         self.r.run=missing
         self.assertTrue(any(not c['ok'] for c in run_checks(self.r,self.state)))
+
+    def test_removed_seed_domain_uses_current_blocked_site(self):
+        del self.state.sites['twitch']
+        self.r.answers[('resolvectl', 'query', 'liquipedia.net')] = (1, '')
+        self.r.calls.clear()
+        checks = run_checks(self.r, self.state)
+        self.assertTrue(next(c for c in checks if c['name']=='blocked_dns')['ok'])
+        self.assertIn(['resolvectl', 'query', 'liquipedia.net'], self.r.calls)
+        self.assertNotIn(['resolvectl', 'query', 'twitch.tv'], self.r.calls)
+
+    def test_pause_marks_blocked_check_inapplicable_and_keeps_other_probes(self):
+        self.state.pause_until = 9999999999
+        self.r.answers[('resolvectl', 'query', 'twitch.tv')] = (0, '')
+        self.r.calls.clear()
+        result = next(c for c in run_checks(self.r, self.state) if c['name']=='blocked_dns')
+        self.assertTrue(result['ok'])
+        self.assertIn('Не применяется', result['detail'])
+        self.assertIn(['resolvectl', 'query', 'example.com'], self.r.calls)
+        self.assertTrue(any(call[0]=='dig' for call in self.r.calls))
+
+    def test_no_policy_sites_marks_blocked_probe_inapplicable(self):
+        self.state.sites.clear()
+        self.r.calls.clear()
+        result = next(c for c in run_checks(self.r, self.state) if c['name']=='blocked_dns')
+        self.assertTrue(result['ok'])
+        self.assertIn('Не применяется', result['detail'])
+        self.assertNotIn(['resolvectl', 'query', 'twitch.tv'], self.r.calls)

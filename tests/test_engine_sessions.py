@@ -127,3 +127,43 @@ class SessionTests(unittest.TestCase):
             'limited': [dict(site='youtube', open=True, ends=T+720, left_sec=719, spent_min=24, budget_min=45, bonus_min=0),
                         dict(site='x', open=False, ends=None, left_sec=0, spent_min=0, budget_min=30, bonus_min=0)],
             'pending': [], 'delay_min': 45, 'reset_hour': 4, 'pause_until': None})
+
+    def test_routine_expiry_jitter_charges_scheduled_minute(self):
+        self.e.open('youtube', 1, T)
+        self.e.tick(T+59, 59, 'b')
+        self.e.tick(T+60.01, 60.01, 'b')
+        self.assertEqual(self.st.spent_sec['youtube'], 60)
+
+    def test_restart_and_missed_ticks_still_charge_actual_overrun(self):
+        for restart, boot_id in ((False, 'b'), (True, 'b'), (False, 'new')):
+            with self.subTest(restart=restart, boot_id=boot_id):
+                self.setUp()
+                self.e.open('youtube', 1, T)
+                self.e.tick(T+59, 59, 'b')
+                if restart:
+                    self.e = Engine(self.st, timezone.utc)
+                self.e.tick(T+120.01, 120.01, boot_id)
+                self.assertEqual(self.st.spent_sec['youtube'], 180)
+
+    def test_clock_jump_is_not_mistaken_for_routine_jitter(self):
+        self.e.open('youtube', 1, T)
+        self.e.tick(T-3600, 59, 'b')
+        self.e.tick(T+60.01, 60.01, 'b')
+        self.assertEqual(self.st.spent_sec['youtube'], 120)
+
+    def test_restart_or_boot_change_does_not_forgive_short_overrun(self):
+        for restart in (True, False):
+            with self.subTest(restart=restart):
+                self.setUp()
+                self.e.open('youtube', 1, T)
+                self.e.tick(T+59, 59, 'b')
+                if restart:
+                    self.e = Engine(self.st, timezone.utc)
+                self.e.tick(T+60.01, 60.01, 'b' if restart else 'new')
+                self.assertEqual(self.st.spent_sec['youtube'], 120)
+
+    def test_missed_ticks_near_deadline_keep_actual_accounting(self):
+        self.e.open('youtube', 1, T)
+        self.e.tick(T+57, 57, 'b')
+        self.e.tick(T+60.01, 60.01, 'b')
+        self.assertEqual(self.st.spent_sec['youtube'], 120)

@@ -11,7 +11,8 @@ from .daemon import SOCKET
 from .changes import normalize_domain, ChangeError, SITE_RE
 
 HELP = '''Использование: stopscroll [status | doctor | open САЙТ [МИНУТЫ] | close САЙТ |
-  block САЙТ [ДОМЕН ...] | limit САЙТ МИНУТЫ | delay МИНУТЫ | cancel НОМЕР |
+  block САЙТ [ДОМЕН ...] | remove-exception САЙТ ДОМЕН |
+  limit САЙТ МИНУТЫ | delay МИНУТЫ | cancel НОМЕР |
   request budget САЙТ МИНУТЫ | request bonus САЙТ МИНУТЫ |
   request unblock САЙТ [ДОМЕН] | request limit САЙТ МИНУТЫ |
   request except САЙТ ДОМЕН | request delay МИНУТЫ |
@@ -37,7 +38,7 @@ def _number(text, maximum=1440):
 def build_request(argv, known=None):
     args = list(argv)
     if '--yes' in args:
-        if args.count('--yes') > 1 or not args or args[0] not in ('block','limit','delay'):
+        if args.count('--yes') > 1 or not args or args[0] not in ('block','limit','delay','remove-exception'):
             _bad()
         args.remove('--yes')
     if not args:
@@ -61,6 +62,8 @@ def build_request(argv, known=None):
             change=dict(kind='add_domain',site=a[0],domain=a[1])
         else:
             change=dict(kind='add_site',site=a[0],domains=a[1:],mode='blocked',budget_min=0)
+    elif cmd=='remove-exception' and len(a)==2:
+        change=dict(kind='remove_exception',site=a[0],domain=a[1])
     elif cmd=='limit' and len(a)==2:
         change=dict(kind='set_budget',site=a[0],minutes=_number(a[1]))
     elif cmd=='delay' and len(a)==1:
@@ -97,7 +100,7 @@ def build_request(argv, known=None):
 
 
 def needs_confirmation(argv):
-    return bool(argv) and argv[0] in ('block','limit','delay') and '--yes' not in argv
+    return bool(argv) and argv[0] in ('block','limit','delay','remove-exception') and '--yes' not in argv
 
 
 def _hm(stamp,tz):
@@ -143,6 +146,7 @@ def render_reply(req,reply,tz=None):
 def _describe(change):
     site=change.get('site','')
     kind=change['kind']
+    if kind=='remove_exception': return f"{site}: исключение {change['domain']} будет удалено; домен подпадает под блокировку сайта."
     if kind=='set_delay': return f"Задержка на ослабление станет {change['minutes']} мин."
     if kind=='set_budget': return f"{site}: дневной бюджет станет {change['minutes']} мин."
     if kind=='set_mode': return f"{site}: сайт будет закрыт без лимита."

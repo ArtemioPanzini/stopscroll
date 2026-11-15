@@ -10,6 +10,7 @@ from . import changes
 from .model import Pending, Session, State
 
 WARN_BEFORE_SEC = 120
+ROUTINE_TICK_GAP_SEC = 2.0
 
 
 class EngineError(Exception):
@@ -27,6 +28,7 @@ class Engine:
     def __init__(self, state: State, tz: tzinfo | None = None):
         self.state = state
         self.tz = tz
+        self._last_tick = None
 
     def _site(self, site):
         if site not in self.state.sites:
@@ -81,6 +83,17 @@ class Engine:
         return [Event('session_closed', site, f'{site}: {reasons.get(reason, "отрезок закрыт")}')]
 
     def tick(self, now: float, boot: float, boot_id: str) -> list[Event]:
+        # Only observations from this live Engine can establish routine ticking.
+        # Restart, missed ticks and clock jumps retain actual overrun accounting.
+        previous = self._last_tick
+        routine = False
+        if previous is not None:
+            wall_gap, boot_gap = now - previous[0], boot - previous[1]
+            routine = (boot_id == previous[2] and
+                       0 <= boot_gap <= ROUTINE_TICK_GAP_SEC and
+                       0 <= wall_gap <= ROUTINE_TICK_GAP_SEC and
+                       math.isclose(wall_gap, boot_gap, abs_tol=0.25))
+        self._last_tick = (now, boot, boot_id)
         key = day_key(now, self.state.reset_hour, self.tz)
         if key > self.state.day:
             reset = datetime.fromisoformat(key).replace(hour=self.state.reset_hour, tzinfo=self.tz).timestamp()
@@ -107,7 +120,8 @@ class Engine:
                 events.extend(self._after_change(pending.change, now))
         for site, session in list(self.state.sessions.items()):
             if now >= session.ends:
-                events.extend(self.close(site, now, 'expired'))
+                charged_until = session.ends if routine and previous[0] <= session.ends else now
+                events.extend(self.close(site, charged_until, 'expired'))
             elif self.remaining_sec(site, now) == 0:
                 events.extend(self.close(site, now, 'budget'))
             elif session.ends - now <= WARN_BEFORE_SEC and not session.warned:
