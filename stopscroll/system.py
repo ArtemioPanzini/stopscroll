@@ -171,7 +171,9 @@ class System:
                     continue
                 lines = []
                 if job.addresses:
-                    timeout = max(1, math.ceil((job.expires - now) * 1000))
+                    # Wall-clock rollback must never lengthen the quarantine interval.
+                    timeout = min(QUARANTINE_SEC * 1000,
+                                  max(1, math.ceil((job.expires - now) * 1000)))
                     entries = ', '.join(f'{addr} timeout {timeout}ms' for addr in job.addresses)
                     lines.append(f'add element inet stopscroll quarantine{name[-1]} {{ {entries} }}')
                 if remaining:

@@ -24,3 +24,15 @@ Scope: authorized recovery fix wave on main, starting from `9668e79`. No install
 - If storage remains unavailable, the daemon explicitly reports non-durability and continues enforcing its in-memory policy/retrying. A crash before any successful save cannot make unsaved policy durable; no extra state file is introduced.
 - The retained standalone System.quarantine(site) compatibility entry point remains best effort. Durable retries are provided by the daemon's explicit state-backed close journal.
 - Owner decisions for expiry accounting, dynamic doctor checks and remove_exception CLI remain outside this commit; live installation and timed/browser acceptance belong to the controller.
+
+## Follow-up: bound quarantine replay after wall-clock rollback
+
+Re-review identified that the stored wall deadline could emit a timeout longer than the intended 120 seconds after a backward clock adjustment. Added `test_quarantine_replay_after_wall_clock_rollback_is_bounded`: a snapshot captured at 1000 with deadline 1120 and replayed at -2600 previously emitted 3720000ms. The focused test failed RED with that exact script.
+
+The emitted duration now clamps to at most QUARANTINE_SEC (120000ms); the persisted deadline remains unchanged, preserving ordinary fixed-deadline replay behavior. No live runtime changes were made, and owner accounting/minor decisions remain untouched.
+
+Verification:
+- `python3 -m unittest tests.test_system.SystemTests.test_quarantine_replay_after_wall_clock_rollback_is_bounded -q` before fix: 1 test, 1 failure (RED).
+- `python3 -m unittest tests.test_system tests.test_daemon tests.test_model tests.test_store -q`: 51 tests passed (GREEN).
+- `python3 -m unittest discover -s tests -q`: 129 tests passed, 0.748 seconds.
+- `git diff --check`: clean.

@@ -232,3 +232,12 @@ class SystemTests(unittest.TestCase):
         self.st.quarantine['site_youtube4'] = Quarantine(['142.250.1.1'], 1120)
         self.s.queue_quarantine(self.st, 'youtube')
         self.assertIsNone(self.st.quarantine['site_youtube4'].addresses)
+
+    def test_quarantine_replay_after_wall_clock_rollback_is_bounded(self):
+        from stopscroll.model import Quarantine
+        self.st.quarantine['site_youtube4'] = Quarantine(['142.250.1.1'], 1120)
+        self.r.answers['nft'] = (0, '{"nftables":[{"set":{"elem":["142.250.1.1"]}}]}')
+        self.s.retry_quarantine(self.st, -2600, lambda: True)
+        script = self.r.inputs[self.r.calls.index(['nft', '-f', '-'])]
+        self.assertIn('timeout 120000ms', script)
+        self.assertNotIn('3720000ms', script)
