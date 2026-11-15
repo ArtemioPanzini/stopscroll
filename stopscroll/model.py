@@ -88,8 +88,12 @@ def _decode(schema, value):
             hints = get_type_hints(schema)
             return schema(**{k: _decode(hints[k], v) for k, v in value.items()})
     elif schema is float:
-        if type(value) in (int, float) and math.isfinite(value):
-            return value
+        if type(value) in (int, float):
+            try:
+                if math.isfinite(value):
+                    return value
+            except OverflowError:
+                raise StateError('Число в состоянии слишком велико') from None
     elif type(value) is schema:
         return value
     raise StateError('Неполные или некорректные данные состояния')

@@ -50,3 +50,9 @@ class ModelTests(unittest.TestCase):
         s.sites['youtube'].domains.clear()
         self.assertTrue(initial_state(1000, '2026-11-15').sites['youtube'].domains)
         self.assertTrue(DOH_DOMAINS)
+
+    def test_huge_integer_float_field_rejected(self):
+        data = initial_state(1000, '2026-11-15').to_dict()
+        data['boot_saved'] = 10 ** 400
+        with self.assertRaises(StateError):
+            State.from_dict(data)

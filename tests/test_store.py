@@ -39,3 +39,11 @@ class StoreTests(unittest.TestCase):
             Path(self.path).write_text(contents)
             Path(self.path + '.bak').write_bytes(b'\xff')
             self.assertIsNone(load(self.path))
+
+    def test_load_falls_back_for_numeric_overflow(self):
+        save(self.state, self.path)
+        save(self.state, self.path)
+        data = self.state.to_dict()
+        data['boot_saved'] = 10 ** 400
+        Path(self.path).write_text(json.dumps(data))
+        self.assertEqual(load(self.path), self.state)
