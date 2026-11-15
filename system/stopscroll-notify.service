@@ -1,0 +1,12 @@
+[Unit]
+Description=Stopscroll desktop notifications
+PartOf=graphical-session.target
+
+[Service]
+Environment=PYTHONPATH=/usr/local/lib/stopscroll
+ExecStart=/usr/bin/python3 -m stopscroll.notify
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,6 @@
+[Unit]
+Description=Stopscroll watchdog
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl start stopscrolld.service stopscroll-dns.service

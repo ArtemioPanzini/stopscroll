@@ -1,0 +1,15 @@
+[Unit]
+Description=Stopscroll
+After=network.target
+
+[Service]
+Environment=PYTHONPATH=/usr/local/lib/stopscroll
+ExecStart=/usr/bin/python3 -m stopscroll.daemon
+RuntimeDirectory=stopscroll
+StateDirectory=stopscroll
+StateDirectoryMode=0700
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
