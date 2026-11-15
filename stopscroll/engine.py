@@ -4,7 +4,10 @@ from datetime import datetime, tzinfo
 import math
 
 from .day import day_key
-from .model import Session, State
+from copy import deepcopy
+
+from . import changes
+from .model import Pending, Session, State
 
 WARN_BEFORE_SEC = 120
 
@@ -66,14 +69,15 @@ class Engine:
                     capped=granted < minutes * 60, extended=extended)
 
     def close(self, site: str, now: float, reason: str = 'manual') -> list[Event]:
-        self._site(site)
+        if site not in self.state.sessions:
+            self._site(site)
         session = self.state.sessions.get(site)
         if session is None:
             return []
         charge = math.ceil(self._elapsed(site, now) / 60) * 60
         self.state.spent_sec[site] = self.state.spent_sec.get(site, 0) + charge
         del self.state.sessions[site]
-        reasons = {'manual': 'закрыто вручную', 'expired': 'время истекло', 'budget': 'дневной бюджет исчерпан'}
+        reasons = {'manual': 'закрыто вручную', 'expired': 'время истекло', 'budget': 'дневной бюджет исчерпан', 'rules': 'закрыто из-за изменения правил'}
         return [Event('session_closed', site, f'{site}: {reasons.get(reason, "отрезок закрыт")}')]
 
     def tick(self, now: float, boot: float, boot_id: str) -> list[Event]:
@@ -86,7 +90,21 @@ class Engine:
             for session in self.state.sessions.values():
                 session.segment_start = max(session.segment_start, reset)
         events = []
-        # Queue processing and boot-clock accounting are added by Task 3.
+        elapsed = max(0, boot - self.state.boot_saved) if boot_id == self.state.boot_id else 0
+        self.state.boot_id, self.state.boot_saved = boot_id, boot
+        for pending in self.state.pending:
+            pending.remaining_sec = max(0, pending.remaining_sec - elapsed)
+        for pending in sorted(list(self.state.pending), key=lambda p: p.id):
+            if pending.remaining_sec > 0:
+                continue
+            self.state.pending.remove(pending)
+            try:
+                changes.apply(self.state, pending.change, now)
+            except changes.ChangeError as exc:
+                events.append(Event('change_dropped', text=f'Изменение #{pending.id} снято: {exc}'))
+            else:
+                events.append(Event('change_applied', text=pending.summary))
+                events.extend(self._after_change(pending.change, now))
         for site, session in list(self.state.sessions.items()):
             if now >= session.ends:
                 events.extend(self.close(site, now, 'expired'))
@@ -96,6 +114,39 @@ class Engine:
                 session.warned = True
                 events.append(Event('session_ending', site, f'{site}: отрезок скоро закончится'))
         return events
+
+    def _after_change(self, change, now):
+        events = []
+        for site in list(self.state.sessions):
+            policy = self.state.sites.get(site)
+            if policy is None or policy.mode == 'blocked':
+                events.extend(self.close(site, now, 'rules'))
+            elif self.remaining_sec(site, now) == 0:
+                events.extend(self.close(site, now, 'budget'))
+        if change['kind'] == 'uninstall':
+            events.append(Event('uninstall'))
+        return events
+
+    def submit(self, change: dict, now: float) -> dict:
+        try:
+            classification = changes.classify(self.state, change)
+            summary = changes.summarize(self.state, change)
+            if classification == 'tighten':
+                changes.apply(self.state, change, now)
+                return dict(applied=True, summary=summary, events=self._after_change(change, now))
+        except changes.ChangeError as exc:
+            raise EngineError(str(exc)) from None
+        pending = Pending(self.state.next_id, deepcopy(change), self.state.delay_min * 60, summary)
+        self.state.next_id += 1
+        self.state.pending.append(pending)
+        return dict(applied=False, id=pending.id, eta=now + pending.remaining_sec, summary=summary)
+
+    def cancel(self, change_id: int) -> str:
+        for pending in self.state.pending:
+            if type(change_id) is int and pending.id == change_id:
+                self.state.pending.remove(pending)
+                return pending.summary
+        raise EngineError('Нет ожидающего изменения с таким номером')
 
     def status(self, now: float) -> dict:
         blocked, limited = [], []
@@ -110,6 +161,7 @@ class Engine:
                                 left_sec=max(0, math.ceil(session.ends - now)) if session else 0,
                                 spent_min=math.ceil(spent / 60), budget_min=policy.budget_min,
                                 bonus_min=self.state.bonus_min.get(site, 0)))
-        return dict(blocked=blocked, limited=limited, pending=[],
+        return dict(blocked=blocked, limited=limited, pending=[dict(id=p.id, summary=p.summary, eta=now + p.remaining_sec)
+                            for p in sorted(self.state.pending, key=lambda p: p.id)],
                     delay_min=self.state.delay_min, reset_hour=self.state.reset_hour,
                     pause_until=self.state.pause_until)
