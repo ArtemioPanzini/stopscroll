@@ -1,6 +1,8 @@
 """Persisted state and strict decoding of its versioned JSON schema."""
 from dataclasses import asdict, dataclass, field, fields
 import math
+import ipaddress
+import re
 import types
 from typing import get_args, get_origin, get_type_hints
 
@@ -33,6 +35,12 @@ class Pending:
 
 
 @dataclass
+class Quarantine:
+    addresses: list[str] | None = None
+    expires: float | None = None
+
+
+@dataclass
 class State:
     owner_uid: int
     sites: dict[str, Site]
@@ -50,12 +58,16 @@ class State:
     pause_until: float | None = None
     boot_id: str = ''
     boot_saved: float = 0.0
+    quarantine: dict[str, Quarantine] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> 'State':
+        # The recovery journal was added to v1; old installed states remain valid.
+        if isinstance(d, dict) and 'quarantine' not in d:
+            d = dict(d, quarantine={})
         state = _decode(cls, d)
         if state.version != 1:
             raise StateError('Неподдерживаемая версия состояния')
@@ -64,6 +76,17 @@ class State:
                 raise StateError('Неизвестный режим сайта')
             if site.budget_min < 0 or (site.mode == 'blocked' and site.budget_min != 0):
                 raise StateError('Некорректный бюджет сайта')
+        for name, job in state.quarantine.items():
+            if not re.fullmatch(r'site_[a-z][a-z0-9_]*[46]', name):
+                raise StateError('Некорректное имя набора карантина')
+            if (job.addresses is None) != (job.expires is None):
+                raise StateError('Неполный снимок карантина')
+            for address in job.addresses or []:
+                try:
+                    if ipaddress.ip_address(address).version != int(name[-1]):
+                        raise ValueError('Неверное семейство адреса')
+                except ValueError as exc:
+                    raise StateError('Некорректный адрес карантина') from exc
         return state
 
 
@@ -83,7 +106,7 @@ def _decode(schema, value):
     elif origin is dict:
         if isinstance(value, dict):
             return {_decode(args[0], k): _decode(args[1], v) for k, v in value.items()}
-    elif schema in (State, Site, Session, Pending):
+    elif schema in (State, Site, Session, Pending, Quarantine):
         if isinstance(value, dict) and set(value) == {f.name for f in fields(schema)}:
             hints = get_type_hints(schema)
             return schema(**{k: _decode(hints[k], v) for k, v in value.items()})

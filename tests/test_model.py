@@ -33,7 +33,7 @@ class ModelTests(unittest.TestCase):
 
     def test_from_dict_rejects_missing_fields(self):
         data = initial_state(1000, '2026-11-15').to_dict()
-        for key in data:
+        for key in data.keys() - {'quarantine'}:
             with self.subTest(key=key), self.assertRaises(StateError):
                 State.from_dict({k: v for k, v in data.items() if k != key})
 
@@ -56,3 +56,24 @@ class ModelTests(unittest.TestCase):
         data['boot_saved'] = 10 ** 400
         with self.assertRaises(StateError):
             State.from_dict(data)
+
+    def test_old_state_load_preserves_custom_policy_sessions_and_queue(self):
+        state = initial_state(1000, '2026-11-15')
+        state.sites['youtube'].budget_min = 17
+        state.sessions['youtube'] = Session(100, 700)
+        state.spent_sec['youtube'] = 180
+        state.pending.append(Pending(1, {'kind': 'uninstall'}, 50, 'remove'))
+        data = state.to_dict()
+        del data['quarantine']
+        self.assertEqual(State.from_dict(data), state)
+
+    def test_quarantine_roundtrip_and_invalid_metadata(self):
+        from stopscroll.model import Quarantine
+        state = initial_state(1000, '2026-11-15')
+        state.quarantine['site_youtube4'] = Quarantine(['142.250.1.1'], 1234)
+        self.assertEqual(State.from_dict(state.to_dict()), state)
+        for value in (None, [], {'site_youtube4': {'addresses': 5, 'expires': 1234}}):
+            data = state.to_dict()
+            data['quarantine'] = value
+            with self.assertRaises(StateError):
+                State.from_dict(data)

@@ -1,12 +1,14 @@
 """Reconcile the private DNS/firewall setup without stopping on repair errors."""
 import ipaddress
 import json
+import logging
+import math
 from pathlib import Path
 import pwd
 import subprocess
 
 from .blocklist import DNS_PORT, QUARANTINE_SEC, render_dnsmasq, render_nft, set_names
-from .model import State
+from .model import State, Quarantine
 
 DNS_CONF = '/var/lib/stopscroll/dnsmasq.conf'
 RESOLVED_DROPIN = '/etc/systemd/resolved.conf.d/stopscroll.conf'
@@ -37,9 +39,9 @@ class System:
     def __init__(self, runner: Runner):
         self.runner = runner
         self._nft = None
-        self._dns_restart = False
-        self._flush = False
-        self._resolved_restart = False
+        self._dns_restart = True
+        self._flush = True
+        self._resolved_restart = True
 
     def _run(self, argv, input=None):
         result = self.runner.run(argv, input=input)
@@ -134,23 +136,62 @@ class System:
             step(f'политика браузера {name}', chrome)
         return messages
 
-    def quarantine(self, site: str) -> None:
-        for version, name in zip((4, 6), set_names(site)):
+    def queue_quarantine(self, state: State, site: str) -> None:
+        for name in set_names(site):
+            state.quarantine[name] = Quarantine()
+
+    def _addresses(self, name):
+        result = self._run(['nft', '-j', 'list', 'set', 'inet', 'stopscroll', name])
+        data = json.loads(result.stdout)
+        addresses = [str(ipaddress.ip_address(elem)) for item in data['nftables']
+                     for elem in item.get('set', {}).get('elem', [])]
+        if any(ipaddress.ip_address(addr).version != int(name[-1]) for addr in addresses):
+            raise ValueError('Неверное семейство адреса')
+        return addresses
+
+    def retry_quarantine(self, state: State, now: float, persist) -> list[str]:
+        """Journal snapshots before applying; only actual close jobs are retried."""
+        messages = []
+        for name, job in list(state.quarantine.items()):
             try:
-                result = self._run(['nft', '-j', 'list', 'set', 'inet', 'stopscroll', name])
-                data = json.loads(result.stdout)
-                elements = [elem for item in data['nftables']
-                            for elem in item.get('set', {}).get('elem', [])]
-                addresses = [str(ipaddress.ip_address(elem)) for elem in elements]
-                if any(ipaddress.ip_address(addr).version != version for addr in addresses):
-                    raise ValueError('Неверное семейство адреса')
-                if addresses:
-                    entries = ', '.join(f'{addr} timeout {QUARANTINE_SEC}s' for addr in addresses)
-                    self._run(['nft', 'add', 'element', 'inet', 'stopscroll', f'quarantine{version}', '{ ' + entries + ' }'])
-                self._run(['nft', 'flush', 'set', 'inet', 'stopscroll', name])
-            except Exception:
-                # Keep source elements when moving fails; still attempt the other family.
-                continue
+                current = self._addresses(name)
+                if job.addresses is None:
+                    job.addresses = current
+                    job.expires = now + QUARANTINE_SEC
+                remaining = set(job.addresses) & set(current)
+                if job.expires <= now:
+                    if not remaining:
+                        # Atomic move already succeeded, including a crash before ack.
+                        del state.quarantine[name]
+                        persist()
+                        continue
+                    # The source still contains unprocessed close work.
+                    job.expires = now + QUARANTINE_SEC
+                if not persist():
+                    continue
+                lines = []
+                if job.addresses:
+                    timeout = max(1, math.ceil((job.expires - now) * 1000))
+                    entries = ', '.join(f'{addr} timeout {timeout}ms' for addr in job.addresses)
+                    lines.append(f'add element inet stopscroll quarantine{name[-1]} {{ {entries} }}')
+                if remaining:
+                    entries = ', '.join(sorted(remaining))
+                    lines.append(f'delete element inet stopscroll {name} {{ {entries} }}')
+                if lines:
+                    # One nft transaction: failure retains every source element.
+                    self._run(['nft', '-f', '-'], input='\n'.join(lines) + '\n')
+                del state.quarantine[name]
+                persist()
+            except Exception as exc:
+                messages.append(f'сбой: карантин {name}: {exc}')
+        return messages
+
+    def quarantine(self, site: str) -> None:
+        # Compatibility entry point for standalone callers; daemon journals jobs.
+        state = State(0, {}, [], '')
+        self.queue_quarantine(state, site)
+        for message in self.retry_quarantine(state, 0, lambda: True):
+            logging.getLogger(__name__).warning('%s', message)
 
     def uninstall(self) -> None:
         self._run(['systemd-run', '--unit=stopscroll-uninstall', '/usr/local/lib/stopscroll/uninstall.sh'])

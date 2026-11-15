@@ -47,3 +47,13 @@ class StoreTests(unittest.TestCase):
         data['boot_saved'] = 10 ** 400
         Path(self.path).write_text(json.dumps(data))
         self.assertEqual(load(self.path), self.state)
+
+    def test_legacy_state_load_does_not_fall_back_or_reset(self):
+        from stopscroll.model import Session
+        self.state.delay_min = 91
+        self.state.sessions['youtube'] = Session(100, 700)
+        self.state.spent_sec['youtube'] = 180
+        data = self.state.to_dict()
+        del data['quarantine']
+        Path(self.path).write_text(json.dumps(data))
+        self.assertEqual(load(self.path), self.state)

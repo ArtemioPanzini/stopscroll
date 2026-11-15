@@ -141,9 +141,10 @@ class SystemTests(unittest.TestCase):
         self.r.answers[('nft', '-j', 'list', 'set', 'inet', 'stopscroll', 'site_youtube4')] = (0, '{"nftables":[{"metainfo":{"json_schema_version":1}},{"set":{"family":"inet","table":"stopscroll","name":"site_youtube4","type":"ipv4_addr","elem":["142.250.1.1","142.250.1.2"]}}]}')
         self.r.answers[('nft', '-j', 'list', 'set', 'inet', 'stopscroll', 'site_youtube6')] = (0, '{"nftables":[{"set":{"family":"inet","table":"stopscroll","name":"site_youtube6","type":"ipv6_addr"}}]}')
         self.s.quarantine('youtube')
-        self.assertIn(['nft', 'add', 'element', 'inet', 'stopscroll', 'quarantine4', '{ 142.250.1.1 timeout 120s, 142.250.1.2 timeout 120s }'], self.r.calls)
-        for n in ('site_youtube4', 'site_youtube6'):
-            self.assertIn(['nft', 'flush', 'set', 'inet', 'stopscroll', n], self.r.calls)
+        scripts = '\n'.join(value or '' for value in self.r.inputs)
+        self.assertIn('add element inet stopscroll quarantine4 { 142.250.1.1 timeout 120000ms, 142.250.1.2 timeout 120000ms }', scripts)
+        self.assertIn('delete element inet stopscroll site_youtube4 { 142.250.1.1, 142.250.1.2 }', scripts)
+        self.assertNotIn('flush set', scripts)
 
     def test_quarantine_survives_nft_error(self):
         self.r.answers['nft'] = (1, '')
@@ -152,3 +153,82 @@ class SystemTests(unittest.TestCase):
     def test_uninstall(self):
         self.s.uninstall()
         self.assertIn(['systemd-run', '--unit=stopscroll-uninstall', '/usr/local/lib/stopscroll/uninstall.sh'], self.r.calls)
+
+    def test_restart_recovers_service_configuration(self):
+        self.sync()
+        for command in [('systemctl', 'restart', DNS_UNIT), ('resolvectl', 'flush-caches'), ('systemctl', 'restart', 'systemd-resolved')]:
+            self.r.answers[command] = (1, '')
+        self.s = System(self.r)
+        self.sync()
+        self.r.answers.clear()
+        self.r.calls.clear()
+        self.s = System(self.r)
+        self.sync()
+        for command in [('systemctl', 'restart', DNS_UNIT), ('resolvectl', 'flush-caches'), ('systemctl', 'restart', 'systemd-resolved')]:
+            self.assertIn(list(command), self.r.calls)
+
+    def test_durable_quarantine_retry_preserves_exception_and_deadline(self):
+        from stopscroll.model import State
+        self.s.queue_quarantine(self.st, 'youtube')
+        read = ('nft', '-j', 'list', 'set', 'inet', 'stopscroll', 'site_youtube4')
+        self.r.answers[read] = (0, '{"nftables":[{"set":{"elem":["142.250.1.1"]}}]}')
+        self.r.answers[('nft', '-j', 'list', 'set', 'inet', 'stopscroll', 'site_youtube6')] = (0, '{"nftables":[{"set":{}}]}')
+        self.r.answers[('nft', '-f', '-')] = (1, '')
+        messages = self.s.retry_quarantine(self.st, 1000, lambda: True)
+        self.assertTrue(any('сбой' in message for message in messages))
+        self.assertIn('site_youtube4', self.st.quarantine)
+        script = self.r.inputs[self.r.calls.index(['nft', '-f', '-'])]
+        self.assertIn('delete element inet stopscroll site_youtube4', script)
+        self.assertNotIn('flush set', script)
+        self.st = State.from_dict(self.st.to_dict())
+        self.s = System(self.r)
+        self.r.answers.pop(('nft', '-f', '-'))
+        self.r.calls.clear(); self.r.inputs.clear()
+        # An exception address arriving after the snapshot must not be quarantined.
+        self.r.answers[read] = (0, '{"nftables":[{"set":{"elem":["142.250.1.1","142.250.2.2"]}}]}')
+        self.s.retry_quarantine(self.st, 1060, lambda: True)
+        script = self.r.inputs[self.r.calls.index(['nft', '-f', '-'])]
+        self.assertIn('timeout 60000ms', script)
+        self.assertNotIn('142.250.2.2', script)
+        self.assertEqual(self.st.quarantine, {})
+        self.r.calls.clear()
+        self.s.retry_quarantine(self.st, 1070, lambda: True)
+        self.assertEqual(self.r.calls, [])
+
+    def test_quarantine_snapshot_must_be_saved_before_enforcement(self):
+        self.s.queue_quarantine(self.st, 'youtube')
+        self.r.answers['nft'] = (0, '{"nftables":[{"set":{"elem":["142.250.1.1"]}}]}')
+        self.s.retry_quarantine(self.st, 1000, lambda: False)
+        self.assertNotIn(['nft', '-f', '-'], self.r.calls)
+
+    def test_failed_quarantine_after_deadline_retries_full_interval(self):
+        self.s.queue_quarantine(self.st, 'youtube')
+        read = ('nft', '-j', 'list', 'set', 'inet', 'stopscroll', 'site_youtube4')
+        self.r.answers[read] = (0, '{"nftables":[{"set":{"elem":["142.250.1.1"]}}]}')
+        self.r.answers[('nft', '-j', 'list', 'set', 'inet', 'stopscroll', 'site_youtube6')] = (0, '{"nftables":[{"set":{}}]}')
+        self.r.answers[('nft', '-f', '-')] = (1, '')
+        self.s.retry_quarantine(self.st, 1000, lambda: True)
+        self.r.answers.pop(('nft', '-f', '-'))
+        self.r.calls.clear(); self.r.inputs.clear()
+        self.s.retry_quarantine(self.st, 1300, lambda: True)
+        self.assertIn('timeout 120000ms', self.r.inputs[self.r.calls.index(['nft', '-f', '-'])])
+        self.assertFalse(self.st.quarantine)
+
+    def test_replayed_success_after_deadline_leaves_exception_untouched(self):
+        from stopscroll.model import Quarantine
+        self.st.quarantine['site_youtube4'] = Quarantine(['142.250.1.1'], 1120)
+        self.r.answers['nft'] = (0, '{"nftables":[{"set":{"elem":["142.250.2.2"]}}]}')
+        self.s.retry_quarantine(self.st, 1300, lambda: True)
+        self.assertNotIn(['nft', '-f', '-'], self.r.calls)
+        self.assertFalse(self.st.quarantine)
+
+    def test_closed_site_without_close_job_does_not_quarantine_exceptions(self):
+        self.r.answers['nft'] = (0, '{"nftables":[{"set":{"elem":["142.250.2.2"]}}]}')
+        self.s.retry_quarantine(self.st, 1000, lambda: True)
+        self.assertEqual(self.r.calls, [])
+
+    def test_new_close_recaptures_addresses_after_earlier_failed_job(self):
+        from stopscroll.model import Quarantine
+        self.st.quarantine['site_youtube4'] = Quarantine(['142.250.1.1'], 1120)
+        self.s.queue_quarantine(self.st, 'youtube')
+        self.assertIsNone(self.st.quarantine['site_youtube4'].addresses)

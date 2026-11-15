@@ -17,6 +17,7 @@ class DaemonTests(unittest.TestCase):
         self.state = initial_state(os.getuid(), '2026-11-15')
         self.system = Mock()
         self.system.sync.return_value = []
+        self.system.retry_quarantine.return_value = []
         self.save = Mock()
         self.d = Daemon(Engine(self.state), self.system, self.save, lambda: [])
     def call(self, **req):
@@ -37,12 +38,12 @@ class DaemonTests(unittest.TestCase):
         self.assertTrue(self.call(cmd='open',site='youtube',minutes=10)['ok'])
         self.save.assert_called_once(); self.system.sync.assert_called_once()
         self.call(cmd='close',site='youtube')
-        self.system.quarantine.assert_called_once_with('youtube')
+        self.system.queue_quarantine.assert_called_once_with(self.state, 'youtube')
     def test_expiry(self):
         self.call(cmd='open',site='youtube',minutes=10)
         events=self.d.tick(T+600,600,'boot')
         self.assertEqual(events[0]['event'],'session_closed')
-        self.system.quarantine.assert_called_with('youtube')
+        self.system.queue_quarantine.assert_called_with(self.state, 'youtube')
     def test_queue_cancel_uninstall(self):
         result=self.call(cmd='change',change={'kind':'uninstall'})
         self.assertFalse(result['applied'])
@@ -70,7 +71,7 @@ class DaemonTests(unittest.TestCase):
 class SocketTests(unittest.IsolatedAsyncioTestCase):
     async def test_socket_bad_json_and_roundtrip(self):
         state=initial_state(os.getuid(),'2026-11-15')
-        system=Mock(); system.sync.return_value=[]
+        system=Mock(); system.sync.return_value=[]; system.retry_quarantine.return_value=[]
         d=Daemon(Engine(state),system,Mock(),lambda:[])
         with tempfile.TemporaryDirectory() as tmp:
             path=str(Path(tmp)/'socket')
@@ -103,3 +104,48 @@ class SocketTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 task.cancel()
                 with self.assertRaises(asyncio.CancelledError): await task
+
+class PersistenceTests(unittest.TestCase):
+    setUp = DaemonTests.setUp
+    call = DaemonTests.call
+    def test_failed_save_is_reported_and_retried_without_queue(self):
+        self.d.tick(T, 0, 'boot')
+        self.save.side_effect = [OSError('disk full'), None]
+        reply = self.call(cmd='change', change={'kind':'set_budget', 'site':'youtube', 'minutes':20})
+        self.assertFalse(reply['ok'])
+        self.assertIn('сохран', reply['error'])
+        self.assertEqual(self.state.sites['youtube'].budget_min, 20)
+        self.assertFalse(self.state.pending)
+        self.d.tick(T+60, 60, 'boot')
+        self.assertEqual(self.save.call_count, 2)
+        self.assertFalse(self.d._dirty)
+
+    def test_failed_close_save_keeps_dns_tightening_and_retries(self):
+        self.call(cmd='open', site='youtube', minutes=10)
+        self.d.tick(T, 0, 'boot')
+        self.save.reset_mock()
+        self.save.side_effect = OSError('disk full')
+        reply = self.call(cmd='close', site='youtube')
+        self.assertFalse(reply['ok'])
+        self.assertNotIn('youtube', self.state.sessions)
+        self.system.queue_quarantine.assert_called_once_with(self.state, 'youtube')
+        self.assertTrue(self.d._dirty)
+        self.save.side_effect = None
+        self.d.tick(T+60, 60, 'boot')
+        self.assertFalse(self.d._dirty)
+        self.assertEqual(self.save.call_count, 2)
+
+    def test_startup_with_events_reconciles_once(self):
+        from unittest.mock import patch
+        from stopscroll.daemon import main
+        from stopscroll.model import Session
+        self.state.sessions['youtube'] = Session(T-100, T-1)
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch('stopscroll.daemon.STATE', str(Path(tmp)/'state.json')), \
+                patch('stopscroll.daemon.OWNER_FILE', str(Path(tmp)/'owner')), \
+                patch('stopscroll.daemon.bootstrap', return_value=self.state), \
+                patch('stopscroll.daemon._clock', return_value=(T, 100, 'boot')), \
+                patch('stopscroll.daemon.System', return_value=self.system), \
+                patch('stopscroll.daemon.store.save'):
+            self.assertEqual(main(['--init']), 0)
+        self.system.sync.assert_called_once()

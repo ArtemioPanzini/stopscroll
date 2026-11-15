@@ -44,28 +44,36 @@ class Daemon:
         self._last_sync = None
         self._last_save = None
         self._boot_id = None
+        self._dirty = False
         self._subscribers = set()
 
     def _sync(self, now):
         try:
             for message in self.system.sync(self.engine.state, now):
                 LOG.warning('%s', message)
+            for message in self.system.retry_quarantine(self.engine.state, now, self._persist):
+                LOG.warning('%s', message)
         except Exception:
             LOG.exception('Сбой сверки системы')
 
     def _persist(self):
+        self._dirty = True
         try:
             self.save()
+            self._dirty = False
+            return True
         except Exception:
             LOG.exception('Не удалось сохранить состояние')
+            return False
 
     def _changed(self, events, now):
+        for event in events:
+            if event.kind == 'session_closed':
+                self.system.queue_quarantine(self.engine.state, event.site)
         self._persist()
         for event in events:
             try:
-                if event.kind == 'session_closed':
-                    self.system.quarantine(event.site)
-                elif event.kind == 'uninstall':
+                if event.kind == 'uninstall':
                     self.system.uninstall()
             except Exception:
                 LOG.exception('Сбой обработки события %s', event.kind)
@@ -109,6 +117,8 @@ class Daemon:
                 raise ValueError('Неизвестная команда')
             if cmd in ('open', 'close', 'change', 'cancel'):
                 self._changed(events, now)
+                if self._dirty:
+                    return dict(result, ok=False, error='Не удалось сохранить состояние; изменение действует в памяти, сохранение будет повторено')
             return dict(ok=True, **result)
         except (EngineError, ChangeError, ValueError) as exc:
             return dict(ok=False, error=str(exc))
@@ -127,7 +137,7 @@ class Daemon:
         if boot - self._last_sync >= SYNC_EVERY_SEC:
             self._sync(now)
             self._last_sync = boot
-        if self.engine.state.pending and boot - self._last_save >= SYNC_EVERY_SEC:
+        if (self._dirty or self.engine.state.pending) and boot - self._last_save >= SYNC_EVERY_SEC:
             self._persist()
             self._last_save = boot
         return payloads
@@ -203,9 +213,10 @@ def main(argv=None):
     runner = Runner()
     daemon = Daemon(Engine(state), System(runner), lambda: store.save(state, STATE), lambda: run_checks(runner, state))
     Path(STATE).parent.mkdir(parents=True, exist_ok=True)
-    daemon.tick(now, boot, boot_id)
-    daemon._persist()
-    daemon._sync(now)
+    events = daemon.tick(now, boot, boot_id)
+    if not events:
+        daemon._persist()
+        daemon._sync(now)
     if not args.init:
         Path(SOCKET).parent.mkdir(parents=True, exist_ok=True)
         asyncio.run(daemon.serve(SOCKET))
