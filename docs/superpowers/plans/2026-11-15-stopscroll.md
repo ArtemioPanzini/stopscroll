@@ -1,6 +1,6 @@
 # stopscroll — план реализации
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Цель:** системная блокировка отвлекающих сайтов на этой машине: четыре сайта закрыты насовсем, YouTube и x.com открываются командой на отрезок в пределах дневного бюджета, любое ослабление правил применяется с задержкой.
 
@@ -17,7 +17,7 @@
 - Только стандартная библиотека Python 3; сторонних пакетов нет ни в коде, ни в тестах.
 - Тесты не требуют root и сети (раздел 8).
 - `/etc/resolv.conf`, таблицы `ufw` и Docker не изменяются. Своя таблица — `inet stopscroll`, hook только `output`.
-- Изменение списка блокировки действует на DNS не позже чем через 5 секунд.
+- Изменение списка блокировки действует на DNS не позже чем через 5 секунд; по явному выбору владельца завершение паузы и изменения без события подхватываются минутной сверкой задачи 6.
 - Карантин адресов при закрытии отрезка — 120 секунд.
 - Значения по умолчанию: задержка 45 мин, смена дня в 04:00 местного времени, отрезок 15 мин, предупреждение за 2 мин до конца отрезка.
 - Ручного файла настроек нет. Состояние — один файл `/var/lib/stopscroll/state.json`, владелец root, права 0600, пишет только служба.
@@ -120,9 +120,9 @@ def save(state: State, path: str) -> None: ...        # tmp → fsync → пре
 def load(path: str) -> State | None: ...              # path, затем path+".bak"; None, если оба негодны
 ```
 
-- [ ] **Шаг 1.** `git init` в корне, `.gitignore` с `__pycache__/`. Закоммитить уже лежащие `docs/`.
+- [x] **Шаг 1.** `git init` в корне, `.gitignore` с `__pycache__/`. Закоммитить уже лежащие `docs/`.
 
-- [ ] **Шаг 2. Написать падающие тесты.**
+- [x] **Шаг 2. Написать падающие тесты.**
 
 ```python
 # tests/test_model.py
@@ -161,10 +161,10 @@ def test_load_returns_none_when_both_bad(self):   # оба файла битые
 
 `DOH_DOMAINS` — список из раздела 5.4, слой 2, включая `use-application-dns.net`.
 
-- [ ] **Шаг 3.** Запустить тесты, убедиться, что падают на отсутствии модулей.
-- [ ] **Шаг 4.** Реализовать `model.py`, `seed.py`, `store.py`.
-- [ ] **Шаг 5.** Запустить тесты: все проходят.
-- [ ] **Шаг 6.** Коммит: `feat: state model, seed lists, atomic store`.
+- [x] **Шаг 3.** Запустить тесты, убедиться, что падают на отсутствии модулей.
+- [x] **Шаг 4.** Реализовать `model.py`, `seed.py`, `store.py`.
+- [x] **Шаг 5.** Запустить тесты: все проходят.
+- [x] **Шаг 6.** Коммит: `feat: state model, seed lists, atomic store`.
 
 ---
 
@@ -219,7 +219,7 @@ class Engine:
  "delay_min": 45, "reset_hour": 4, "pause_until": None}
 ```
 
-- [ ] **Шаг 1. Написать падающие тесты.** Во всех тестах `tz=timezone.utc`, `T = datetime(2026, 11, 15, 12, 0, tzinfo=timezone.utc).timestamp()`.
+- [x] **Шаг 1. Написать падающие тесты.** Во всех тестах `tz=timezone.utc`, `T = datetime(2026, 11, 15, 12, 0, tzinfo=timezone.utc).timestamp()`.
 
 ```python
 # tests/test_day.py
@@ -262,10 +262,10 @@ def test_clock_back_does_not_go_negative(self):# open в T, close в T-300 → s
 def test_status_shape(self):                   # ключи и значения как в образце выше
 ```
 
-- [ ] **Шаг 2.** Запустить, убедиться в падении.
-- [ ] **Шаг 3.** Реализовать `day.py` и `engine.py` (очередь изменений в `tick` и `status["pending"]` пока пустые — их добавит задача 3).
-- [ ] **Шаг 4.** Запустить: все тесты задач 1–2 проходят.
-- [ ] **Шаг 5.** Коммит: `feat: sessions and daily budget`.
+- [x] **Шаг 2.** Запустить, убедиться в падении.
+- [x] **Шаг 3.** Реализовать `day.py` и `engine.py` (очередь изменений в `tick` и `status["pending"]` пока пустые — их добавит задача 3).
+- [x] **Шаг 4.** Запустить: все тесты задач 1–2 проходят.
+- [x] **Шаг 5.** Коммит: `feat: sessions and daily budget`.
 
 ---
 
@@ -319,7 +319,7 @@ class Engine:
 - После любого применения `Engine` закрывает отрезки, потерявшие основание: сайт исчез или стал `blocked` (причина `rules`), остаток бюджета стал нулём (причина `budget`).
 - `eta` = `now + remaining_sec`.
 
-- [ ] **Шаг 1. Написать падающие тесты.**
+- [x] **Шаг 1. Написать падающие тесты.**
 
 ```python
 # tests/test_changes.py
@@ -364,10 +364,10 @@ def test_uninstall_emits_event_after_delay(self):        # после задер
 def test_status_lists_pending(self):                     # status(T)["pending"] == [{"id": 1, "summary": ..., "eta": T + 2700}]
 ```
 
-- [ ] **Шаг 2.** Запустить, убедиться в падении.
-- [ ] **Шаг 3.** Реализовать `changes.py`, дополнить `engine.py`.
-- [ ] **Шаг 4.** Запустить: все тесты задач 1–3 проходят.
-- [ ] **Шаг 5.** Коммит: `feat: rule changes with delayed loosening`.
+- [x] **Шаг 2.** Запустить, убедиться в падении.
+- [x] **Шаг 3.** Реализовать `changes.py`, дополнить `engine.py`.
+- [x] **Шаг 4.** Запустить: все тесты задач 1–3 проходят.
+- [x] **Шаг 5.** Коммит: `feat: rule changes with delayed loosening`.
 
 ---
 
@@ -424,7 +424,7 @@ add rule inet stopscroll output ip6 daddr @quarantine6 reject
 add rule inet stopscroll output meta l4proto { tcp, udp } th dport { 53, 853 } meta skuid != { 991, 992 } reject
 ```
 
-- [ ] **Шаг 1. Написать падающие тесты.**
+- [x] **Шаг 1. Написать падающие тесты.**
 
 ```python
 def test_blocked_when_no_session(self):         # в списке twitch.tv, youtube.com, x.com, dns.google, use-application-dns.net
@@ -443,10 +443,10 @@ def test_nft_exact_text(self):                  # render_nft(seed, 991, 992) == 
 def test_set_names(self):                       # set_names("x") == ("site_x4", "site_x6")
 ```
 
-- [ ] **Шаг 2.** Запустить, убедиться в падении.
-- [ ] **Шаг 3.** Реализовать `blocklist.py`.
-- [ ] **Шаг 4.** Запустить: все тесты проходят.
-- [ ] **Шаг 5. Проверить текст настоящими программами** (систему не меняет). Записать вывод `render_dnsmasq` и `render_nft` для начального состояния в файлы каталога `mktemp -d` и выполнить:
+- [x] **Шаг 2.** Запустить, убедиться в падении.
+- [x] **Шаг 3.** Реализовать `blocklist.py`.
+- [x] **Шаг 4.** Запустить: все тесты проходят.
+- [x] **Шаг 5. Проверить текст настоящими программами** (систему не меняет). Записать вывод `render_dnsmasq` и `render_nft` для начального состояния в файлы каталога `mktemp -d` и выполнить:
 
 ```bash
 dnsmasq --test --conf-file="$D/dnsmasq.conf"      # ожидается: "dnsmasq: syntax check OK."
@@ -455,7 +455,7 @@ sudo nft -c -f "$D/stopscroll.nft"                # ожидается: пуст
 
 Для `render_nft` подставить `dns_uid=$(id -u nobody)`, `resolved_uid=$(id -u systemd-resolve)`. Если любая из проверок ругается, исправить `blocklist.py` и тест с точным текстом вместе.
 
-- [ ] **Шаг 6.** Коммит: `feat: blocklist, dnsmasq and nftables rendering`.
+- [x] **Шаг 6.** Коммит: `feat: blocklist, dnsmasq and nftables rendering`.
 
 ---
 
@@ -502,7 +502,7 @@ class System:
 
 `uninstall()`: `systemd-run --unit=stopscroll-uninstall /usr/local/lib/stopscroll/uninstall.sh`.
 
-- [ ] **Шаг 1. Написать падающие тесты.** `FakeRunner(Runner)` с `root` во временном каталоге записывает все `argv` в список и отдаёт заранее заданные ответы по первому слову команды.
+- [x] **Шаг 1. Написать падающие тесты.** `FakeRunner(Runner)` с `root` во временном каталоге записывает все `argv` в список и отдаёт заранее заданные ответы по первому слову команды.
 
 ```python
 def test_first_sync_writes_everything(self):
@@ -526,10 +526,10 @@ def test_quarantine_moves_elements(self):
 def test_quarantine_survives_nft_error(self):   # nft -j отвечает кодом 1 → без исключения
 ```
 
-- [ ] **Шаг 2.** Запустить, убедиться в падении.
-- [ ] **Шаг 3.** Реализовать `system.py`.
-- [ ] **Шаг 4.** Запустить: все тесты проходят.
-- [ ] **Шаг 5.** Коммит: `feat: system layer with self-repair and quarantine`.
+- [x] **Шаг 2.** Запустить, убедиться в падении.
+- [x] **Шаг 3.** Реализовать `system.py`.
+- [x] **Шаг 4.** Запустить: все тесты проходят.
+- [x] **Шаг 5.** Коммит: `feat: system layer with self-repair and quarantine`.
 
 ---
 
@@ -589,7 +589,7 @@ def run_checks(runner: Runner, state: State) -> list[dict]: ...     # [{"name": 
 Проверки `run_checks`, по одной записи на каждую:
 `stopscroll-dns.service` активна; `stopscroll-watchdog.timer` активен; глобальный DNS `systemd-resolved` — `127.0.0.1:5354` с доменом `~.` (по `resolvectl status`); ни у одного интерфейса нет домена `~.` (иначе «блокировка не действует: похоже на VPN»); `twitch.tv` не разрешается (`resolvectl query`); `example.com` разрешается; прямой запрос `dig +time=2 +tries=1 @1.1.1.1 example.com` не проходит; таблица `inet stopscroll` есть; файлы политик на месте и верны.
 
-- [ ] **Шаг 1. Написать падающие тесты.** `FakeSystem` считает вызовы `sync`, `quarantine`, `uninstall`.
+- [x] **Шаг 1. Написать падающие тесты.** `FakeSystem` считает вызовы `sync`, `quarantine`, `uninstall`.
 
 ```python
 # tests/test_daemon.py
@@ -622,10 +622,10 @@ def test_direct_dns_reachable_is_flagged(self):           # dig отвечает
 def test_check_command_missing_is_reported_not_raised(self):
 ```
 
-- [ ] **Шаг 2.** Запустить, убедиться в падении.
-- [ ] **Шаг 3.** Реализовать `daemon.py` и `doctor.py`.
-- [ ] **Шаг 4.** Запустить: все тесты проходят.
-- [ ] **Шаг 5.** Коммит: `feat: daemon and doctor`.
+- [x] **Шаг 2.** Запустить, убедиться в падении.
+- [x] **Шаг 3.** Реализовать `daemon.py` и `doctor.py`.
+- [x] **Шаг 4.** Запустить: все тесты проходят.
+- [x] **Шаг 5.** Коммит: `feat: daemon and doctor`.
 
 ---
 
@@ -697,7 +697,7 @@ def main() -> int: ...
 - `format_event`: `session_ending` → `("stopscroll", "youtube закроется через 2 минуты")`; `session_closed` → `"youtube закрыт: время вышло"` / `"…: бюджет на сегодня исчерпан"` / `"…: закрыт вручную"` / `"…: изменились правила"` по причине `expired` / `budget` / `manual` / `rules`; `change_applied` → `"Применено: <text>"`; `change_dropped` → `"Не применено: <text>"`; остальное → `None`.
 - `notify.main`: подключиться, отправить `subscribe`, на каждое событие вызвать `notify-send -a stopscroll <заголовок> <текст>`; при обрыве — повтор через 5 секунд.
 
-- [ ] **Шаг 1. Написать падающие тесты.**
+- [x] **Шаг 1. Написать падающие тесты.**
 
 ```python
 # tests/test_cli.py
@@ -718,10 +718,10 @@ def test_format_each_kind(self):                # по проверке на к�
 def test_unknown_event_is_none(self):
 ```
 
-- [ ] **Шаг 2.** Запустить, убедиться в падении.
-- [ ] **Шаг 3.** Реализовать `cli.py` и `notify.py`.
-- [ ] **Шаг 4.** Запустить: все тесты проходят.
-- [ ] **Шаг 5.** Коммит: `feat: owner CLI and desktop notifier`.
+- [x] **Шаг 2.** Запустить, убедиться в падении.
+- [x] **Шаг 3.** Реализовать `cli.py` и `notify.py`.
+- [x] **Шаг 4.** Запустить: все тесты проходят.
+- [x] **Шаг 5.** Коммит: `feat: owner CLI and desktop notifier`.
 
 ---
 
@@ -759,7 +759,7 @@ sudo rm /etc/systemd/resolved.conf.d/stopscroll.conf && sudo systemctl restart s
 sudo nft delete table inet stopscroll
 ```
 
-- [ ] **Шаг 1. Написать падающие тесты** (проверяют файлы как текст, систему не трогают).
+- [x] **Шаг 1. Написать падающие тесты** (проверяют файлы как текст, систему не трогают).
 
 ```python
 # tests/test_packaging.py
@@ -774,11 +774,11 @@ def test_uninstall_removes_every_path_system_module_creates(self):
 def test_readme_has_emergency_section(self):                    # "Аварийное восстановление" и три команды из блока выше
 ```
 
-- [ ] **Шаг 2.** Запустить, убедиться в падении.
-- [ ] **Шаг 3.** Написать единицы, `install.sh`, `uninstall.sh`, `README.md`.
-- [ ] **Шаг 4.** Запустить: все тесты всех задач проходят.
-- [ ] **Шаг 5.** `systemd-analyze verify system/*.service system/*.timer` — без ошибок (предупреждения о ненайденном `/usr/local/lib/...` допустимы).
-- [ ] **Шаг 6.** Коммит: `feat: systemd units, install and uninstall scripts, README`.
+- [x] **Шаг 2.** Запустить, убедиться в падении.
+- [x] **Шаг 3.** Написать единицы, `install.sh`, `uninstall.sh`, `README.md`.
+- [x] **Шаг 4.** Запустить: все тесты всех задач проходят.
+- [x] **Шаг 5.** `systemd-analyze verify system/*.service system/*.timer` — без ошибок (предупреждения о ненайденном `/usr/local/lib/...` допустимы).
+- [x] **Шаг 6.** Коммит: `feat: systemd units, install and uninstall scripts, README`.
 
 ---
 
@@ -788,9 +788,9 @@ def test_readme_has_emergency_section(self):                    # "Аварий�
 
 **Файлы:** изменить `README.md` (раздел «Результат установки»); при находках — файлы, в которых найдена ошибка, вместе с их тестами.
 
-- [ ] **Шаг 1. Подготовить отход.** Открыть в отдельном терминале три команды из «Аварийного восстановления». Записать текущее состояние: `resolvectl status | head -20`, `sudo nft list tables`.
-- [ ] **Шаг 2. Установить.** `sudo ./install.sh`. Ожидается: `doctor` печатает все проверки `ok`, код 0. Если пропал интернет и `doctor` не зелёный — выполнить отход, разобраться по `journalctl -u stopscrolld -u stopscroll-dns -b`, исправить, повторить.
-- [ ] **Шаг 3. Попросить владельца перезапустить все браузеры** (политики и старые соединения).
+- [x] **Шаг 1. Подготовить отход.** Открыть в отдельном терминале три команды из «Аварийного восстановления». Записать текущее состояние: `resolvectl status | head -20`, `sudo nft list tables`.
+- [x] **Шаг 2. Установить.** `sudo ./install.sh`. Ожидается: `doctor` печатает все проверки `ok`, код 0. Если пропал интернет и `doctor` не зелёный — выполнить отход, разобраться по `journalctl -u stopscrolld -u stopscroll-dns -b`, исправить, повторить.
+- [x] **Шаг 3. Самостоятельно проверить браузеры.** По последующему указанию владельца проверки выполняются агентом в новых изолированных процессах Firefox и Chrome; личные окна и несохранённая работа не закрываются.
 - [ ] **Шаг 4. Пройти приёмку из раздела 8 спецификации, пункты 1–15, по одному.** Проверки командной строки:
 
 ```bash
@@ -805,7 +805,11 @@ sudo systemctl stop stopscrolld stopscroll-dns; sleep 75; systemctl is-active st
 ```
 
   Пункты про браузеры (1, 4, 5, 6, 15) владелец проверяет глазами; исполнитель называет, что открыть и что должно получиться. Пункт 7: `stopscroll open youtube 10`, через 3 минуты `stopscroll close youtube`, в `status` — 3 минуты. Пункт 9: в начале приёмки выполнить `stopscroll request bonus x 5` и `stopscroll request bonus youtube 5`; второе сразу отменить и убедиться, что оно исчезло из `status`. Первое оставить ждать: задержку сократить нельзя, поэтому остальные пункты проходят, пока идут 45 минут. По их истечении добавка должна появиться в `status` сама, с уведомлением. Пункт 12: перезагрузка с открытым отрезком и изменением в очереди.
-- [ ] **Шаг 5. Клоак-браузер.** Спросить владельца, какой это браузер; открыть в нём `chrome://policy` и `twitch.tv`. Записать в README: читает ли политики, блокируется ли, ходит ли через прокси.
-- [ ] **Шаг 6. Записать результат** в `README.md`, раздел «Результат установки»: дата, итог по каждому из 15 пунктов, результат по клоак-браузеру, всё найденное сверх спецификации.
-- [ ] **Шаг 7.** Каждая найденная ошибка исправляется через падающий тест в задаче-владельце кода, затем `sudo ./install.sh` повторно и повтор задетых пунктов приёмки.
-- [ ] **Шаг 8.** Коммит: `docs: installation result and acceptance record`.
+- [x] **Шаг 5. Клоак-браузер.** Исключён по указанию владельца: находится на другом устройстве. Это записано в README.
+- [x] **Шаг 6. Записать результат** в `README.md`, раздел «Результат установки»: дата, итог по каждому из 15 пунктов, результат по клоак-браузеру, всё найденное сверх спецификации.
+- [x] **Шаг 7.** Каждая найденная ошибка исправляется через падающий тест в задаче-владельце кода, затем `sudo ./install.sh` повторно и повтор задетых пунктов приёмки.
+- [x] **Шаг 8.** Коммит: `docs: installation result and acceptance record`.
+
+## Запись исполнения 2026-11-15
+
+Задачи 1–8 реализованы сабагентами, каждая прошла независимое ревью; исправления общего обзора также проверены. Установка в задаче 9 заранее одобрена и выполнена основной сессией. Владелец делегировал рабочие решения и браузерные проверки исполнителю; дополнительные подтверждения не требуются. Изменения учёта, текущих проверок doctor и команды remove-exception отражены в коде, тестах и README. Полный список фактических результатов приёмки находится в README; фактическая перезагрузка и авторизация с учётными данными не выдаются за проверенные. Поэтому общий шаг 4 приёмки оставлен открытым.
