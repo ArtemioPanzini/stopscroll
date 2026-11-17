@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.stopscroll.probe"
+    android:versionCode="1"
+    android:versionName="1.0">
+    <uses-sdk android:minSdkVersion="33" android:targetSdkVersion="33" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <queries>
+        <provider android:authorities="com.celzero.bravedns.stopscroll.usb" />
+    </queries>
+    <application
+        android:allowBackup="false"
+        android:debuggable="false"
+        android:label="Stopscroll G0 Probe"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar"
+        android:usesCleartextTraffic="true">
+        <activity
+            android:name=".ProbeActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="true"
+            android:launchMode="singleTask" />
+    </application>
+</manifest>
