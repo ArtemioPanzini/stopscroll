@@ -1,10 +1,12 @@
 """YouTube-only browser policy and read-only native messaging host."""
+import base64
 import json
 import math
 import os
 from pathlib import Path
 import select
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -12,6 +14,8 @@ import time
 POLICY = '/run/stopscroll/browser.json'
 LEASE_SEC = 4
 HOST_NAME = 'org.stopscroll.youtube'
+SIGNING_KEY = '/var/lib/stopscroll/browser-key.pem'
+_last_sequence = 0
 
 
 def browser_policy(state, now):
@@ -22,7 +26,7 @@ def browser_policy(state, now):
         if site.mode == 'limited' and session is not None:
             deadline = session.ends
         if state.pause_until is not None and state.pause_until > now:
-            deadline = state.pause_until
+            deadline = max(deadline, state.pause_until)
     else:
         # Removing the group through the normal delayed command removes its guard.
         deadline = now + LEASE_SEC
@@ -32,14 +36,24 @@ def browser_policy(state, now):
                 exceptions=sorted(site.exceptions) if site else [])
 
 
-def publish_policy(state, now, path=POLICY):
+def sign_policy(data, key=SIGNING_KEY):
+    global _last_sequence
+    _last_sequence = max(time.monotonic_ns(), _last_sequence + 1)
+    data = dict(data, sequence=str(_last_sequence))
+    payload = json.dumps(data, separators=(',', ':'), allow_nan=False).encode()
+    signature = subprocess.run(['openssl', 'dgst', '-sha256', '-sign', str(key)],
+                               input=payload, capture_output=True, check=True, timeout=5).stdout
+    return dict(payload=base64.b64encode(payload).decode(), signature=base64.b64encode(signature).decode())
+
+
+def publish_policy(state, now, path=POLICY, key=SIGNING_KEY):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix='.browser-', dir=path.parent)
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as stream:
             os.fchmod(stream.fileno(), 0o644)
-            json.dump(browser_policy(state, now), stream, separators=(',', ':'), allow_nan=False)
+            json.dump(sign_policy(browser_policy(state, now), key), stream, separators=(',', ':'), allow_nan=False)
             stream.write('\n')
             stream.flush()
             os.fsync(stream.fileno())
@@ -52,12 +66,25 @@ def read_policy(path=POLICY, now=None):
     from .changes import ChangeError, normalize_domain
     now = time.time() if now is None else now
     try:
-        raw = Path(path).read_bytes()
-        if len(raw) > 65536:
+        with Path(path).open('rb') as stream:
+            raw = stream.read(131073)
+        if len(raw) > 131072:
             return None
-        data = json.loads(raw)
+        envelope = json.loads(raw)
+        if (not isinstance(envelope, dict) or set(envelope) != {'payload', 'signature'}
+                or any(not isinstance(envelope[k], str) for k in envelope)):
+            return None
+        payload = base64.b64decode(envelope['payload'], validate=True)
+        signature = base64.b64decode(envelope['signature'], validate=True)
+        if len(payload) > 65536 or not 128 <= len(signature) <= 1024:
+            return None
+        data = json.loads(payload)
         if not isinstance(data, dict) or set(data) != {
-                'version', 'issued_at', 'lease_until', 'allowed_until', 'domains', 'exceptions'}:
+                'version', 'sequence', 'issued_at', 'lease_until', 'allowed_until', 'domains', 'exceptions'}:
+            return None
+        if (not isinstance(data['sequence'], str) or not data['sequence'].isascii()
+                or not data['sequence'].isdigit() or not 1 <= len(data['sequence']) <= 25
+                or data['sequence'].startswith('0')):
             return None
         if type(data['version']) is not int or data['version'] != 1:
             return None
@@ -73,7 +100,7 @@ def read_policy(path=POLICY, now=None):
             if any(not isinstance(domain, str) or normalize_domain(domain) != domain
                    for domain in data[key]):
                 return None
-        return data
+        return envelope
     except (OSError, ValueError, TypeError, ChangeError):
         return None
 
@@ -100,12 +127,40 @@ def native_host(input_stream=None, output_stream=None, path=POLICY):
         return 0
 
 
-if __name__ == '__main__':
-    raise SystemExit(native_host())
-
-
 PACKAGE = '/usr/local/lib/stopscroll/browser/package.json'
 REGISTRATION = 'stopscroll-youtube.json'
+
+
+def check_conflicts(runner=None):
+    """Reject competing platform dictionaries before packaging or registration."""
+    from .system import Runner
+    runner = Runner() if runner is None else runner
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate JSON key')
+            result[key] = value
+        return result
+
+    for directory in ('/etc/opt/chrome/policies/managed', '/etc/chromium/policies/managed'):
+        folder = runner.path(directory)
+        if not folder.exists():
+            continue
+        for path in folder.iterdir():
+            if path.name == REGISTRATION or path.is_dir():
+                continue
+            try:
+                # Chromium loads every file and accepts JSONC. Reject syntax we
+                # cannot unambiguously interpret, rather than silently hiding it.
+                data = json.loads(path.read_text(), object_pairs_hook=unique_object,
+                                  parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+                if not isinstance(data, dict):
+                    raise ValueError('policy is not an object')
+            except (OSError, ValueError, UnicodeError) as exc:
+                raise ValueError(f'Неоднозначный или нечитаемый файл политики {path.name}; установка остановлена') from exc
+            if 'ExtensionSettings' in data:
+                raise ValueError(f'Конфликт ExtensionSettings в {path.name}; политика не изменена')
 
 
 def register(runner=None):
@@ -113,6 +168,7 @@ def register(runner=None):
     import re
     from .system import Runner
     runner = Runner() if runner is None else runner
+    check_conflicts(runner)
     metadata = runner.path(PACKAGE)
     if not metadata.exists():
         return []
@@ -146,3 +202,7 @@ def register(runner=None):
             Path(temporary).unlink(missing_ok=True)
         messages.append(f'Исправлена браузерная защита: {name}')
     return messages
+
+
+if __name__ == '__main__':
+    raise SystemExit(native_host())

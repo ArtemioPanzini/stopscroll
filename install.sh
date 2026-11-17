@@ -32,6 +32,14 @@ if listeners.strip():
             sys.exit('Ошибка: порт 5354 занят посторонним процессом; установка остановлена.')
 PY
 SOURCE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# Package and check policy conflicts before stopping any existing service or
+# replacing installed Python. Import the new source, including on an old install.
+BROWSER_STAGE=''
+if [[ -x /opt/google/chrome/chrome || -x /usr/bin/chromium || -x /usr/bin/chromium-browser ]]; then
+    BROWSER_STAGE=$(mktemp -d /tmp/stopscroll-install-stage-XXXXXX)
+    trap '[[ -z $BROWSER_STAGE ]] || rm -rf -- "$BROWSER_STAGE"' EXIT
+    PYTHONPATH="$SOURCE" /usr/bin/python3 "$SOURCE/browser/install.py" --stage "$BROWSER_STAGE"
+fi
 # Prevent two state writers and a watchdog restart during a repeat installation.
 for unit in stopscroll-watchdog.timer stopscrolld.service; do
     if systemctl cat "$unit" >/dev/null 2>&1; then
@@ -68,15 +76,13 @@ install -d -o root -g root -m 0755 /etc/systemd/user
 install -o root -g root -m 0644 "$SOURCE/system/stopscroll-notify.service" /etc/systemd/user/stopscroll-notify.service
 systemctl daemon-reload
 install -d -o root -g root -m 0700 /var/lib/stopscroll
-if [[ $SOURCE != /usr/local/lib/stopscroll ]]; then
+if [[ -n $BROWSER_STAGE ]]; then
     install -d -o root -g root -m 0755 /usr/local/lib/stopscroll/browser
-    cp -R -- "$SOURCE/browser/extension" /usr/local/lib/stopscroll/browser/
-    install -o root -g root -m 0644 "$SOURCE/browser/install.py" /usr/local/lib/stopscroll/browser/install.py
-fi
-chown -R root:root /usr/local/lib/stopscroll/browser
-chmod -R u=rwX,go=rX /usr/local/lib/stopscroll/browser
-if [[ -x /opt/google/chrome/chrome || -x /usr/bin/chromium || -x /usr/bin/chromium-browser ]]; then
-    PYTHONPATH=/usr/local/lib/stopscroll /usr/bin/python3 /usr/local/lib/stopscroll/browser/install.py
+    cp -R -- "$BROWSER_STAGE/browser/." /usr/local/lib/stopscroll/browser/
+    install -o root -g root -m 0600 "$BROWSER_STAGE/browser-key.pem" /var/lib/stopscroll/browser-key.pem
+    chown -R root:root /usr/local/lib/stopscroll/browser
+    chmod -R u=rwX,go=rX /usr/local/lib/stopscroll/browser
+    PYTHONPATH=/usr/local/lib/stopscroll /usr/bin/python3 -c 'from stopscroll.browser import register; register()'
 else
     echo 'Предупреждение: Chrome/Chromium отсутствует; браузерная защита YouTube не установлена.' >&2
 fi

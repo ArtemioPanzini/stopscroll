@@ -10,7 +10,7 @@ import subprocess
 from .blocklist import DNS_PORT, QUARANTINE_SEC, render_dnsmasq, render_nft, set_names
 from .model import State, Quarantine
 from .telegram import POLICY, publish_policy
-from .browser import POLICY as BROWSER_POLICY, publish_policy as publish_browser, register as register_browser
+from .browser import POLICY as BROWSER_POLICY, SIGNING_KEY, publish_policy as publish_browser, register as register_browser
 
 DNS_CONF = '/var/lib/stopscroll/dnsmasq.conf'
 RESOLVED_DROPIN = '/etc/systemd/resolved.conf.d/stopscroll.conf'
@@ -71,8 +71,10 @@ class System:
         return []
 
     def sync_browser(self, state: State, now: float) -> list[str]:
+        if not self.runner.path(SIGNING_KEY).is_file():
+            return []
         try:
-            publish_browser(state, now, self.runner.path(BROWSER_POLICY))
+            publish_browser(state, now, self.runner.path(BROWSER_POLICY), self.runner.path(SIGNING_KEY))
             return []
         except Exception as exc:
             return [f'сбой: политика браузера: {exc}']

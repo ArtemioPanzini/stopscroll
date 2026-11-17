@@ -13,6 +13,10 @@ for name in ['install', 'state', 'policy', 'etc-upper', 'etc-work', 'home', 'run
     (test/name).mkdir()
 shutil.copytree(root/'stopscroll', test/'install/stopscroll')
 shutil.copytree(root/'browser', test/'install/browser')
+shutil.copytree(root/'stopscroll',test/'source/stopscroll')
+shutil.copytree(root/'browser',test/'source/browser')
+shutil.copyfile(root/'install.sh',test/'source/install.sh')
+(test/'control.json').write_text('{"mode":"signed","deadline":0}')
 subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-keyout',str(test/'key.pem'),'-out',str(test/'cert.pem'),'-days','1','-subj','/CN=www.youtube.com'],check=True,capture_output=True)
 with wave.open(str(test/'media.wav'),'wb') as media:
     media.setnchannels(1); media.setsampwidth(2); media.setframerate(8000)
