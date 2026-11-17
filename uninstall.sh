@@ -12,6 +12,13 @@ cleanup() {
 if [[ -f /etc/stopscroll/owner-uid ]]; then
     owner_uid=$(cat /etc/stopscroll/owner-uid)
     if [[ $owner_uid =~ ^[0-9]+$ && $owner_uid != 0 ]]; then
+        if [[ -f /usr/local/lib/stopscroll/telegram/desktop.py ]]; then
+            if [[ -S /run/user/$owner_uid/bus ]]; then
+                cleanup sudo -u "#$owner_uid" XDG_RUNTIME_DIR="/run/user/$owner_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$owner_uid/bus" /usr/bin/python3 /usr/local/lib/stopscroll/telegram/desktop.py restore
+            else
+                cleanup sudo -u "#$owner_uid" dbus-run-session -- /usr/bin/python3 /usr/local/lib/stopscroll/telegram/desktop.py restore
+            fi
+        fi
         cleanup sudo -u "#$owner_uid" XDG_RUNTIME_DIR="/run/user/$owner_uid" systemctl --user disable --now stopscroll-notify.service
     fi
 fi
@@ -51,6 +58,8 @@ if path.exists():
 PY
 cleanup rm -f /etc/systemd/system/stopscroll-dns.service /etc/systemd/system/stopscrolld.service /etc/systemd/system/stopscroll-watchdog.service /etc/systemd/system/stopscroll-watchdog.timer /etc/systemd/user/stopscroll-notify.service
 cleanup rm -f /usr/local/bin/stopscroll
+cleanup rm -f /usr/local/bin/stopscroll-telegram /usr/local/share/applications/org.telegram.desktop.desktop
+# Includes the published Telegram channel policy telegram.json.
 cleanup rm -rf /etc/stopscroll /var/lib/stopscroll
 if id stopscroll-dns >/dev/null 2>&1; then
     cleanup userdel stopscroll-dns

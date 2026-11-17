@@ -15,5 +15,5 @@ def initial_state(owner_uid: int, day: str) -> State:
         'kick': Site('blocked', ['kick.com'], [], 0),
         'instagram': Site('blocked', ['instagram.com', 'cdninstagram.com', 'instagr.am', 'ig.me'], [], 0),
         'youtube': Site('limited', ['youtube.com', 'youtu.be', 'googlevideo.com', 'youtube-nocookie.com', 'youtubei.googleapis.com', 'youtube.googleapis.com'], ['accounts.youtube.com'], 45),
-        'x': Site('limited', ['x.com', 'twitter.com'], [], 30),
+        'x': Site('limited', ['x.com', 'twitter.com'], [], 10),
     })

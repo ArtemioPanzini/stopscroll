@@ -8,9 +8,11 @@ import sys
 import time
 
 from .daemon import SOCKET
+from .telegram import normalize_channel
 from .changes import normalize_domain, ChangeError, SITE_RE
 
 HELP = '''Использование: stopscroll [status | doctor | open САЙТ [МИНУТЫ] | close САЙТ |
+  telegram block ИМЯ [--yes] | request telegram-unblock ИМЯ |
   block САЙТ [ДОМЕН ...] | remove-exception САЙТ ДОМЕН |
   limit САЙТ МИНУТЫ | delay МИНУТЫ | cancel НОМЕР |
   request budget САЙТ МИНУТЫ | request bonus САЙТ МИНУТЫ |
@@ -38,7 +40,7 @@ def _number(text, maximum=1440):
 def build_request(argv, known=None):
     args = list(argv)
     if '--yes' in args:
-        if args.count('--yes') > 1 or not args or args[0] not in ('block','limit','delay','remove-exception'):
+        if args.count('--yes') > 1 or not args or args[0] not in ('block','limit','delay','remove-exception','telegram'):
             _bad()
         args.remove('--yes')
     if not args:
@@ -47,7 +49,9 @@ def build_request(argv, known=None):
     change = None
     if cmd in ('status','doctor') and not a:
         return dict(cmd=cmd)
-    if cmd == 'open' and len(a) in (1,2):
+    if cmd == 'telegram' and len(a) == 2 and a[0] == 'block':
+        change = dict(kind='telegram_block', username=a[1])
+    elif cmd == 'open' and len(a) in (1,2):
         req = dict(cmd=cmd,site=a[0],minutes=_number(a[1]) if len(a)==2 else None)
     elif cmd == 'close' and len(a)==1:
         req = dict(cmd=cmd,site=a[0])
@@ -70,7 +74,9 @@ def build_request(argv, known=None):
         change=dict(kind='set_delay',minutes=_number(a[0]))
     elif cmd=='request' and a:
         sub,*b=a
-        if sub in ('budget','bonus','limit') and len(b)==2:
+        if sub == 'telegram-unblock' and len(b) == 1:
+            change = dict(kind='telegram_unblock', username=b[0])
+        elif sub in ('budget','bonus','limit') and len(b)==2:
             change=dict(kind={'budget':'set_budget','bonus':'bonus','limit':'set_mode'}[sub],site=b[0])
             change.update(dict(mode='limited',budget_min=_number(b[1])) if sub=='limit' else dict(minutes=_number(b[1])))
         elif sub=='unblock' and len(b) in (1,2):
@@ -92,15 +98,16 @@ def build_request(argv, known=None):
     if 'site' in target and not re.fullmatch(SITE_RE,target['site']):
         _bad('Некорректное имя сайта')
     try:
+        if 'username' in target: target['username'] = normalize_channel(target['username'])
         if 'domain' in target: target['domain']=normalize_domain(target['domain'])
         if 'domains' in target: target['domains']=[normalize_domain(d) for d in target['domains']]
-    except ChangeError as exc:
+    except (ChangeError, ValueError) as exc:
         _bad(str(exc))
     return req
 
 
 def needs_confirmation(argv):
-    return bool(argv) and argv[0] in ('block','limit','delay','remove-exception') and '--yes' not in argv
+    return bool(argv) and argv[0] in ('block','limit','delay','remove-exception','telegram') and '--yes' not in argv
 
 
 def _hm(stamp,tz):
@@ -118,6 +125,10 @@ def render_status(status,now,tz=None):
         # Preserve the published status layout, including its closed-row spacing.
         width=max(36,len(state)+3)
         lines.append(f"  {site['site']:<10}{state:<{width}}сегодня {site['spent_min']:2} из {budget} мин")
+    if status.get('telegram_policy_pending'):
+        lines += ['', 'Telegram: ошибка публикации политики; повторная попытка ожидается.']
+    if status.get('telegram_channels'):
+        lines += ['', 'Telegram: ' + '  '.join('@' + name for name in status['telegram_channels'])]
     if status['pending']:
         lines += ['','Ждут применения:']
         for p in status['pending']:
@@ -146,6 +157,7 @@ def render_reply(req,reply,tz=None):
 def _describe(change):
     site=change.get('site','')
     kind=change['kind']
+    if kind=='telegram_block': return f"Telegram: @{change['username']} будет заблокирован."
     if kind=='remove_exception': return f"{site}: исключение {change['domain']} будет удалено; домен подпадает под блокировку сайта."
     if kind=='set_delay': return f"Задержка на ослабление станет {change['minutes']} мин."
     if kind=='set_budget': return f"{site}: дневной бюджет станет {change['minutes']} мин."

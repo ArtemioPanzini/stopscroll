@@ -1,0 +1,1432 @@
+diff --git a/Telegram/CMakeLists.txt b/Telegram/CMakeLists.txt
+index 1601b50..758bdb9 100644
+--- a/Telegram/CMakeLists.txt
++++ b/Telegram/CMakeLists.txt
+@@ -626,6 +626,10 @@ PRIVATE
+     core/private_temp_directory.h
+     core/sandbox.cpp
+     core/sandbox.h
++    stopscroll/stopscroll.cpp
++    stopscroll/stopscroll.h
++    stopscroll/stopscroll_policy.cpp
++    stopscroll/stopscroll_policy.h
+     core/shortcuts.cpp
+     core/shortcuts.h
+     core/ton_explorer_url.cpp
+diff --git a/Telegram/Resources/langs/lang.strings b/Telegram/Resources/langs/lang.strings
+index d61c09c..238a5db 100644
+--- a/Telegram/Resources/langs/lang.strings
++++ b/Telegram/Resources/langs/lang.strings
+@@ -9141,4 +9141,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ "lng_tgw_copied" = "Copied: {text}";
+ "lng_in_dlg_widget" = "Widget";
+ 
++"lng_stopscroll_channel_blocked" = "Канал заблокирован Stopscroll.";
++"lng_stopscroll_policy_unavailable" = "Политика Stopscroll недоступна. Каналы временно закрыты.";
++
+ // Keys finished
+diff --git a/Telegram/SourceFiles/AGENTS.md b/Telegram/SourceFiles/AGENTS.md
+index 3701dd3..495aeff 100644
+--- a/Telegram/SourceFiles/AGENTS.md
++++ b/Telegram/SourceFiles/AGENTS.md
+@@ -38,6 +38,10 @@ This atlas divides Telegram Desktop's sources into named areas, ordered from fou
+ - Paths: `SourceFiles/core/update_*`, `SourceFiles/_other/updater*`, `SourceFiles/_other/packer*`, `SourceFiles/platform/linux/update_install_linux*`
+ - Checking, downloading, verifying, unpacking and installing new versions per channel, the standalone Updater, the Linux protected install and the release Packer. It must not own changelogs or settings UI.
+ 
++### stopscroll — local channel restrictions
++- Paths: `SourceFiles/stopscroll/`
++- Loading the external Stopscroll policy, matching channel identities, reporting observed IDs and exposing local access checks and navigation enforcement. It must not own screens, Telegram transport, system DNS or website budgets.
++
+ ### accounts — accounts and sessions
+ - Paths: `SourceFiles/main/`
+ - The multi-account `Main::Domain`, each `Main::Account` with its MTP instance and local storage, the logged-in `Main::Session` that owns data, API and storage, per-session settings and the server `AppConfig`. It must not own feature logic beyond holding components.
+diff --git a/Telegram/SourceFiles/data/data_peer.cpp b/Telegram/SourceFiles/data/data_peer.cpp
+index 33a0313..b94b8e7 100644
+--- a/Telegram/SourceFiles/data/data_peer.cpp
++++ b/Telegram/SourceFiles/data/data_peer.cpp
+@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "data/data_peer.h"
+ 
+ #include "api/api_sensitive_content.h"
++#include "stopscroll/stopscroll.h"
+ #include "data/data_user.h"
+ #include "data/data_chat.h"
+ #include "data/data_chat_participant_status.h"
+@@ -619,6 +620,9 @@ auto PeerData::unavailableReasons() const
+ }
+ 
+ QString PeerData::computeUnavailableReason() const {
++	if (Stopscroll::Blocked(this)) {
++		return Stopscroll::UnavailableReason();
++	}
+ 	return Data::UnavailableReason::Compute(
+ 		&session(),
+ 		unavailableReasons());
+diff --git a/Telegram/SourceFiles/dialogs/dialogs_inner_widget.cpp b/Telegram/SourceFiles/dialogs/dialogs_inner_widget.cpp
+index 12006cf..e332a6a 100644
+--- a/Telegram/SourceFiles/dialogs/dialogs_inner_widget.cpp
++++ b/Telegram/SourceFiles/dialogs/dialogs_inner_widget.cpp
+@@ -6,6 +6,7 @@ For license and copyright information please follow this link:
+ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "dialogs/dialogs_inner_widget.h"
++#include "stopscroll/stopscroll.h"
+ 
+ #include "dialogs/dialogs_three_state_icon.h"
+ #include "dialogs/ui/chat_search_empty.h"
+@@ -113,6 +114,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include <QtCore/QMimeData>
+ #include <unordered_map>
+ 
++#include <QtCore/QTimer>
++
+ namespace Dialogs {
+ namespace {
+ 
+@@ -321,6 +324,16 @@ InnerWidget::InnerWidget(
+ 	+ st::defaultDialogRow.padding.left())
+ , _childListShown(std::move(childListShown))
+ , _freezeTimer([=] { _shownList->unfreeze(); update(); }) {
++	const auto stopscrollTimer = new QTimer(this);
++	QObject::connect(stopscrollTimer, &QTimer::timeout, this,
++		[=, revision = Stopscroll::Revision()]() mutable {
++			const auto current = Stopscroll::Revision();
++			if (current != revision) {
++				revision = current;
++				refreshStopscroll();
++			}
++		});
++	stopscrollTimer->start(1000);
+ 	setAttribute(Qt::WA_OpaquePaintEvent, true);
+ 	setAccessibleName(tr::lng_recent_chats(tr::now));
+ 
+@@ -4595,7 +4608,10 @@ void InnerWidget::refreshFilterResults() {
+ 		: TextUtilities::PrepareSearchWords(_filter);
+ 	_filterResults.clear();
+ 	const auto append = [&](not_null<IndexedList*> list) {
+-		const auto results = list->filtered(words);
++		auto results = list->filtered(words);
++		std::erase_if(results, [](const auto row) {
++			return Stopscroll::Blocked(row->key().peer());
++		});
+ 		auto top = filteredHeight();
+ 		auto i = _filterResults.insert(
+ 			end(_filterResults),
+@@ -4623,6 +4639,9 @@ void InnerWidget::refreshFilterResults() {
+ 		}
+ 	}
+ 	for (const auto &[key, row] : _filterResultsGlobal) {
++		if (Stopscroll::Blocked(key.peer())) {
++			continue;
++		}
+ 		if (!ranges::contains(_filterResults, key, &FilterResult::key)) {
+ 			const auto height = filteredHeight();
+ 			_filterResults.emplace_back(row.get());
+@@ -4632,7 +4651,47 @@ void InnerWidget::refreshFilterResults() {
+ 	}
+ }
+ 
++void InnerWidget::refreshStopscroll() {
++	clearMouseSelection(true);
++	refreshFilterResults();
++	std::erase_if(_peerSearchResults, [](const auto &row) {
++		return Stopscroll::Blocked(row->peer);
++	});
++	const auto prune = [&](auto &rows, bool preview) {
++		const auto containsBlocked = ranges::any_of(rows, [](const auto &row) {
++			return Stopscroll::Blocked(row->item()->history()->peer);
++		});
++		if (!containsBlocked) {
++			return;
++		}
++		auto kept = std::vector<std::unique_ptr<FakeRow>>();
++		for (const auto &row : rows) {
++			if (Stopscroll::Blocked(row->item()->history()->peer)) {
++				continue;
++			}
++			const auto index = int(kept.size());
++			kept.push_back(std::make_unique<FakeRow>(
++				row->searchInChat(),
++				row->item(),
++				[=] {
++					if (preview) {
++						repaintPreviewResult(index);
++					} else {
++						repaintSearchResult(index);
++					}
++				}));
++		}
++		rows = std::move(kept);
++	};
++	prune(_searchResults, false);
++	prune(_previewResults, true);
++	refresh();
++}
++
+ void InnerWidget::appendToFiltered(Key key) {
++	if (Stopscroll::Blocked(key.peer())) {
++		return;
++	}
+ 	for (const auto &row : _filterResults) {
+ 		if (row.key() == key) {
+ 			return;
+@@ -5022,6 +5081,7 @@ void InnerWidget::searchReceived(
+ 		? _searchState.inChat
+ 		: Key(_openedForum->history());
+ 	if (inject
++		&& !Stopscroll::Blocked(inject->history()->peer)
+ 		&& (globalSearch
+ 			|| !_searchState.inChat
+ 			|| inject->history() == _searchState.inChat.history())) {
+@@ -5039,6 +5099,9 @@ void InnerWidget::searchReceived(
+ 	auto &results = toPreview ? _previewResults : _searchResults;
+ 	for (const auto &item : messages) {
+ 		const auto history = item->history();
++		if (Stopscroll::Blocked(history->peer)) {
++			continue;
++		}
+ 		if (toPreview || !uniquePeers || !hasHistoryInResults(history)) {
+ 			const auto index = int(results.size());
+ 			const auto repaint = toPreview
+@@ -5087,7 +5150,9 @@ void InnerWidget::peerSearchReceived(Api::PeerSearchResult result) {
+ 	auto added = base::flat_set<not_null<PeerData*>>();
+ 	for (const auto &sponsored : result.sponsored) {
+ 		const auto peer = sponsored.peer;
+-		if (inlist(peer) || _sponsoredRemoved.contains(peer)) {
++		if (Stopscroll::Blocked(peer)
++			|| inlist(peer)
++			|| _sponsoredRemoved.contains(peer)) {
+ 			continue;
+ 		}
+ 		_peerSearchResults.push_back(
+@@ -5099,7 +5164,7 @@ void InnerWidget::peerSearchReceived(Api::PeerSearchResult result) {
+ 		added.emplace(peer);
+ 	}
+ 	for (const auto &peer : result.peers) {
+-		if (added.contains(peer) || inlist(peer)) {
++		if (Stopscroll::Blocked(peer) || added.contains(peer) || inlist(peer)) {
+ 			continue;
+ 		}
+ 		_peerSearchResults.push_back(
+diff --git a/Telegram/SourceFiles/dialogs/dialogs_inner_widget.h b/Telegram/SourceFiles/dialogs/dialogs_inner_widget.h
+index ab01704..e733a68 100644
+--- a/Telegram/SourceFiles/dialogs/dialogs_inner_widget.h
++++ b/Telegram/SourceFiles/dialogs/dialogs_inner_widget.h
+@@ -592,6 +592,7 @@ private:
+ 
+ 	void announceSelectedFocus();
+ 	void refreshFilterResults();
++	void refreshStopscroll();
+ 	void clearSearchResults(bool alsoPeerSearchResults = true);
+ 	void clearPeerSearchResults();
+ 	void clearPreviewResults();
+diff --git a/Telegram/SourceFiles/dialogs/ui/dialogs_suggestions.cpp b/Telegram/SourceFiles/dialogs/ui/dialogs_suggestions.cpp
+index 0ce6515..24f52d4 100644
+--- a/Telegram/SourceFiles/dialogs/ui/dialogs_suggestions.cpp
++++ b/Telegram/SourceFiles/dialogs/ui/dialogs_suggestions.cpp
+@@ -49,6 +49,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "settings/settings_credits_graphics.h"
+ #include "settings/sections/settings_premium.h"
+ #include "storage/storage_shared_media.h"
++#include "stopscroll/stopscroll.h"
+ #include "ui/boxes/confirm_box.h"
+ #include "ui/controls/swipe_handler.h"
+ #include "ui/effects/loading_element.h"
+@@ -84,6 +85,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "styles/style_menu_icons.h"
+ #include "styles/style_window.h"
+ 
++#include <QtCore/QTimer>
+ #include <QtWidgets/QApplication>
+ 
+ namespace Dialogs {
+@@ -120,6 +122,42 @@ constexpr auto kQueryPreviewLimit = 32;
+ 	return result;
+ }
+ 
++[[nodiscard]] std::unique_ptr<QTimer> WatchChannelPolicy(Fn<void()> refresh) {
++	auto timer = std::make_unique<QTimer>();
++	QObject::connect(timer.get(), &QTimer::timeout, timer.get(),
++		[revision = Stopscroll::Revision(), refresh = std::move(refresh)]() mutable {
++			const auto current = Stopscroll::Revision();
++			if (revision != current) {
++				revision = current;
++				refresh();
++			}
++		});
++	timer->start(1000);
++	return timer;
++}
++
++void FillChannelRows(
++		not_null<PeerListDelegate*> delegate,
++		const std::vector<not_null<PeerData*>> &peers,
++		int limit,
++		Fn<void(not_null<PeerData*>)> append) {
++	const auto already = delegate->peerListFullRowsCount();
++	auto same = (already == limit);
++	for (auto i = 0; same && i != limit; ++i) {
++		same = (delegate->peerListRowAt(i)->peer() == peers[i]);
++	}
++	if (same) {
++		return;
++	}
++	for (auto i = already; i != 0;) {
++		delegate->peerListRemoveRow(delegate->peerListRowAt(--i));
++	}
++	for (auto i = 0; i != limit; ++i) {
++		append(peers[i]);
++	}
++	delegate->peerListRefreshRows();
++}
++
+ void UpdateVisibleRange(
+ 		not_null<Ui::ElasticScroll*> scroll,
+ 		not_null<InnerWidget*> content,
+@@ -617,7 +655,7 @@ public:
+ 
+ private:
+ 	void appendRow(not_null<ChannelData*> channel);
+-	void fill(bool force = false);
++	void fill();
+ 	void refilter();
+ 	[[nodiscard]] const std::vector<not_null<History*>> &shown() const;
+ 
+@@ -626,6 +664,7 @@ private:
+ 	std::vector<not_null<History*>> _channels;
+ 	std::vector<not_null<History*>> _filtered;
+ 	rpl::lifetime _lifetime;
++	std::unique_ptr<QTimer> _policyTimer;
+ 
+ };
+ 
+@@ -647,6 +686,7 @@ private:
+ 	std::vector<not_null<PeerData*>> _peers;
+ 	const bool _expandable = false;
+ 	rpl::lifetime _lifetime;
++	std::unique_ptr<QTimer> _policyTimer;
+ 
+ };
+ 
+@@ -666,6 +706,7 @@ private:
+ 
+ 	bool _requested = false;
+ 	rpl::lifetime _lifetime;
++	std::unique_ptr<QTimer> _policyTimer;
+ 
+ };
+ 
+@@ -1173,6 +1214,8 @@ MyChannelsController::MyChannelsController(
+ }
+ 
+ void MyChannelsController::prepare() {
++	_policyTimer = WatchChannelPolicy([=] { fill(); });
++
+ 	setupExpandDivider(tr::lng_channels_your_title());
+ 
+ 	session().changes().peerUpdates(
+@@ -1190,12 +1233,7 @@ void MyChannelsController::prepare() {
+ 		_channels.erase(i, end(_channels));
+ 		_filtered.erase(ranges::remove(_filtered, history), end(_filtered));
+ 		removeFound(channel);
+-		const auto row = delegate()->peerListFindRow(channel->id.value);
+-		if (row) {
+-			delegate()->peerListRemoveRow(row);
+-		}
+-		setCount(shown().size());
+-		fill(true);
++		fill();
+ 	}, _lifetime);
+ 
+ 	_channels.reserve(kProbablyMaxChannels);
+@@ -1215,7 +1253,6 @@ void MyChannelsController::prepare() {
+ 	}
+ 
+ 	ranges::sort(_channels, ranges::greater(), &History::chatListTimeId);
+-	setCount(_channels.size());
+ 
+ 	expanded() | rpl::on_next([=] {
+ 		fill();
+@@ -1246,7 +1283,6 @@ void MyChannelsController::prepare() {
+ 		const auto was = countCurrent();
+ 		const auto now = int(_channels.size());
+ 		if (was != now) {
+-			setCount(now);
+ 			fill();
+ 		}
+ 	}, _lifetime);
+@@ -1272,36 +1308,31 @@ void MyChannelsController::refilter() {
+ 			}
+ 		}
+ 	}
+-	for (auto i = delegate()->peerListFullRowsCount(); i != 0;) {
+-		delegate()->peerListRemoveRow(delegate()->peerListRowAt(--i));
+-	}
+-	setCount(shown().size());
+-	fill(true);
++	fill();
+ }
+ 
+ const std::vector<not_null<History*>> &MyChannelsController::shown() const {
+ 	return words().isEmpty() ? _channels : _filtered;
+ }
+ 
+-void MyChannelsController::fill(bool force) {
+-	const auto count = countCurrent();
++void MyChannelsController::fill() {
++	const auto peers = [&] {
++		auto result = std::vector<not_null<PeerData*>>();
++		for (const auto history : shown()) {
++			if (!Stopscroll::Blocked(history->peer)) {
++				result.push_back(history->peer);
++			}
++		}
++		return result;
++	}();
++	const auto count = int(peers.size());
++	setCount(count);
+ 	const auto limit = expandedCurrent()
+ 		? count
+ 		: std::min(count, kCollapsedChannelsCount);
+-	const auto already = delegate()->peerListFullRowsCount();
+-	const auto delta = limit - already;
+-	if (!delta && !force) {
+-		return;
+-	} else if (delta > 0) {
+-		for (auto i = already; i != limit; ++i) {
+-			appendRow(shown()[i]->peer->asBroadcast());
+-		}
+-	} else if (delta < 0) {
+-		for (auto i = already; i != limit;) {
+-			delegate()->peerListRemoveRow(delegate()->peerListRowAt(--i));
+-		}
+-	}
+-	delegate()->peerListRefreshRows();
++	FillChannelRows(delegate(), peers, limit, [=](not_null<PeerData*> peer) {
++		appendRow(peer->asBroadcast());
++	});
+ }
+ 
+ void MyChannelsController::appendRow(not_null<ChannelData*> channel) {
+@@ -1345,6 +1376,8 @@ GlobalPeersController::GlobalPeersController(
+ }
+ 
+ void GlobalPeersController::prepare() {
++	_policyTimer = WatchChannelPolicy([=] { fill(); });
++
+ 	if (_expandable) {
+ 		setupExpandDivider(tr::lng_search_global_results());
+ 	} else {
+@@ -1359,29 +1392,24 @@ void GlobalPeersController::prepare() {
+ 	std::move(
+ 		_results
+ 	) | rpl::on_next([=](std::vector<not_null<PeerData*>> &&peers) {
+-		for (auto i = delegate()->peerListFullRowsCount(); i != 0;) {
+-			delegate()->peerListRemoveRow(delegate()->peerListRowAt(--i));
+-		}
+ 		_peers = std::move(peers);
+-		setCount(_peers.size());
+ 		collapse();
+ 		fill();
+ 	}, _lifetime);
+ }
+ 
+ void GlobalPeersController::fill() {
+-	const auto count = int(_peers.size());
++	const auto peers = FilterPeers(_peers, [](not_null<PeerData*> peer) {
++		return !Stopscroll::Blocked(peer);
++	});
++	const auto count = int(peers.size());
++	setCount(count);
+ 	const auto limit = (_expandable && !expandedCurrent())
+ 		? std::min(count, kCollapsedChannelsCount)
+ 		: count;
+-	const auto already = delegate()->peerListFullRowsCount();
+-	for (auto i = already; i < limit; ++i) {
+-		appendRow(_peers[i]);
+-	}
+-	for (auto i = already; i > limit;) {
+-		delegate()->peerListRemoveRow(delegate()->peerListRowAt(--i));
+-	}
+-	delegate()->peerListRefreshRows();
++	FillChannelRows(delegate(), peers, limit, [=](not_null<PeerData*> peer) {
++		appendRow(peer);
++	});
+ }
+ 
+ void GlobalPeersController::appendRow(not_null<PeerData*> peer) {
+@@ -1417,6 +1445,8 @@ RecommendationsController::RecommendationsController(
+ }
+ 
+ void RecommendationsController::prepare() {
++	_policyTimer = WatchChannelPolicy([=] { fill(); });
++
+ 	setupPlainDivider(tr::lng_channels_recommended());
+ 	setupActiveRows();
+ 	fill();
+@@ -1437,17 +1467,15 @@ void RecommendationsController::load() {
+ 
+ void RecommendationsController::fill() {
+ 	const auto participants = &session().api().chatParticipants();
+-	const auto &list = participants->recommendations().list;
+-	if (list.empty()) {
+-		return;
+-	}
+-	for (const auto &peer : list) {
+-		if (const auto channel = peer->asBroadcast()) {
+-			appendRow(channel);
+-		}
+-	}
+-	delegate()->peerListRefreshRows();
+-	setCount(delegate()->peerListFullRowsCount());
++	const auto peers = FilterPeers(
++		participants->recommendations().list,
++		[](not_null<PeerData*> peer) {
++			return peer->asBroadcast() && !Stopscroll::Blocked(peer);
++		});
++	FillChannelRows(delegate(), peers, peers.size(), [=](not_null<PeerData*> peer) {
++		appendRow(peer->asBroadcast());
++	});
++	setCount(peers.size());
+ }
+ 
+ void RecommendationsController::appendRow(not_null<ChannelData*> channel) {
+diff --git a/Telegram/SourceFiles/history/history_widget.cpp b/Telegram/SourceFiles/history/history_widget.cpp
+index 895fb7c..03891f9 100644
+--- a/Telegram/SourceFiles/history/history_widget.cpp
++++ b/Telegram/SourceFiles/history/history_widget.cpp
+@@ -6,6 +6,7 @@ For license and copyright information please follow this link:
+ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "history/history_widget.h"
++#include "stopscroll/stopscroll.h"
+ 
+ #include "api/api_compose_with_ai.h"
+ #include "api/api_editing.h"
+@@ -3270,6 +3271,10 @@ void HistoryWidget::showHistory(
+ 		PeerId peerId,
+ 		MsgId showAtMsgId,
+ 		const Window::SectionShow &params) {
++	if (peerId && Stopscroll::Prevent(
++			session().data().peer(peerId), controller())) {
++		return;
++	}
+ 	_pinnedClickedId = FullMsgId();
+ 	_minPinnedId = std::nullopt;
+ 	_showAtMsgParams = {};
+diff --git a/Telegram/SourceFiles/history/view/history_view_chat_section.cpp b/Telegram/SourceFiles/history/view/history_view_chat_section.cpp
+index 22d8f65..e51bea5 100644
+--- a/Telegram/SourceFiles/history/view/history_view_chat_section.cpp
++++ b/Telegram/SourceFiles/history/view/history_view_chat_section.cpp
+@@ -300,6 +300,10 @@ void ChatMemento::setReadInformation(
+ 	_replies->setOutboxReadTill(outboxReadTillId);
+ }
+ 
++PeerData *ChatMemento::peerForStopscroll() const {
++	return _id.history->peer;
++}
++
+ object_ptr<Window::SectionWidget> ChatMemento::createWidget(
+ 		QWidget *parent,
+ 		not_null<Window::SessionController*> controller,
+diff --git a/Telegram/SourceFiles/history/view/history_view_chat_section.h b/Telegram/SourceFiles/history/view/history_view_chat_section.h
+index f387232..0695274 100644
+--- a/Telegram/SourceFiles/history/view/history_view_chat_section.h
++++ b/Telegram/SourceFiles/history/view/history_view_chat_section.h
+@@ -643,6 +643,8 @@ private:
+ 
+ class ChatMemento final : public Window::SectionMemento {
+ public:
++	PeerData *peerForStopscroll() const override;
++
+ 	explicit ChatMemento(
+ 		ChatViewId id,
+ 		MsgId highlightId = 0,
+diff --git a/Telegram/SourceFiles/info/info_memento.cpp b/Telegram/SourceFiles/info/info_memento.cpp
+index 19c6fb4..de77e6b 100644
+--- a/Telegram/SourceFiles/info/info_memento.cpp
++++ b/Telegram/SourceFiles/info/info_memento.cpp
+@@ -6,6 +6,7 @@ For license and copyright information please follow this link:
+ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "info/info_memento.h"
++#include "info/info_content_widget.h"
+ 
+ #include "info/global_media/info_global_media_widget.h"
+ #include "info/profile/info_profile_widget.h"
+@@ -396,6 +397,10 @@ std::shared_ptr<ContentMemento> Memento::DefaultContent(
+ 	Unexpected("Wrong section type in Info::Memento::DefaultContent()");
+ }
+ 
++PeerData *Memento::peerForStopscroll() const {
++	return _stack.empty() ? nullptr : _stack.back()->peer();
++}
++
+ object_ptr<Window::SectionWidget> Memento::createWidget(
+ 		QWidget *parent,
+ 		not_null<Window::SessionController*> controller,
+diff --git a/Telegram/SourceFiles/info/info_memento.h b/Telegram/SourceFiles/info/info_memento.h
+index de1c43c..bf5f355 100644
+--- a/Telegram/SourceFiles/info/info_memento.h
++++ b/Telegram/SourceFiles/info/info_memento.h
+@@ -55,6 +55,8 @@ struct MementoThreadLifetime {
+ 
+ class Memento final : public Window::SectionMemento {
+ public:
++	PeerData *peerForStopscroll() const override;
++
+ 	explicit Memento(not_null<PeerData*> peer);
+ 	Memento(not_null<PeerData*> peer, Section section);
+ 	explicit Memento(not_null<Data::ForumTopic*> topic);
+diff --git a/Telegram/SourceFiles/info/info_wrap_widget.cpp b/Telegram/SourceFiles/info/info_wrap_widget.cpp
+index 60d27d7..ef5077d 100644
+--- a/Telegram/SourceFiles/info/info_wrap_widget.cpp
++++ b/Telegram/SourceFiles/info/info_wrap_widget.cpp
+@@ -35,6 +35,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "ui/search_field_controller.h"
+ #include "ui/ui_utility.h"
+ #include "core/application.h"
++#include "stopscroll/stopscroll.h"
+ #include "calls/calls_instance.h"
+ #include "core/shortcuts.h"
+ #include "window/window_session_controller.h"
+@@ -58,6 +59,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "styles/style_info.h"
+ #include "styles/style_layers.h"
+ 
++#include <QtCore/QTimer>
++
+ namespace Info {
+ namespace {
+ 
+@@ -158,6 +161,29 @@ WrapWidget::WrapWidget(
+ 		});
+ 	}, lifetime());
+ 	restoreHistoryStack(memento->takeStack());
++	const auto timer = new QTimer(this);
++	QObject::connect(timer, &QTimer::timeout, this, [=] {
++		if (!_controller || !Stopscroll::Blocked(key().peer())) {
++			return;
++		}
++		InvokeQueued(this, [=] {
++			if (!_controller || !Stopscroll::Blocked(key().peer())) {
++				return;
++			}
++			const auto controller = _controller->parentController();
++			if (_wrap.current() == Wrap::Narrow) {
++				Stopscroll::CloseBlocked(controller);
++			} else if (_wrap.current() == Wrap::Layer) {
++				controller->showToast(Stopscroll::UnavailableReason());
++				controller->hideSpecialLayer();
++			} else {
++				controller->showToast(Stopscroll::UnavailableReason());
++				_removeRequests.fire({});
++			}
++		});
++	});
++	timer->start(1000);
++
+ 	subscribeToThreadDestroyed();
+ }
+ 
+@@ -748,9 +774,12 @@ bool WrapWidget::requireTopBarSearch() const {
+ 
+ bool WrapWidget::showBackFromStackInternal(
+ 		const Window::SectionShow &params) {
+-	if (hasStackHistory()) {
++	while (hasStackHistory()) {
+ 		auto last = std::move(_historyStack.back());
+ 		_historyStack.pop_back();
++		if (Stopscroll::Blocked(last.section->peer())) {
++			continue;
++		}
+ 		showNewContent(
+ 			last.section.get(),
+ 			params.withWay(Window::SectionShow::Way::Backward));
+@@ -970,6 +999,11 @@ bool WrapWidget::showInternal(
+ 			return false;
+ 		}
+ 		auto content = infoMemento->content();
++		if (Stopscroll::Prevent(
++				content->peer(),
++				_controller->parentController())) {
++			return true;
++		}
+ 		auto skipInternal = hasStackHistory()
+ 			&& (params.way == Window::SectionShow::Way::ClearStack);
+ 		if (_controller->validateMementoPeer(content)) {
+@@ -1055,6 +1089,11 @@ bool WrapWidget::returnToFirstStackFrame(
+ void WrapWidget::showNewContent(
+ 		not_null<ContentMemento*> memento,
+ 		const Window::SectionShow &params) {
++	if (Stopscroll::Prevent(
++			memento->peer(),
++			_controller->parentController())) {
++		return;
++	}
+ 	const auto saveToStack = (_content != nullptr)
+ 		&& (params.way == Window::SectionShow::Way::Forward);
+ 	const auto needAnimation = (_content != nullptr)
+@@ -1133,6 +1172,11 @@ void WrapWidget::showNewContent(
+ }
+ 
+ void WrapWidget::showNewContent(not_null<ContentMemento*> memento) {
++	if (_content && Stopscroll::Prevent(
++			memento->peer(),
++			_controller->parentController())) {
++		return;
++	}
+ 	// Validates contentGeometry().
+ 	setupTop();
+ 	auto newContent = createContent(memento, _controller.get());
+diff --git a/Telegram/SourceFiles/mainwidget.cpp b/Telegram/SourceFiles/mainwidget.cpp
+index 7374e83..8ae2056 100644
+--- a/Telegram/SourceFiles/mainwidget.cpp
++++ b/Telegram/SourceFiles/mainwidget.cpp
+@@ -6,6 +6,7 @@ For license and copyright information please follow this link:
+ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "mainwidget.h"
++#include "stopscroll/stopscroll.h"
+ 
+ #include "api/api_updates.h"
+ #include "api/api_views.h"
+@@ -288,6 +289,7 @@ MainWidget::MainWidget(
+ 	: nullptr)
+ , _playerPlaylist(this, _controller)
+ , _changelogs(Core::Changelogs::Create(&controller->session())) {
++	Stopscroll::Attach(this, controller);
+ 	if (_dialogs) {
+ 		setupConnectingWidget();
+ 	}
+@@ -1772,6 +1774,9 @@ bool MainWidget::handleDrawToReplyRequest(Data::DrawToReplyRequest request) {
+ void MainWidget::showMessage(
+ 		not_null<const HistoryItem*> item,
+ 		const SectionShow &params) {
++	if (Stopscroll::Prevent(item->history()->peer, _controller)) {
++		return;
++	}
+ 	const auto peerId = item->history()->peer->id;
+ 	const auto itemId = item->id;
+ 	if (!v::is_null(params.origin)) {
+@@ -1881,6 +1886,9 @@ bool MainWidget::saveSectionInStack(
+ void MainWidget::showSection(
+ 		std::shared_ptr<Window::SectionMemento> memento,
+ 		const SectionShow &params) {
++	if (Stopscroll::Prevent(memento->peerForStopscroll(), _controller)) {
++		return;
++	}
+ 	if (_mainSection && _mainSection->showInternal(
+ 			memento.get(),
+ 			params)) {
+@@ -2016,6 +2024,9 @@ Window::SectionSlideParams MainWidget::prepareHistoryAnimation(PeerId historyPee
+ void MainWidget::showNewSection(
+ 		std::shared_ptr<Window::SectionMemento> memento,
+ 		const SectionShow &params) {
++	if (Stopscroll::Prevent(memento->peerForStopscroll(), _controller)) {
++		return;
++	}
+ 	using Column = Window::Column;
+ 
+ 	if (_controller->window().locked()) {
+diff --git a/Telegram/SourceFiles/media/stories/media_stories_controller.cpp b/Telegram/SourceFiles/media/stories/media_stories_controller.cpp
+index 30c9981..8ece6a1 100644
+--- a/Telegram/SourceFiles/media/stories/media_stories_controller.cpp
++++ b/Telegram/SourceFiles/media/stories/media_stories_controller.cpp
+@@ -50,6 +50,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "info/stories/info_stories_common.h"
+ #include "payments/payments_reaction_process.h"
+ #include "settings/settings_credits_graphics.h"
++#include "stopscroll/stopscroll.h"
+ #include "ui/boxes/confirm_box.h"
+ #include "ui/boxes/report_box_graphics.h"
+ #include "ui/controls/send_button.h"
+@@ -311,7 +312,8 @@ Controller::Controller(not_null<Delegate*> delegate)
+ 	[=](not_null<Calls::GroupCall*> call) {
+ 		return _videoStreamCall.get() == call;
+ 	}))
+-, _weatherInCelsius(ResolveWeatherInCelsius()){
++, _weatherInCelsius(ResolveWeatherInCelsius())
++, _stopscrollTimer([=] { checkStoryAccess(); }) {
+ 	initLayout();
+ 
+ 	using namespace rpl::mappers;
+@@ -363,6 +365,7 @@ Controller::Controller(not_null<Delegate*> delegate)
+ 	}, _lifetime);
+ 
+ 	_contentFadeAnimation.stop();
++	_stopscrollTimer.callEach(1000);
+ }
+ 
+ Controller::~Controller() {
+@@ -371,6 +374,19 @@ Controller::~Controller() {
+ 	changeShown(nullptr);
+ }
+ 
++void Controller::checkStoryAccess() {
++	if (!shown()) {
++		return;
++	} else if (Stopscroll::Blocked(shownPeer())) {
++		_delegate->storiesClose();
++		return;
++	}
++	if (v::is<Data::StorySourcesList>(_context.data)) {
++		showSiblings(_session);
++		repaint();
++	}
++}
++
+ void Controller::updateContentFaded() {
+ 	const auto faded = _replyActive
+ 		|| (_captionFullView && !_captionFullView->closing());
+@@ -885,8 +901,11 @@ void Controller::show(
+ 			rebuildFromContext(peer, storyId);
+ 			checkMoveByDelta();
+ 		}, _contextLifetime);
+-	}, [&](Data::StorySourcesList) {
++	}, [&](Data::StorySourcesList list) {
+ 		subscribeToSource();
++		stories.sourcesChanged(list) | rpl::on_next([=] {
++			rebuildFromContext(peer, storyId);
++		}, _contextLifetime);
+ 	});
+ 
+ 	const auto guard = gsl::finally([&] {
+@@ -1177,18 +1196,26 @@ void Controller::setPlayingAllowed(bool allowed) {
+ }
+ 
+ void Controller::showSiblings(not_null<Main::Session*> session) {
+-	showSibling(
+-		_siblingLeft,
+-		session,
+-		(_cachedSourceIndex > 0
+-			? _cachedSourcesList[_cachedSourceIndex - 1]
+-			: CachedSource()));
+-	showSibling(
+-		_siblingRight,
+-		session,
+-		(_cachedSourceIndex + 1 < _cachedSourcesList.size()
+-			? _cachedSourcesList[_cachedSourceIndex + 1]
+-			: CachedSource()));
++	const auto allowed = [&](int delta) {
++		for (auto index = _cachedSourceIndex + delta
++			; index >= 0 && index < int(_cachedSourcesList.size())
++			; index += delta) {
++			const auto cached = _cachedSourcesList[index];
++			const auto source = session->data().stories().source(cached.peerId);
++			if (source && !Stopscroll::Blocked(source->peer)) {
++				return cached;
++			}
++		}
++		return CachedSource();
++	};
++	const auto right = allowed(1);
++	showSibling(_siblingLeft, session, allowed(-1));
++	showSibling(_siblingRight, session, right);
++	if (!right) {
++		if (const auto list = std::get_if<Data::StorySourcesList>(&_context.data)) {
++			session->data().stories().loadMore(*list);
++		}
++	}
+ }
+ 
+ void Controller::hideSiblings() {
+@@ -1205,7 +1232,7 @@ void Controller::showSibling(
+ 		return;
+ 	}
+ 	const auto source = session->data().stories().source(cached.peerId);
+-	if (!source) {
++	if (!source || Stopscroll::Blocked(source->peer)) {
+ 		sibling = nullptr;
+ 	} else if (!sibling || !sibling->shows(*source, cached.shownId)) {
+ 		sibling = std::make_unique<Sibling>(this, *source, cached.shownId);
+@@ -1442,6 +1469,9 @@ void Controller::checkWaitingFor() {
+ }
+ 
+ bool Controller::jumpFor(int delta) {
++	if (_session && v::is<Data::StorySourcesList>(_context.data)) {
++		showSiblings(_session);
++	}
+ 	if (delta == -1) {
+ 		if (const auto left = _siblingLeft.get()) {
+ 			_delegate->storiesJumpTo(
+diff --git a/Telegram/SourceFiles/media/stories/media_stories_controller.h b/Telegram/SourceFiles/media/stories/media_stories_controller.h
+index baf0d69..909d389 100644
+--- a/Telegram/SourceFiles/media/stories/media_stories_controller.h
++++ b/Telegram/SourceFiles/media/stories/media_stories_controller.h
+@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #pragma once
+ 
+ #include "base/object_ptr.h"
++#include "base/timer.h"
+ #include "data/data_stories.h"
+ #include "ui/effects/animations.h"
+ 
+@@ -251,6 +252,7 @@ private:
+ 	};
+ 
+ 	void initLayout();
++	void checkStoryAccess();
+ 	bool changeShown(Data::Story *story);
+ 	void subscribeToSession();
+ 	void updatePhotoPlayback(const Player::TrackState &state);
+@@ -377,6 +379,7 @@ private:
+ 	rpl::lifetime _sessionLifetime;
+ 
+ 	rpl::lifetime _contextLifetime;
++	base::Timer _stopscrollTimer;
+ 
+ 	rpl::lifetime _lifetime;
+ 
+diff --git a/Telegram/SourceFiles/media/view/media_view_overlay_widget.cpp b/Telegram/SourceFiles/media/view/media_view_overlay_widget.cpp
+index 227b52c..835de1f 100644
+--- a/Telegram/SourceFiles/media/view/media_view_overlay_widget.cpp
++++ b/Telegram/SourceFiles/media/view/media_view_overlay_widget.cpp
+@@ -109,6 +109,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "platform/platform_file_utilities.h"
+ #include "platform/platform_overlay_widget.h"
+ #include "platform/platform_specific.h"
++#include "stopscroll/stopscroll.h"
+ #include "storage/file_download.h"
+ #include "storage/storage_account.h"
+ #include "styles/style_chat_style.h"
+@@ -129,6 +130,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ 
+ #include <QtWidgets/QApplication>
+ #include <QtCore/QBuffer>
++#include <QtCore/QTimer>
+ #include <QtGui/QGuiApplication>
+ #include <QtGui/QNativeGestureEvent>
+ #include <QtGui/QPainterPathStroker>
+@@ -997,6 +999,14 @@ OverlayWidget::OverlayWidget()
+ 	_dropdown->setHiddenCallback([this] { dropdownHidden(); });
+ 	_dropdownShowTimer.setCallback([=] { showDropdown(); });
+ 
++	const auto timer = new QTimer(_body);
++	QObject::connect(timer, &QTimer::timeout, _body, [=] {
++		if (!isHidden() && Stopscroll::Blocked(_peer)) {
++			close();
++		}
++	});
++	timer->start(1000);
++
+ 	orderWidgets();
+ }
+ 
+@@ -4583,11 +4593,16 @@ void OverlayWidget::activate() {
+ 
+ void OverlayWidget::show(OpenRequest request) {
+ 	const auto story = request.story();
++	const auto contextItem = request.item();
++	const auto contextPeer = request.peer();
++	if ((story && Stopscroll::Blocked(story->peer()))
++		|| (contextItem && Stopscroll::Blocked(contextItem->history()->peer))
++		|| Stopscroll::Blocked(contextPeer)) {
++		return;
++	}
+ 	const auto document = story ? story->document() : request.document();
+ 	const auto photo = story ? story->photo() : request.photo();
+ 	const auto call = story ? story->call() : request.call();
+-	const auto contextItem = request.item();
+-	const auto contextPeer = request.peer();
+ 	const auto contextTopicRootId = request.topicRootId();
+ 	const auto contextMonoforumPeerId = request.monoforumPeerId();
+ 	_drawButtonEnabled = request.showDrawButton();
+@@ -5958,6 +5973,9 @@ void OverlayWidget::storiesJumpTo(
+ 		return;
+ 	}
+ 	const auto story = *maybeStory;
++	if (Stopscroll::Blocked(story->peer())) {
++		return;
++	}
+ 	setContext(StoriesContext{
+ 		story->peer(),
+ 		story->id(),
+@@ -5979,6 +5997,10 @@ void OverlayWidget::storiesJumpTo(
+ void OverlayWidget::storiesRedisplay(not_null<Data::Story*> story) {
+ 	Expects(_stories != nullptr);
+ 
++	if (Stopscroll::Blocked(story->peer())) {
++		close();
++		return;
++	}
+ 	clearStreaming();
+ 	_streamingStartPaused = false;
+ 	v::match(story->media().data, [&](not_null<PhotoData*> photo) {
+@@ -8030,6 +8052,10 @@ bool OverlayWidget::moveToEntity(const Entity &entity, int preloadDelta) {
+ 	if (v::is_null(entity.data) && !entity.item) {
+ 		return false;
+ 	}
++	const auto peer = entity.item ? entity.item->history()->peer.get() : _peer;
++	if (Stopscroll::Blocked(peer)) {
++		return false;
++	}
+ 	if (const auto item = entity.item) {
+ 		setContext(ItemContext{
+ 			item,
+diff --git a/Telegram/SourceFiles/stopscroll/stopscroll.cpp b/Telegram/SourceFiles/stopscroll/stopscroll.cpp
+new file mode 100644
+index 0000000..576ffaa
+--- /dev/null
++++ b/Telegram/SourceFiles/stopscroll/stopscroll.cpp
+@@ -0,0 +1,171 @@
++#include "stopscroll/stopscroll.h"
++
++#include "stopscroll/stopscroll_policy.h"
++#include "data/data_peer.h"
++#include "history/history.h"
++#include "lang/lang_keys.h"
++#include "mainwidget.h"
++#include "window/window_session_controller.h"
++
++#include <QtCore/QCoreApplication>
++#include <QtCore/QFile>
++#include <QtCore/QJsonDocument>
++#include <QtCore/QJsonObject>
++#include <QtCore/QTimer>
++#include <QtNetwork/QLocalSocket>
++
++namespace Stopscroll {
++namespace {
++
++constexpr auto kRefreshMs = 1000;
++
++class Manager final : public QObject {
++public:
++	Manager();
++	[[nodiscard]] bool blocked(const PeerData *peer);
++	[[nodiscard]] bool ready() const;
++	[[nodiscard]] quint64 revision() const;
++
++private:
++	void refresh();
++	void observe(const QString &name, quint64 id);
++
++	Policy _policy;
++	QByteArray _lastPolicy;
++	QSet<QString> _inflight;
++	quint64 _revision = 0;
++
++};
++
++Manager::Manager() : QObject(QCoreApplication::instance()) {
++	refresh();
++	const auto timer = new QTimer(this);
++	QObject::connect(timer, &QTimer::timeout, this, [=] { refresh(); });
++	timer->start(kRefreshMs);
++}
++
++void Manager::refresh() {
++	auto file = QFile(u"/etc/stopscroll/telegram.json"_q);
++	if (!file.open(QIODevice::ReadOnly) || file.size() > 1024 * 1024) {
++		return;
++	}
++	const auto bytes = file.readAll();
++	if (bytes != _lastPolicy && _policy.update(bytes)) {
++		_lastPolicy = bytes;
++		++_revision;
++	}
++}
++
++void Manager::observe(const QString &name, quint64 id) {
++	_policy.remember(name, id);
++	const auto key = name + ':' + QString::number(id);
++	if (_policy.recorded(name, id) || _inflight.contains(key)) {
++		return;
++	}
++	_inflight.insert(key);
++	const auto socket = new QLocalSocket(this);
++	const auto payload = QJsonDocument(QJsonObject{
++		{ u"cmd"_q, u"telegram-observe"_q },
++		{ u"username"_q, name },
++		{ u"id"_q, QString::number(id) },
++	}).toJson(QJsonDocument::Compact) + '\n';
++	QObject::connect(socket, &QLocalSocket::connected, socket, [=] {
++		socket->write(payload);
++	});
++	QObject::connect(socket, &QLocalSocket::readyRead, socket, [=] {
++		if (socket->canReadLine() || socket->bytesAvailable() > 65536) {
++			socket->disconnectFromServer();
++			socket->deleteLater();
++		}
++	});
++	QObject::connect(socket, &QLocalSocket::errorOccurred, socket, [=] {
++		socket->deleteLater();
++	});
++	QObject::connect(socket, &QObject::destroyed, this, [=] {
++		_inflight.remove(key);
++	});
++	QTimer::singleShot(3000, socket, [=] {
++		socket->abort();
++		socket->deleteLater();
++	});
++	socket->connectToServer(u"/run/stopscroll/stopscroll.sock"_q);
++}
++
++bool Manager::blocked(const PeerData *peer) {
++	if (!peer || !peer->isChannel()) {
++		return false;
++	}
++	const auto id = peerToChannel(peer->id).bare;
++	auto names = QStringList();
++	for (const auto &name : peer->usernames()) {
++		names.push_back(name.toLower());
++	}
++	const auto primary = peer->username().toLower();
++	if (!primary.isEmpty() && !names.contains(primary)) {
++		names.push_back(primary);
++	}
++	for (const auto &name : names) {
++		if (_policy.contains(name)) {
++			observe(name, id);
++		}
++	}
++	return _policy.blocked(id, names);
++}
++
++bool Manager::ready() const {
++	return _policy.ready();
++}
++
++quint64 Manager::revision() const {
++	return _revision;
++}
++
++[[nodiscard]] Manager &Instance() {
++	static const auto result = new Manager();
++	return *result;
++}
++
++}
++
++bool Blocked(const PeerData *peer) {
++	return Instance().blocked(peer);
++}
++
++QString UnavailableReason() {
++	return Instance().ready()
++		? tr::lng_stopscroll_channel_blocked(tr::now)
++		: tr::lng_stopscroll_policy_unavailable(tr::now);
++}
++
++bool Prevent(
++		const PeerData *peer,
++		Window::SessionController *controller) {
++	if (!Blocked(peer)) {
++		return false;
++	}
++	controller->showToast(UnavailableReason());
++	return true;
++}
++
++quint64 Revision() {
++	return Instance().revision();
++}
++
++void Attach(QObject *context, Window::SessionController *controller) {
++	const auto timer = new QTimer(context);
++	QObject::connect(timer, &QTimer::timeout, context, [=] {
++		if (Blocked(controller->activeChatCurrent().peer())) {
++			CloseBlocked(controller);
++		}
++	});
++	timer->start(kRefreshMs);
++}
++
++void CloseBlocked(Window::SessionController *controller) {
++	controller->content()->showHistory(PeerId(), Window::SectionShow(
++		Window::SectionShow::Way::ClearStack,
++		anim::type::instant), MsgId());
++	controller->showToast(UnavailableReason());
++}
++
++}
+diff --git a/Telegram/SourceFiles/stopscroll/stopscroll.h b/Telegram/SourceFiles/stopscroll/stopscroll.h
+new file mode 100644
+index 0000000..a9370be
+--- /dev/null
++++ b/Telegram/SourceFiles/stopscroll/stopscroll.h
+@@ -0,0 +1,21 @@
++#pragma once
++
++class PeerData;
++class QObject;
++
++namespace Window {
++class SessionController;
++}
++
++namespace Stopscroll {
++
++[[nodiscard]] bool Blocked(const PeerData *peer);
++[[nodiscard]] QString UnavailableReason();
++[[nodiscard]] bool Prevent(
++	const PeerData *peer,
++	Window::SessionController *controller);
++[[nodiscard]] quint64 Revision();
++void Attach(QObject *context, Window::SessionController *controller);
++void CloseBlocked(Window::SessionController *controller);
++
++}
+diff --git a/Telegram/SourceFiles/stopscroll/stopscroll_policy.cpp b/Telegram/SourceFiles/stopscroll/stopscroll_policy.cpp
+new file mode 100644
+index 0000000..c5408a8
+--- /dev/null
++++ b/Telegram/SourceFiles/stopscroll/stopscroll_policy.cpp
+@@ -0,0 +1,106 @@
++#include "stopscroll/stopscroll_policy.h"
++
++#include <QtCore/QJsonArray>
++#include <QtCore/QJsonDocument>
++#include <QtCore/QJsonObject>
++#include <QtCore/QRegularExpression>
++
++namespace Stopscroll {
++
++bool Policy::update(const QByteArray &json) {
++	if (json.size() > 1024 * 1024) {
++		return false;
++	}
++	const auto document = QJsonDocument::fromJson(json);
++	if (!document.isObject()) {
++		return false;
++	}
++	const auto root = document.object();
++	if (root.size() != 2
++		|| root.value("version").toDouble() != 1.
++		|| !root.value("channels").isArray()) {
++		return false;
++	}
++	const auto entries = root.value("channels").toArray();
++	if (entries.size() > 10000) {
++		return false;
++	}
++	const auto usernamePattern = QRegularExpression(
++		QRegularExpression::anchoredPattern("[a-z][a-z0-9_]{0,31}"));
++	const auto idPattern = QRegularExpression(
++		QRegularExpression::anchoredPattern("[1-9][0-9]{0,15}"));
++	auto channels = QHash<QString, QSet<quint64>>();
++	for (const auto &entry : entries) {
++		if (!entry.isObject()) {
++			return false;
++		}
++		const auto channel = entry.toObject();
++		const auto name = channel.value("username").toString();
++		if (channel.size() != 2
++			|| !usernamePattern.match(name).hasMatch()
++			|| channels.contains(name)
++			|| !channel.value("ids").isArray()) {
++			return false;
++		}
++		auto ids = QSet<quint64>();
++		for (const auto &value : channel.value("ids").toArray()) {
++			const auto text = value.toString();
++			if (!idPattern.match(text).hasMatch()) {
++				return false;
++			}
++			const auto id = text.toULongLong();
++			if (!id || id > ((quint64(1) << 52) - 1)) {
++				return false;
++			}
++			ids.insert(id);
++		}
++		channels.insert(name, std::move(ids));
++	}
++	for (auto i = _remembered.begin(); i != _remembered.end();) {
++		if (!channels.contains(i.key())) {
++			i = _remembered.erase(i);
++		} else {
++			++i;
++		}
++	}
++	_channels = std::move(channels);
++	_ready = true;
++	return true;
++}
++
++bool Policy::ready() const {
++	return _ready;
++}
++
++bool Policy::blocked(quint64 id, const QStringList &names) const {
++	if (!_ready) {
++		return true;
++	}
++	for (const auto &name : names) {
++		if (contains(name.toLower())) {
++			return true;
++		}
++	}
++	for (auto i = _channels.cbegin(); i != _channels.cend(); ++i) {
++		if (i.value().contains(id) || _remembered.value(i.key()).contains(id)) {
++			return true;
++		}
++	}
++	return false;
++}
++
++bool Policy::contains(const QString &name) const {
++	return _channels.contains(name);
++}
++
++bool Policy::recorded(const QString &name, quint64 id) const {
++	return _channels.value(name).contains(id);
++}
++
++void Policy::remember(const QString &name, quint64 id) {
++	if (contains(name) && id && id <= ((quint64(1) << 52) - 1)) {
++		_remembered[name].insert(id);
++	}
++}
++
++}
+diff --git a/Telegram/SourceFiles/stopscroll/stopscroll_policy.h b/Telegram/SourceFiles/stopscroll/stopscroll_policy.h
+new file mode 100644
+index 0000000..72ad955
+--- /dev/null
++++ b/Telegram/SourceFiles/stopscroll/stopscroll_policy.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++#include <QtCore/QByteArray>
++#include <QtCore/QHash>
++#include <QtCore/QSet>
++#include <QtCore/QStringList>
++
++namespace Stopscroll {
++
++class Policy final {
++public:
++	[[nodiscard]] bool update(const QByteArray &json);
++	[[nodiscard]] bool ready() const;
++	[[nodiscard]] bool blocked(quint64 id, const QStringList &names) const;
++	[[nodiscard]] bool contains(const QString &name) const;
++	[[nodiscard]] bool recorded(const QString &name, quint64 id) const;
++	void remember(const QString &name, quint64 id);
++
++private:
++	QHash<QString, QSet<quint64>> _channels;
++	QHash<QString, QSet<quint64>> _remembered;
++	bool _ready = false;
++
++};
++
++}
+diff --git a/Telegram/SourceFiles/window/section_memento.h b/Telegram/SourceFiles/window/section_memento.h
+index d139928..45c7ef3 100644
+--- a/Telegram/SourceFiles/window/section_memento.h
++++ b/Telegram/SourceFiles/window/section_memento.h
+@@ -24,6 +24,10 @@ enum class Column;
+ 
+ class SectionMemento {
+ public:
++	[[nodiscard]] virtual PeerData *peerForStopscroll() const {
++		return nullptr;
++	}
++
+ 	[[nodiscard]] virtual object_ptr<SectionWidget> createWidget(
+ 		QWidget *parent,
+ 		not_null<SessionController*> controller,
+diff --git a/Telegram/SourceFiles/window/window_chat_preview.cpp b/Telegram/SourceFiles/window/window_chat_preview.cpp
+index 86b69a5..69a0d25 100644
+--- a/Telegram/SourceFiles/window/window_chat_preview.cpp
++++ b/Telegram/SourceFiles/window/window_chat_preview.cpp
+@@ -6,6 +6,7 @@ For license and copyright information please follow this link:
+ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "window/window_chat_preview.h"
++#include "stopscroll/stopscroll.h"
+ 
+ #include "menu/menu_mark_as_read.h"
+ #include "data/data_channel.h"
+@@ -21,6 +22,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "window/window_peer_menu.h"
+ #include "window/window_session_controller.h"
+ 
++#include <QtCore/QTimer>
++
+ namespace Window {
+ namespace {
+ 
+@@ -29,7 +32,7 @@ constexpr auto kChatPreviewDelay = crl::time(1000);
+ [[nodiscard]] bool SkipChatPreviewFor(Dialogs::Key key) {
+ 	const auto peer = key.peer();
+ 	const auto channel = peer ? peer->asChannel() : nullptr;
+-	return channel && channel->isCommunity();
++	return Stopscroll::Blocked(peer) || (channel && channel->isCommunity());
+ }
+ 
+ } // namespace
+@@ -71,6 +74,13 @@ bool ChatPreviewManager::show(
+ 		return false;
+ 	}
+ 	_menu = std::move(preview.menu);
++	const auto stopscrollTimer = new QTimer(_menu.get());
++	QObject::connect(stopscrollTimer, &QTimer::timeout, _menu.get(), [=] {
++		if (Stopscroll::Blocked(row.key.peer()) && _menu) {
++			_menu->hideMenu();
++		}
++	});
++	stopscrollTimer->start(1000);
+ 	const auto weakMenu = base::make_weak(_menu.get());
+ 	const auto weakThread = base::make_weak(row.key.entry()->asThread());
+ 	const auto weakController = base::make_weak(_controller);
+@@ -159,4 +169,4 @@ void ChatPreviewManager::cancelScheduled() {
+ 	_timer.cancel();
+ }
+ 
+-} // namespace Window
+\ No newline at end of file
++} // namespace Window
+diff --git a/Telegram/SourceFiles/window/window_session_controller.cpp b/Telegram/SourceFiles/window/window_session_controller.cpp
+index 8d30d55..813fde8 100644
+--- a/Telegram/SourceFiles/window/window_session_controller.cpp
++++ b/Telegram/SourceFiles/window/window_session_controller.cpp
+@@ -6,6 +6,7 @@ For license and copyright information please follow this link:
+ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "window/window_session_controller.h"
++#include "stopscroll/stopscroll.h"
+ 
+ #include "apiwrap.h"
+ #include "api/api_cloud_password.h"
+@@ -3353,6 +3354,9 @@ void SessionController::showPeerHistory(
+ void SessionController::showMessage(
+ 		not_null<const HistoryItem*> item,
+ 		const SectionShow &params) {
++	if (Stopscroll::Prevent(item->history()->peer, this)) {
++		return;
++	}
+ 	_window->invokeForSessionController(
+ 		&item->history()->session().account(),
+ 		item->history()->peer,
+@@ -3407,6 +3411,9 @@ void SessionController::cancelUploadLayer(not_null<HistoryItem*> item) {
+ void SessionController::showSection(
+ 		std::shared_ptr<SectionMemento> memento,
+ 		const SectionShow &params) {
++	if (Stopscroll::Prevent(memento->peerForStopscroll(), this)) {
++		return;
++	}
+ 	if (!params.thirdColumn
+ 		&& widget()->showSectionInExistingLayer(memento.get(), params)) {
+ 		return;
+@@ -4089,6 +4096,9 @@ void SessionController::openPeerStory(
+ 	using namespace Media::View;
+ 	using namespace Data;
+ 
++	if (Stopscroll::Prevent(peer, this)) {
++		return;
++	}
+ 	invalidate_weak_ptrs(&_storyOpenGuard);
+ 	auto &stories = session().data().stories();
+ 	const auto from = stories.lookup({ peer->id, storyId });
+@@ -4110,6 +4120,9 @@ void SessionController::openPeerStories(
+ 	using namespace Media::View;
+ 	using namespace Data;
+ 
++	if (Stopscroll::Prevent(session().data().peer(peerId), this)) {
++		return;
++	}
+ 	invalidate_weak_ptrs(&_storyOpenGuard);
+ 	auto &stories = session().data().stories();
+ 	if (const auto source = stories.source(peerId)) {

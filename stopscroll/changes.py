@@ -4,6 +4,7 @@ import re
 from urllib.parse import urlsplit
 
 from .model import Site, State
+from .telegram import normalize_channel
 
 SITE_RE = r'^[a-z][a-z0-9]{0,23}$'
 
@@ -53,6 +54,7 @@ def _validated(state, change):
     c = dict(change)
     kind = c.get('kind')
     fields = {
+        'telegram_block': {'username'}, 'telegram_unblock': {'username'},
         'add_site': {'site','mode','domains','budget_min'}, 'remove_site': {'site'},
         'add_domain': {'site','domain'}, 'remove_domain': {'site','domain'},
         'add_exception': {'site','domain'}, 'remove_exception': {'site','domain'},
@@ -61,6 +63,14 @@ def _validated(state, change):
     }
     if not isinstance(kind, str) or kind not in fields or set(c) != fields[kind] | {'kind'}:
         raise ChangeError('Неизвестное или неполное изменение')
+    if 'username' in c:
+        try:
+            c['username'] = normalize_channel(c['username'])
+        except ValueError as exc:
+            raise ChangeError(str(exc)) from None
+        exists = c['username'] in state.telegram_channels
+        if exists == (kind == 'telegram_block'):
+            raise ChangeError('Канал уже заблокирован' if exists else 'Канал не заблокирован')
     site = c.get('site')
     if 'site' in c and (not isinstance(site,str) or not re.fullmatch(SITE_RE,site)):
         raise ChangeError('Имя сайта: латинская буква, затем до 23 букв или цифр')
@@ -104,7 +114,7 @@ def _validated(state, change):
 def classify(state: State, change: dict) -> str:
     c = _validated(state,change)
     kind = c['kind']
-    tight = kind in ('add_site','add_domain','remove_exception')
+    tight = kind in ('telegram_block','add_site','add_domain','remove_exception')
     if kind == 'set_mode': tight = c['mode'] == 'blocked'
     if kind == 'set_budget': tight = c['minutes'] < state.sites[c['site']].budget_min
     if kind == 'set_delay': tight = c['minutes'] > state.delay_min
@@ -114,7 +124,9 @@ def classify(state: State, change: dict) -> str:
 def apply(state: State, change: dict, now: float) -> None:
     c = _validated(state,change)
     kind, site = c['kind'], c.get('site')
-    if kind == 'add_site': state.sites[site] = Site(c['mode'],c['domains'],[],c['budget_min'])
+    if kind == 'telegram_block': state.telegram_channels[c['username']] = []
+    elif kind == 'telegram_unblock': del state.telegram_channels[c['username']]
+    elif kind == 'add_site': state.sites[site] = Site(c['mode'],c['domains'],[],c['budget_min'])
     elif kind == 'remove_site': del state.sites[site]
     elif kind in ('add_domain','remove_domain','add_exception','remove_exception'):
         values = state.sites[site].exceptions if 'exception' in kind else state.sites[site].domains
@@ -130,6 +142,8 @@ def apply(state: State, change: dict, now: float) -> None:
 def summarize(state: State, change: dict) -> str:
     c = _validated(state,change)
     kind, site = c['kind'], c.get('site')
+    if kind in ('telegram_block', 'telegram_unblock'):
+        return f"Telegram: {'заблокировать' if kind == 'telegram_block' else 'разблокировать'} @{c['username']}"
     if kind == 'set_budget': return f'{site}: бюджет {state.sites[site].budget_min} → {c["minutes"]} мин'
     if kind == 'set_delay': return f'Задержка {state.delay_min} → {c["minutes"]} мин'
     if kind == 'pause': return f'Приостановить блокировку на {c["minutes"]} мин'

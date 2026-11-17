@@ -9,6 +9,7 @@ import subprocess
 
 from .blocklist import DNS_PORT, QUARANTINE_SEC, render_dnsmasq, render_nft, set_names
 from .model import State, Quarantine
+from .telegram import POLICY, publish_policy
 
 DNS_CONF = '/var/lib/stopscroll/dnsmasq.conf'
 RESOLVED_DROPIN = '/etc/systemd/resolved.conf.d/stopscroll.conf'
@@ -38,6 +39,7 @@ class Runner:
 class System:
     def __init__(self, runner: Runner):
         self.runner = runner
+        self.telegram_policy_dirty = True
         self._nft = None
         self._dns_restart = True
         self._flush = True
@@ -56,6 +58,16 @@ class System:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
         return True
+
+    def sync_telegram(self, state: State) -> list[str]:
+        """Publish enforcement independently; retain failure status for fast retry."""
+        self.telegram_policy_dirty = True
+        try:
+            publish_policy(state.telegram_channels, self.runner.path(POLICY))
+        except Exception as exc:
+            return [f'сбой: политика Telegram: {exc}']
+        self.telegram_policy_dirty = False
+        return []
 
     def sync(self, state: State, now: float) -> list[str]:
         messages = []
@@ -124,6 +136,7 @@ class System:
             self._write(FIREFOX_POLICY, json.dumps(data, ensure_ascii=False, indent=2) + '\n')
             messages.append('Исправлена политика Firefox')
 
+        messages.extend(self.sync_telegram(state))
         step('сетевые правила', nft)
         step('конфигурация DNS', dns)
         step('служба DNS', active)

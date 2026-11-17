@@ -55,7 +55,7 @@ class SessionTests(unittest.TestCase):
         self.st.bonus_min['youtube'] = 5
         self.e.open('youtube', 20, T)
         self.assertEqual(self.e.remaining_sec('youtube', T+61), 3000-61)
-        self.assertEqual(self.e.remaining_sec('x', T+61), 1800)
+        self.assertEqual(self.e.remaining_sec('x', T+61), 600)
 
     def test_warning_fires_once(self):
         self.assertEqual(WARN_BEFORE_SEC, 120)
@@ -123,9 +123,10 @@ class SessionTests(unittest.TestCase):
         self.st.spent_sec['youtube'] = 23*60
         self.e.open('youtube', 12, T)
         self.assertEqual(self.e.status(T+1), {
+            'telegram_channels': [],
             'blocked': ['twitch', 'liquipedia', 'kick', 'instagram'],
             'limited': [dict(site='youtube', open=True, ends=T+720, left_sec=719, spent_min=24, budget_min=45, bonus_min=0),
-                        dict(site='x', open=False, ends=None, left_sec=0, spent_min=0, budget_min=30, bonus_min=0)],
+                        dict(site='x', open=False, ends=None, left_sec=0, spent_min=0, budget_min=10, bonus_min=0)],
             'pending': [], 'delay_min': 45, 'reset_hour': 4, 'pause_until': None})
 
     def test_routine_expiry_jitter_charges_scheduled_minute(self):

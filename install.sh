@@ -47,8 +47,9 @@ if [[ $SOURCE != /usr/local/lib/stopscroll ]]; then
     cp -R -- "$SOURCE/stopscroll" /usr/local/lib/stopscroll/
     install -o root -g root -m 0755 "$SOURCE/uninstall.sh" /usr/local/lib/stopscroll/uninstall.sh
 fi
-chown -R root:root /usr/local/lib/stopscroll
-chmod -R u=rwX,go=rX /usr/local/lib/stopscroll
+chown -R root:root /usr/local/lib/stopscroll/stopscroll
+chmod -R u=rwX,go=rX /usr/local/lib/stopscroll/stopscroll
+chown root:root /usr/local/lib/stopscroll/uninstall.sh
 chmod 0755 /usr/local/lib/stopscroll/uninstall.sh
 cat > /usr/local/bin/stopscroll <<'EOF'
 #!/bin/sh

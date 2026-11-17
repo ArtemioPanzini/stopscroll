@@ -1,0 +1,5 @@
+# Необязательный образец локального списка. Автоматического импорта нет.
+# Замените вымышленные имена своими и добавляйте через:
+# stopscroll telegram block @example_channel --yes
+@example_channel
+@another_example

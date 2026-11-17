@@ -175,7 +175,7 @@ class Engine:
                                 left_sec=max(0, math.ceil(session.ends - now)) if session else 0,
                                 spent_min=math.ceil(spent / 60), budget_min=policy.budget_min,
                                 bonus_min=self.state.bonus_min.get(site, 0)))
-        return dict(blocked=blocked, limited=limited, pending=[dict(id=p.id, summary=p.summary, eta=now + p.remaining_sec)
+        return dict(telegram_channels=sorted(self.state.telegram_channels), blocked=blocked, limited=limited, pending=[dict(id=p.id, summary=p.summary, eta=now + p.remaining_sec)
                             for p in sorted(self.state.pending, key=lambda p: p.id)],
                     delay_min=self.state.delay_min, reset_hour=self.state.reset_hour,
                     pause_until=self.state.pause_until)

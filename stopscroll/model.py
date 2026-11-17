@@ -59,6 +59,7 @@ class State:
     boot_id: str = ''
     boot_saved: float = 0.0
     quarantine: dict[str, Quarantine] = field(default_factory=dict)
+    telegram_channels: dict[str, list[str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -68,7 +69,18 @@ class State:
         # The recovery journal was added to v1; old installed states remain valid.
         if isinstance(d, dict) and 'quarantine' not in d:
             d = dict(d, quarantine={})
+        if isinstance(d, dict) and 'telegram_channels' not in d:
+            d = dict(d, telegram_channels={})
         state = _decode(cls, d)
+        from .telegram import normalize_channel, validate_channel_id
+        try:
+            for name, ids in state.telegram_channels.items():
+                if normalize_channel(name) != name:
+                    raise ValueError()
+                for channel_id in ids:
+                    validate_channel_id(channel_id)
+        except ValueError as exc:
+            raise StateError('Некорректная политика Telegram') from exc
         if state.version != 1:
             raise StateError('Неподдерживаемая версия состояния')
         for site in state.sites.values():

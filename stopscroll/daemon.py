@@ -10,6 +10,7 @@ import struct
 import time
 
 from . import store
+from .telegram import normalize_channel, validate_channel_id
 from .day import day_key
 from .engine import Engine, EngineError
 from .changes import ChangeError
@@ -45,12 +46,14 @@ class Daemon:
         self._last_save = None
         self._boot_id = None
         self._dirty = False
+        self._telegram_dirty = False
         self._subscribers = set()
 
     def _sync(self, now):
         try:
             for message in self.system.sync(self.engine.state, now):
                 LOG.warning('%s', message)
+            self._telegram_dirty = self.system.telegram_policy_dirty is True
             for message in self.system.retry_quarantine(self.engine.state, now, self._persist):
                 LOG.warning('%s', message)
         except Exception:
@@ -97,6 +100,7 @@ class Daemon:
             result, events = {}, []
             if cmd == 'status':
                 result['status'] = self.engine.status(now)
+                result['status']['telegram_policy_pending'] = self._telegram_dirty
             elif cmd == 'doctor':
                 result['checks'] = self.doctor()
             elif cmd in ('open', 'close'):
@@ -109,14 +113,27 @@ class Daemon:
             elif cmd == 'change':
                 result = self.engine.submit(req.get('change'), now)
                 events = result.pop('events', [])
+            elif cmd == 'telegram-observe':
+                if set(req) != {'cmd', 'username', 'id'}:
+                    raise ValueError('Некорректное наблюдение Telegram')
+                username = normalize_channel(req['username'])
+                channel_id = validate_channel_id(req['id'])
+                if username not in self.engine.state.telegram_channels:
+                    raise ValueError('Канал не заблокирован')
+                ids = self.engine.state.telegram_channels[username]
+                if channel_id not in ids:
+                    ids.append(channel_id)
             elif cmd == 'cancel':
                 if type(req.get('id')) is not int:
                     raise ValueError('Укажите целый номер изменения')
                 result['summary'] = self.engine.cancel(req['id'])
             elif cmd != 'subscribe':
                 raise ValueError('Неизвестная команда')
-            if cmd in ('open', 'close', 'change', 'cancel'):
+            if cmd in ('open', 'close', 'change', 'cancel', 'telegram-observe'):
                 self._changed(events, now)
+                if self._telegram_dirty:
+                    return dict(result, ok=False, error='Политика Telegram не опубликована; изменение сохранено в памяти, публикация будет повторена',
+                                telegram_policy_pending=True, state_save_pending=self._dirty)
                 if self._dirty:
                     return dict(result, ok=False, error='Не удалось сохранить состояние; изменение действует в памяти, сохранение будет повторено')
             return dict(ok=True, **result)
@@ -134,6 +151,10 @@ class Daemon:
         payloads = self._changed(events, now) if events else []
         if events:
             self._last_sync = self._last_save = boot
+        if self._telegram_dirty:
+            for message in self.system.sync_telegram(self.engine.state):
+                LOG.warning('%s', message)
+            self._telegram_dirty = self.system.telegram_policy_dirty is True
         if boot - self._last_sync >= SYNC_EVERY_SEC:
             self._sync(now)
             self._last_sync = boot

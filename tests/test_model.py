@@ -21,7 +21,7 @@ class ModelTests(unittest.TestCase):
         yt = s.sites['youtube']
         self.assertEqual((yt.mode, yt.budget_min, yt.exceptions), ('limited', 45, ['accounts.youtube.com']))
         self.assertEqual(yt.domains, ['youtube.com', 'youtu.be', 'googlevideo.com', 'youtube-nocookie.com', 'youtubei.googleapis.com', 'youtube.googleapis.com'])
-        self.assertEqual((s.sites['x'].domains, s.sites['x'].budget_min), (['x.com', 'twitter.com'], 30))
+        self.assertEqual((s.sites['x'].domains, s.sites['x'].budget_min), (['x.com', 'twitter.com'], 10))
         self.assertEqual((s.delay_min, s.reset_hour, s.default_session_min), (45, 4, 15))
         self.assertEqual(s.doh_domains, ['use-application-dns.net', 'dns.google', 'cloudflare-dns.com', 'mozilla.cloudflare-dns.com', 'dns.quad9.net', 'doh.opendns.com', 'dns.nextdns.io', 'dns.adguard-dns.com'])
 
@@ -33,7 +33,7 @@ class ModelTests(unittest.TestCase):
 
     def test_from_dict_rejects_missing_fields(self):
         data = initial_state(1000, '2026-11-15').to_dict()
-        for key in data.keys() - {'quarantine'}:
+        for key in data.keys() - {'quarantine', 'telegram_channels'}:
             with self.subTest(key=key), self.assertRaises(StateError):
                 State.from_dict({k: v for k, v in data.items() if k != key})
 
