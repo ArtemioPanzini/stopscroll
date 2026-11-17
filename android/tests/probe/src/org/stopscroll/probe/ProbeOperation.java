@@ -31,6 +31,8 @@ final class ProbeOperation {
     private static final int UDP_ECHO_TIMEOUT_MS = 1_000;
     private static final int UDP_WINDOW = UDP_ECHO_TIMEOUT_MS / UDP_INTERVAL_MS + 1;
     private static final int UDP_PAYLOAD_BYTES = 2 * Long.BYTES + Integer.BYTES;
+    private static final int STUN_INTERVAL_MS = 1_000;
+    private static final String DEFAULT_STUN_HOST = "stun.cloudflare.com";
 
     final String op;
     final long durationMs;
@@ -51,6 +53,7 @@ final class ProbeOperation {
         switch (op == null ? "" : op) {
             case "fetch":
             case "udp":
+            case "stun":
                 durationMs = 30_000;
                 break;
             case "stream":
@@ -85,6 +88,8 @@ final class ProbeOperation {
                     return http(url);
                 case "udp":
                     return udp(host, port, progress);
+                case "stun":
+                    return stun(host == null ? DEFAULT_STUN_HOST : host, port);
                 case "provider":
                     return provider();
                 default:
@@ -233,8 +238,73 @@ final class ProbeOperation {
         }
     }
 
+    private JSONObject stun(String host, int port) throws IOException, InterruptedException {
+        if (host.isEmpty() || host.length() > 253 || port < 1 || port > 65_535) {
+            throw new IllegalArgumentException();
+        }
+
+        InetAddress address = InetAddress.getByName(host);
+        SecureRandom random = new SecureRandom();
+        byte[] reply = new byte[2_049];
+        DatagramPacket inbound = new DatagramPacket(reply, reply.length);
+        try (DatagramSocket socket = new DatagramSocket()) {
+            cancelIo = socket::close;
+            if (cancelled || remainingMs() <= 0) {
+                return deadlineResult();
+            }
+            socket.connect(address, port);
+            while (!cancelled && remainingMs() > 0) {
+                long nextSend = SystemClock.elapsedRealtime() + STUN_INTERVAL_MS;
+                byte[] request = StunBinding.request(random);
+                try {
+                    socket.send(new DatagramPacket(request, request.length));
+                    sent++;
+                    receiveStun(socket, inbound, request, nextSend);
+                } catch (PortUnreachableException ignored) {
+                    // Keep sampling on the original socket even when the path rejects packets.
+                }
+                long wait = Math.min(nextSend - SystemClock.elapsedRealtime(), remainingMs());
+                if (!cancelled && wait > 0) {
+                    Thread.sleep(wait);
+                }
+            }
+        } finally {
+            cancelIo = null;
+        }
+        return deadlineResult();
+    }
+
+    private void receiveStun(DatagramSocket socket, DatagramPacket inbound, byte[] request,
+            long nextSend) throws IOException {
+        while (!cancelled) {
+            long timeout = Math.min(nextSend - SystemClock.elapsedRealtime(), remainingMs());
+            if (timeout <= 0) {
+                return;
+            }
+            socket.setSoTimeout((int) timeout);
+            inbound.setLength(inbound.getData().length);
+            try {
+                socket.receive(inbound);
+            } catch (SocketTimeoutException ignored) {
+                return;
+            }
+
+            long now = SystemClock.elapsedRealtime();
+            if (cancelled || now >= nextSend || remainingMs() <= 0) {
+                return;
+            }
+            if (StunBinding.matches(request, inbound.getData(), inbound.getLength())) {
+                received++;
+                bytes += inbound.getLength();
+                lastSuccessElapsedMs = now;
+                return;
+            }
+        }
+    }
+
     JSONObject deadlineResult() {
-        return "udp".equals(op) ? result("done", null) : result("timeout", "DeadlineExceeded");
+        return "udp".equals(op) || "stun".equals(op)
+                ? result("done", null) : result("timeout", "DeadlineExceeded");
     }
 
     JSONObject result(String status, String error) {

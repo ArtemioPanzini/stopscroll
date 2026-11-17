@@ -27,7 +27,7 @@ public final class ProbeActivity extends Activity {
     private static final ExecutorService CANCEL = Executors.newSingleThreadExecutor();
 
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private final Runnable streamProgress = this::publishStreamProgress;
+    private final Runnable periodicProgress = this::publishProgress;
     private final Runnable deadline = this::finishAtDeadline;
     private AtomicFile resultFile;
     private TextView resultView;
@@ -79,12 +79,13 @@ public final class ProbeActivity extends Activity {
 
         String url = intent.getStringExtra("url");
         String host = intent.getStringExtra("host");
-        int port = intent.getIntExtra("port", -1);
+        boolean stun = "stun".equals(operation.op);
+        int port = intent.getIntExtra("port", stun ? 3_478 : -1);
         active = operation;
         publish(operation.result("running", null));
         handler.postDelayed(deadline, Math.max(0, operation.remainingMs()));
-        if ("stream".equals(operation.op)) {
-            handler.postDelayed(streamProgress, 1_000);
+        if (stun || "stream".equals(operation.op)) {
+            handler.postDelayed(periodicProgress, 1_000);
         }
         task = WORKER.submit(() -> {
             JSONObject result = operation.execute(url, host, port, progress -> handler.post(() -> {
@@ -101,10 +102,10 @@ public final class ProbeActivity extends Activity {
         });
     }
 
-    private void publishStreamProgress() {
+    private void publishProgress() {
         if (active != null) {
             publish(active.result("running", null));
-            handler.postDelayed(streamProgress, 1_000);
+            handler.postDelayed(periodicProgress, 1_000);
         }
     }
 
@@ -130,7 +131,7 @@ public final class ProbeActivity extends Activity {
     private void clearActive() {
         active = null;
         task = null;
-        handler.removeCallbacks(streamProgress);
+        handler.removeCallbacks(periodicProgress);
         handler.removeCallbacks(deadline);
     }
 
