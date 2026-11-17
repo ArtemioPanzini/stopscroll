@@ -1,0 +1,66 @@
+{
+  "manifest_version": 3,
+  "name": "Stopscroll YouTube Guard",
+  "version": "1.0.0",
+  "minimum_chrome_version": "105",
+  "permissions": [
+    "declarativeNetRequest",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "*://*.youtube.com/*",
+    "*://*.youtu.be/*",
+    "*://*.googlevideo.com/*",
+    "*://*.youtube-nocookie.com/*",
+    "*://*.youtubei.googleapis.com/*",
+    "*://*.youtube.googleapis.com/*"
+  ],
+  "background": {
+    "service_worker": "worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.youtube.com/*",
+        "*://*.youtu.be/*",
+        "*://*.googlevideo.com/*",
+        "*://*.youtube-nocookie.com/*",
+        "*://*.youtubei.googleapis.com/*",
+        "*://*.youtube.googleapis.com/*"
+      ],
+      "exclude_matches": [
+        "*://accounts.youtube.com/*",
+        "*://*.accounts.youtube.com/*"
+      ],
+      "js": [
+        "guard.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "closed",
+        "enabled": true,
+        "path": "closed.json"
+      }
+    ]
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "blocked.html"
+      ],
+      "matches": [
+        "*://*.youtube.com/*",
+        "*://*.youtu.be/*",
+        "*://*.googlevideo.com/*",
+        "*://*.youtube-nocookie.com/*",
+        "*://*.youtubei.googleapis.com/*",
+        "*://*.youtube.googleapis.com/*"
+      ]
+    }
+  ]
+}

@@ -16,12 +16,18 @@ class DaemonTests(unittest.TestCase):
     def setUp(self):
         self.state = initial_state(os.getuid(), '2026-11-15')
         self.system = Mock()
+        self.system.sync_browser.return_value = []
         self.system.sync.return_value = []
         self.system.retry_quarantine.return_value = []
         self.save = Mock()
         self.d = Daemon(Engine(self.state), self.system, self.save, lambda: [])
     def call(self, **req):
         return self.d.handle(req, os.getuid(), T)
+    def test_browser_heartbeat_publishes_even_without_state_events(self):
+        self.d.tick(T, 100, 'boot')
+        self.d.tick(T+1, 101, 'boot')
+        self.assertEqual(self.system.sync_browser.call_count, 2)
+        self.system.sync_browser.assert_called_with(self.state, T+1)
     def test_bootstrap(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp)/'state')
@@ -71,7 +77,7 @@ class DaemonTests(unittest.TestCase):
 class SocketTests(unittest.IsolatedAsyncioTestCase):
     async def test_socket_bad_json_and_roundtrip(self):
         state=initial_state(os.getuid(),'2026-11-15')
-        system=Mock(); system.sync.return_value=[]; system.retry_quarantine.return_value=[]
+        system=Mock(); system.sync_browser.return_value=[]; system.sync.return_value=[]; system.retry_quarantine.return_value=[]
         d=Daemon(Engine(state),system,Mock(),lambda:[])
         with tempfile.TemporaryDirectory() as tmp:
             path=str(Path(tmp)/'socket')

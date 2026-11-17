@@ -148,6 +148,11 @@ class Daemon:
             self._boot_id = boot_id
             self._last_sync = self._last_save = boot
         events = self.engine.tick(now, boot, boot_id)
+        try:
+            for message in self.system.sync_browser(self.engine.state, now):
+                LOG.warning('%s', message)
+        except Exception:
+            LOG.exception('Сбой публикации браузерной политики')
         payloads = self._changed(events, now) if events else []
         if events:
             self._last_sync = self._last_save = boot

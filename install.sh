@@ -4,7 +4,7 @@ umask 022
 fail() { echo "Ошибка: $*" >&2; exit 1; }
 [[ $EUID == 0 && ${SUDO_UID:-} =~ ^[0-9]+$ && ${SUDO_UID:-0} != 0 && -n ${SUDO_USER:-} ]] || fail 'Запустите через sudo из обычной учётной записи.'
 [[ $(id -u "$SUDO_USER") == "$SUDO_UID" ]] || fail 'Не совпадают имя и uid владельца.'
-for command in python3 systemctl ss nft useradd sudo; do
+for command in python3 systemctl ss nft useradd sudo openssl; do
     command -v "$command" >/dev/null || fail "Не найдена команда $command. Установите зависимости из README."
 done
 [[ -x /usr/sbin/dnsmasq ]] || fail 'Не найден /usr/sbin/dnsmasq.'
@@ -68,6 +68,18 @@ install -d -o root -g root -m 0755 /etc/systemd/user
 install -o root -g root -m 0644 "$SOURCE/system/stopscroll-notify.service" /etc/systemd/user/stopscroll-notify.service
 systemctl daemon-reload
 install -d -o root -g root -m 0700 /var/lib/stopscroll
+if [[ $SOURCE != /usr/local/lib/stopscroll ]]; then
+    install -d -o root -g root -m 0755 /usr/local/lib/stopscroll/browser
+    cp -R -- "$SOURCE/browser/extension" /usr/local/lib/stopscroll/browser/
+    install -o root -g root -m 0644 "$SOURCE/browser/install.py" /usr/local/lib/stopscroll/browser/install.py
+fi
+chown -R root:root /usr/local/lib/stopscroll/browser
+chmod -R u=rwX,go=rX /usr/local/lib/stopscroll/browser
+if [[ -x /opt/google/chrome/chrome || -x /usr/bin/chromium || -x /usr/bin/chromium-browser ]]; then
+    PYTHONPATH=/usr/local/lib/stopscroll /usr/bin/python3 /usr/local/lib/stopscroll/browser/install.py
+else
+    echo 'Предупреждение: Chrome/Chromium отсутствует; браузерная защита YouTube не установлена.' >&2
+fi
 PYTHONPATH=/usr/local/lib/stopscroll /usr/bin/python3 -m stopscroll.daemon --init
 systemctl enable --now stopscroll-dns.service stopscrolld.service stopscroll-watchdog.timer
 if ! sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$SUDO_UID" systemctl --user daemon-reload ||

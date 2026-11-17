@@ -10,6 +10,7 @@ import subprocess
 from .blocklist import DNS_PORT, QUARANTINE_SEC, render_dnsmasq, render_nft, set_names
 from .model import State, Quarantine
 from .telegram import POLICY, publish_policy
+from .browser import POLICY as BROWSER_POLICY, publish_policy as publish_browser, register as register_browser
 
 DNS_CONF = '/var/lib/stopscroll/dnsmasq.conf'
 RESOLVED_DROPIN = '/etc/systemd/resolved.conf.d/stopscroll.conf'
@@ -68,6 +69,13 @@ class System:
             return [f'сбой: политика Telegram: {exc}']
         self.telegram_policy_dirty = False
         return []
+
+    def sync_browser(self, state: State, now: float) -> list[str]:
+        try:
+            publish_browser(state, now, self.runner.path(BROWSER_POLICY))
+            return []
+        except Exception as exc:
+            return [f'сбой: политика браузера: {exc}']
 
     def sync(self, state: State, now: float) -> list[str]:
         messages = []
@@ -137,6 +145,8 @@ class System:
             messages.append('Исправлена политика Firefox')
 
         messages.extend(self.sync_telegram(state))
+        messages.extend(self.sync_browser(state, now))
+        step('регистрация браузерной защиты', lambda: messages.extend(register_browser(self.runner)))
         step('сетевые правила', nft)
         step('конфигурация DNS', dns)
         step('служба DNS', active)

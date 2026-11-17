@@ -30,6 +30,9 @@ cleanup rm -f /etc/systemd/resolved.conf.d/stopscroll.conf
 cleanup systemctl restart systemd-resolved
 cleanup nft delete table inet stopscroll
 cleanup rm -f /etc/opt/chrome/policies/managed/stopscroll.json
+cleanup rm -f /etc/opt/chrome/policies/managed/stopscroll-youtube.json /etc/chromium/policies/managed/stopscroll-youtube.json
+cleanup rm -f /etc/opt/chrome/native-messaging-hosts/org.stopscroll.youtube.json /etc/chromium/native-messaging-hosts/org.stopscroll.youtube.json
+cleanup rm -f /run/stopscroll/browser.json
 cleanup rm -f /etc/chromium/policies/managed/stopscroll.json
 cleanup /usr/bin/python3 - <<'PY'
 import json
