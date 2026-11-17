@@ -8,12 +8,14 @@
 
 **Tech Stack:** Kotlin, Android SDK и Gradle wrapper выбранного upstream, Firestack AAR, Android AtomicFile/Binder/VpnService, Python 3.11+ stdlib, ADB.
 
-Статус: проект плана для обсуждения. Исполнять после согласования [дизайна](android-vpn-design.md).
+Статус: [дизайн](android-vpn-design.md) согласован пользователем; выполняется G0.
 
 ## Global Constraints
 
 - Цель приёмки: Android 13, user 0, arm64-v8a; root и unlock не используются.
+- Текущая аппаратная приёмка по уточнению пользователя: только Wi-Fi IPv4; мобильные данные и роуминг не включать, IPv6 не выдавать за проверенный.
 - Rethink v0.5.8 / `b750334a363065b94f83e818ac5dc38048713c1f`; Firestack `d3d530ea3e`, до исполнения разрешить в полный SHA и зафиксировать SHA-256 AAR.
+- Адресный native-патч допустим только к этому upstream-коммиту; оригинальный и собранный AAR, patch и toolchain имеют отдельные хеши и исходники.
 - Пакет `com.celzero.bravedns.stopscroll`; постоянный собственный release signing key вне Git.
 - Только ручной USB/ADB: без udev, watcher, timers, фоновой синхронизации, сетевого control server.
 - Независимые бюджеты телефона; отрезки, reset 04:00, расход во сне, монотонные deadlines.
@@ -109,6 +111,11 @@ upstream build config/manifest и временный test provider в patch.
   reboot. Сохранить рабочий resolver/ALG в lock, отметить измеренное время закрытия.
   G0 HOLD при непроходящей сборке, неподтверждённом UID, обходе свежего YouTube или
   невозможности закрыть TCP/UDP. До устранения причины задачи 1–6 не выполнять.
+- [ ] Для найденных в G0 общих native cleanup исправить владение состоянием
+  локальным патчем к исходному Firestack, проверить отложенный cleanup старого
+  туннеля после создания нового и safe lifetime общего pool. Пересобрать тот же
+  engine source, сохранить patch/проверки/provenance; повторить сетевую приёмку.
+  Mobile/IPv6 временно исключены из текущей аппаратной приёмки по уточнению пользователя.
 - [ ] Экспортировать минимальный воспроизводимый patch и commit
   `build: pin and validate Android VPN base`; исключить checkout/APK/keys из Git.
 
