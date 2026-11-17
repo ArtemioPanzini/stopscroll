@@ -1,0 +1,1049 @@
+diff --git a/intra/common.go b/intra/common.go
+index 827e5cf33d79e10fa0fe2f0a57ed18a13e4b5acb..23e7819b6fea00067000498b5ef31eb5471473fc 100644
+--- a/intra/common.go
++++ b/intra/common.go
+@@ -79,9 +79,26 @@ func (*zeroListener) Postflow(*FlowSummary)                                  {}
+ 
+ var nooplistener = new(zeroListener)
+ 
++// One generation covers all protocols on a tunnel. The short admission lock
++// orders registration and policy snapshots against an entire close-all sweep.
++type admissionKey struct{}
++type flowAdmission struct {
++	sync.RWMutex
++	generation uint64
++}
++
++func (a *flowAdmission) snapshot() uint64 {
++	a.RLock()
++	defer a.RUnlock()
++	return a.generation
++}
++
+ type baseHandler struct {
+-	proto string // tcp, udp, icmp
+-	ctx   context.Context
++	admission   *flowAdmission
++	dnsConns    core.ConnMapper
++	dnsSequence atomic.Uint64
++	proto       string // tcp, udp, icmp
++	ctx         context.Context
+ 
+ 	resolver dnsx.Resolver     // dns resolver to forward queries to
+ 	prox     ipn.ProxyProvider // proxy provider
+@@ -104,7 +121,13 @@ type baseHandler struct {
+ var _ netstack.GBaseConnHandler = (*baseHandler)(nil)
+ 
+ func newBaseHandler(pctx context.Context, proto string, r dnsx.Resolver, px ipn.ProxyProvider, l FlowListener) *baseHandler {
++	admission, _ := pctx.Value(admissionKey{}).(*flowAdmission)
++	if admission == nil { // standalone handler
++		admission = new(flowAdmission)
++	}
+ 	h := &baseHandler{
++		admission:   admission,
++		dnsConns:    core.NewConnMap(proto + ".dnsConns"),
+ 		ctx:         pctx,
+ 		proto:       proto,
+ 		resolver:    r,
+@@ -121,7 +144,8 @@ func newBaseHandler(pctx context.Context, proto string, r dnsx.Resolver, px ipn.
+ }
+ 
+ // to is the local address, from is the remote address.
+-func (h *baseHandler) onInflow(to, from netip.AddrPort) (fm *Mark) {
++func (h *baseHandler) onInflow(to, from netip.AddrPort) (fm *Mark, generation uint64) {
++	generation = h.admission.snapshot()
+ 	blockmode := settings.BlockMode.Load()
+ 	fm = optionsBlock
+ 	// BlockModeNone returns false, BlockModeSink returns true
+@@ -147,7 +171,8 @@ func (h *baseHandler) onInflow(to, from netip.AddrPort) (fm *Mark) {
+ }
+ 
+ // onFlow calls listener.Flow to determine egress rules and routes; thread-safe.
+-func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidAlg bool, ips, doms string) {
++func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidAlg bool, ips, doms string, generation uint64) {
++	generation = h.admission.snapshot()
+ 	blockmode := settings.BlockMode.Load()
+ 	fm = optionsBlock
+ 	// BlockModeNone returns false, BlockModeSink returns true
+@@ -242,7 +267,7 @@ func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidA
+ 			log.E("com: %s: onFlow: alg, preflow? %t, ips? %t for %s; pre: %v; block!",
+ 				h.proto, hasPre, hasNewIPs, doms, pre)
+ 			// either optionsBase (BlockModeNone) or optionsBlock
+-			return fm, undidAlg, "", ""
++			return fm, undidAlg, "", "", generation
+ 		} // else: if we've got target and/or old ips, dial them
+ 	} else {
+ 		if log.Debug {
+@@ -293,6 +318,23 @@ func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidA
+ 	return
+ }
+ 
++// admit orders socket registration against CloseConns(""). Once registered,
++// a later sweep closes the sockets even if copying has not started yet.
++func (h *baseHandler) admit(tracker core.ConnMapper, generation uint64, id, uid, pid string, conns ...core.MinConn) bool {
++	h.admission.RLock()
++	defer h.admission.RUnlock()
++	if generation != h.admission.generation {
++		core.CloseConn(conns...)
++		return false
++	}
++	tracker.Track(id, uid, pid, conns...)
++	if h.ctx.Err() != nil { // End can also sweep on context cancellation.
++		tracker.Untrack(id)
++		return false
++	}
++	return true
++}
++
+ // forward copies data between local and remote, and tracks the connection.
+ // local, wired to TUN via netstack, is either gonet.TCPConn or gonet.UDPConn.
+ // remote, wired to egress, is wrapped in rwext; but the underlying conn may
+@@ -301,12 +343,13 @@ func (h *baseHandler) onFlow(localaddr, target netip.AddrPort) (fm *Mark, undidA
+ func (h *baseHandler) forward(local, remote net.Conn, smm *FlowSummary) {
+ 	cid := smm.ID
+ 	uid := smm.UID
+-	pid := smm.PID
+ 	via := strings.Join([]string{smm.Proto, smm.PID, smm.RPID, smm.ID}, ":")
+ 
+ 	tup := conn2str(local, remote)
+ 
+-	h.conntracker.Track(cid, uid, pid, local, remote)
++	if !h.admit(h.conntracker, smm.generation, cid, smm.UID, smm.PID, netstack.EstablishedConn(local), remote) {
++		return
++	}
+ 	defer h.conntracker.Untrack(cid)
+ 
+ 	isrwext := false
+@@ -411,6 +454,7 @@ func (h *baseHandler) OpenConns() string {
+ func (h *baseHandler) CloseConns(cidsOrPidsOrUids []string) (closedCids []string) {
+ 	if len(cidsOrPidsOrUids) <= 0 {
+ 		closedCids = h.conntracker.Clear()
++		h.dnsConns.Clear()
+ 	} else {
+ 		closedCids = h.conntracker.UntrackBatch(cidsOrPidsOrUids)
+ 	}
+@@ -528,6 +572,14 @@ func (h *baseHandler) dnsOverride(conn net.Conn, uid string, smm *FlowSummary) b
+ 	// conn closed by the resolver
+ 	fid := smm.ID // flow ID that spawned this DNS query
+ 	core.Gx(h.proto+".dns", func() {
++		// The client-supplied flow ID may be empty or reused by DNS sockets.
++		// Keep the key outside the numeric UID namespace because Untrack
++		// tries a UID or PID lookup when the old key has been swept.
++		key := "dns:" + strconv.FormatUint(h.dnsSequence.Add(1), 10)
++		if !h.admit(h.dnsConns, smm.generation, key, uid, "", netstack.EstablishedConn(conn)) {
++			return
++		}
++		defer h.dnsConns.Untrack(key)
+ 		// SocketSummary is not meant to be used by the listener; x.DNSSummary is
+ 		// but call into PostFlow & OnSocketClosed anyway, to avoid ambiguities
+ 		// on which sockets / sessions are still active.
+diff --git a/intra/cutoff_retrier_test.go b/intra/cutoff_retrier_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..afd5c357e371874483847d1c50f2eaacd336e1f0
+--- /dev/null
++++ b/intra/cutoff_retrier_test.go
+@@ -0,0 +1,229 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++package intra
++
++import (
++	"context"
++	"io"
++	"net"
++	"sync/atomic"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/celzero/firestack/intra/dialers"
++	"github.com/celzero/firestack/intra/protect"
++)
++
++const retryTestLimit = 3 * time.Second
++const retryPayload = "first request"
++
++type retryTestConn interface {
++	net.Conn
++	CloseRead() error
++	CloseWrite() error
++}
++
++type retryFixture struct {
++	listener *net.TCPListener
++	client   retryTestConn
++	first    *net.TCPConn
++	dials    atomic.Int32
++}
++
++func loopbackRetrier(t *testing.T, beforeSecond func()) *retryFixture {
++	t.Helper()
++	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { listener.Close() })
++	f := &retryFixture{listener: listener}
++	d := protect.MakeNsRDialExt("cutoff-test", context.Background(), nil, func(_, _ string, _ syscall.RawConn) error {
++		if f.dials.Add(1) == 2 && beforeSecond != nil {
++			beforeSecond()
++		}
++		return nil
++	})
++	f.client, err = dialers.DialWithSplitRetry(d, nil, listener.Addr().(*net.TCPAddr))
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { f.client.Close() })
++	f.first, err = listener.AcceptTCP()
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { f.first.Close() })
++	return f
++}
++
++func readRequest(t *testing.T, c net.Conn) {
++	t.Helper()
++	c.SetReadDeadline(time.Now().Add(retryTestLimit))
++	b := make([]byte, len(retryPayload))
++	if _, err := io.ReadFull(c, b); err != nil || string(b) != retryPayload {
++		t.Fatalf("read first request %q: %v", b, err)
++	}
++}
++
++// Accept a possible replacement and acknowledge any replay. Closing the listener
++// also releases Accept when full close prevents the replacement entirely.
++func (f *retryFixture) observeReplay() <-chan string {
++	result := make(chan string, 1)
++	go func() {
++		c, err := f.listener.AcceptTCP()
++		if err != nil {
++			result <- ""
++			return
++		}
++		defer c.Close()
++		c.SetDeadline(time.Now().Add(retryTestLimit))
++		b := make([]byte, len(retryPayload))
++		n, _ := io.ReadFull(c, b)
++		if n > 0 {
++			c.Write([]byte{'a'})
++		}
++		result <- string(b[:n])
++	}()
++	return result
++}
++
++func TestCutoffRetrierFirstResponse(t *testing.T) {
++	for _, full := range []bool{true, false} {
++		name := "half-close permits retry"
++		if full {
++			name = "full close retires retry"
++		}
++		t.Run(name, func(t *testing.T) {
++			f := loopbackRetrier(t, nil)
++			if _, err := io.WriteString(f.client, retryPayload); err != nil {
++				t.Fatal(err)
++			}
++			readRequest(t, f.first)
++			replayed := f.observeReplay()
++			if full {
++				f.client.Close()
++			} else {
++				f.client.CloseWrite()
++				f.first.Close()
++			}
++			var b [1]byte
++			n, err := f.client.Read(b[:])
++			f.listener.Close()
++			payload := <-replayed
++			if full {
++				if n != 0 || err == nil || f.dials.Load() != 1 || payload != "" {
++					t.Fatalf("full close: read %q, err %v, dials %d, replay %q", b, err, f.dials.Load(), payload)
++				}
++			} else if n != 1 || err != nil || b[0] != 'a' || payload != retryPayload {
++				t.Fatalf("half close: read %q, err %v, replay %q", b, err, payload)
++			}
++		})
++	}
++	t.Run("read half-close retains writes", func(t *testing.T) {
++		f := loopbackRetrier(t, nil)
++		f.client.CloseRead()
++		if _, err := io.WriteString(f.client, retryPayload); err != nil {
++			t.Fatal(err)
++		}
++		readRequest(t, f.first)
++	})
++}
++
++func TestCutoffRetrierBlockedDial(t *testing.T) {
++	entered, release := make(chan struct{}), make(chan struct{})
++	f := loopbackRetrier(t, func() { close(entered); <-release })
++	tun := newCutoffFixture(t, "tcp")
++	// Real forwarding wraps the protected TCP retrier in rwext. Register a
++	// second UDP flow so the test observes the remainder of the actual sweep.
++	local, app := net.Pipe()
++	defer app.Close()
++	go tun.h.forward(local, rwext{f.client, 0}, &FlowSummary{ID: "retrying", Proto: "tcp"})
++	if _, err := io.WriteString(app, retryPayload); err != nil {
++		t.Fatal(err)
++	}
++	readRequest(t, f.first)
++	uh := tun.handlers.UDP().(*udpHandler)
++	u, ua := net.Pipe()
++	v, ub := net.Pipe()
++	defer ua.Close()
++	defer ub.Close()
++	go uh.forward(u, rwext{v, 0}, &FlowSummary{ID: "other", Proto: "udp"})
++	go ua.Write([]byte{'u'})
++	var b [1]byte
++	if _, err := io.ReadFull(ub, b[:]); err != nil {
++		t.Fatal(err)
++	}
++	replayed := f.observeReplay()
++	f.first.Close()
++	select {
++	case <-entered:
++	case <-time.After(retryTestLimit):
++		close(release)
++		t.Fatal("second TCP dial did not begin")
++	}
++	receipt := make(chan string, 1)
++	go func() { receipt <- tun.CloseConns("") }()
++	select {
++	case ids := <-receipt:
++		if ids != "retrying,other" {
++			t.Errorf("closed IDs %q", ids)
++		}
++		ua.SetWriteDeadline(time.Now().Add(retryTestLimit))
++		if _, err := ua.Write([]byte{'x'}); err == nil {
++			t.Error("UDP flow survived the sweep")
++		}
++	case <-time.After(retryTestLimit):
++		t.Error("cutoff waited for the pending TCP dial")
++	}
++	close(release)
++	if got := <-replayed; got != "" {
++		t.Errorf("replacement received buffered payload: %q", got)
++	}
++}
++
++// Once a replacement is published, interrupt its pending first-response read
++// without waiting for the server, and leave the replacement socket closed.
++func TestCutoffRetrierPublishedReplacement(t *testing.T) {
++	f := loopbackRetrier(t, nil)
++	if _, err := io.WriteString(f.client, retryPayload); err != nil {
++		t.Fatal(err)
++	}
++	readRequest(t, f.first)
++	f.first.Close()
++	readDone := make(chan error, 1)
++	go func() { var b [1]byte; _, err := f.client.Read(b[:]); readDone <- err }()
++	f.listener.SetDeadline(time.Now().Add(retryTestLimit))
++	next, err := f.listener.AcceptTCP()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer next.Close()
++	readRequest(t, next)
++	closed := make(chan struct{})
++	go func() { f.client.Close(); close(closed) }()
++	select {
++	case <-closed:
++	case <-time.After(retryTestLimit):
++		next.Close()
++		t.Fatal("close waited for a remote first response")
++	}
++	var b [1]byte
++	if n, err := next.Read(b[:]); n != 0 || err != io.EOF {
++		t.Fatalf("replacement still open: read %d, %v", n, err)
++	}
++	select {
++	case err := <-readDone:
++		if err == nil {
++			t.Fatal("retired response read succeeded")
++		}
++	case <-time.After(retryTestLimit):
++		t.Fatal("first-response reader did not exit")
++	}
++	if got := f.dials.Load(); got != 2 {
++		t.Fatalf("additional dial after close: %d", got)
++	}
++}
+diff --git a/intra/cutoff_test.go b/intra/cutoff_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..354c46b4b0b2bc746df4dd185060db5658091f79
+--- /dev/null
++++ b/intra/cutoff_test.go
+@@ -0,0 +1,278 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++package intra
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net"
++	"net/netip"
++	"sync/atomic"
++	"testing"
++	"testing/synctest"
++	"time"
++
++	"github.com/celzero/firestack/intra/core"
++	"github.com/celzero/firestack/intra/dnsx"
++	"github.com/celzero/firestack/intra/netstack"
++	"github.com/celzero/firestack/intra/protect"
++	"github.com/celzero/firestack/intra/settings"
++)
++
++type cutoffListener struct {
++	zeroListener
++	holdPreflow bool
++	entered     chan struct{}
++	release     chan struct{}
++}
++
++func (l *cutoffListener) pause() {
++	l.entered <- struct{}{}
++	<-l.release
++}
++func (l *cutoffListener) Preflow(_, _ int32, _, _ string) *PreMark {
++	if l.holdPreflow {
++		l.pause()
++	}
++	return nil
++}
++
++func (l *cutoffListener) Flow(_, _ int32, _, _, _, _, _, _ string, _ bool) *Mark {
++	if !l.holdPreflow {
++		l.pause()
++	}
++	return &Mark{CID: "allowed", PIDCSV: "Base"}
++}
++func (l *cutoffListener) Inflow(_, _ int32, _, _ string) *Mark {
++	l.pause()
++	return &Mark{CID: "allowed", PIDCSV: "Base"}
++}
++
++type cutoffDNS struct {
++	dnsx.Resolver
++	calls       atomic.Int32
++	retiredDone chan struct{}
++}
++
++func (*cutoffDNS) Gateway() dnsx.Gateway { return nil }
++func (d *cutoffDNS) Serve(_ string, c protect.Conn, _, fid string) (int64, int64, []error) {
++	d.calls.Add(1)
++	n, _ := io.Copy(io.Discard, c)
++	if fid == "retired" && d.retiredDone != nil {
++		<-d.retiredDone
++	}
++	return n, 0, nil
++}
++
++type cutoffConn struct {
++	net.Conn
++	reads  atomic.Int32
++	closed atomic.Bool
++}
++
++func (c *cutoffConn) Close() error             { c.closed.Store(true); return c.Conn.Close() }
++func (c *cutoffConn) Read([]byte) (int, error) { c.reads.Add(1); return 0, io.EOF }
++
++type cutoffFixture struct {
++	*rtunnel
++	h        *baseHandler
++	listener *cutoffListener
++	resolver *cutoffDNS
++}
++
++func newCutoffFixture(t *testing.T, proto string) cutoffFixture {
++	t.Helper()
++	ctx, done := context.WithCancel(context.Background())
++	t.Cleanup(done)
++	a := new(flowAdmission)
++	ctx = context.WithValue(ctx, admissionKey{}, a)
++	r := new(cutoffDNS)
++	l := &cutoffListener{entered: make(chan struct{}), release: make(chan struct{})}
++	tcp := NewTCPHandler(ctx, r, nil, l).(*tcpHandler)
++	udp := NewUDPHandler(ctx, r, nil, l).(*udpHandler)
++	h := tcp.baseHandler
++	if proto == "udp" {
++		h = udp.baseHandler
++	}
++	return cutoffFixture{&rtunnel{handlers: netstack.NewGConnHandler(nil, tcp, udp, nil), admission: a}, h, l, r}
++}
++
++func TestCutoffDelayedDecision(t *testing.T) {
++	oldMode := settings.BlockMode.Swap(settings.BlockModeFilter)
++	t.Cleanup(func() { settings.BlockMode.Store(oldMode) })
++	for _, proto := range []string{"tcp", "udp"} {
++		for _, path := range []string{"preflow", "forward", "reverse", "dns"} {
++			t.Run(proto+"/"+path, func(t *testing.T) {
++				synctest.Test(t, func(t *testing.T) {
++					f := newCutoffFixture(t, proto)
++					f.listener.holdPreflow = path == "preflow"
++					a, b := net.Pipe()
++					local, remote := &cutoffConn{Conn: a}, &cutoffConn{Conn: b}
++					defer b.Close()
++					go func() {
++						addr := netip.MustParseAddrPort("192.0.2.123:53")
++						var generation uint64
++						var mark *Mark
++						if path == "reverse" {
++							mark, generation = f.h.onInflow(addr, addr)
++						} else {
++							mark, _, _, _, generation = f.h.onFlow(addr, addr)
++						}
++						s := &FlowSummary{ID: mark.CID, Proto: proto, generation: generation}
++						if path == "dns" {
++							f.h.dnsOverride(local, "test", s)
++						} else {
++							f.h.forward(local, rwext{remote, 0}, s)
++						}
++					}()
++					<-f.listener.entered
++					f.CloseConns("")
++					close(f.listener.release)
++					synctest.Wait()
++					if n := local.reads.Load() + remote.reads.Load(); n != 0 {
++						t.Errorf("old decision entered payload copy: %d reads", n)
++					}
++					if f.resolver.calls.Load() != 0 {
++						t.Error("old decision started DNS Serve")
++					}
++					if !local.closed.Load() || path != "dns" && !remote.closed.Load() {
++						t.Error("old endpoints left open")
++					}
++				})
++			})
++		}
++	}
++}
++
++func TestCutoffRegisteredSockets(t *testing.T) {
++	for _, proto := range []string{"tcp", "udp"} {
++		t.Run(proto, func(t *testing.T) {
++			synctest.Test(t, func(t *testing.T) {
++				f := newCutoffFixture(t, proto)
++				open := func(id string) (net.Conn, net.Conn) {
++					a, app := net.Pipe()
++					b, peer := net.Pipe()
++					t.Cleanup(func() { app.Close(); peer.Close() })
++					s := &FlowSummary{ID: id, Proto: proto, generation: f.h.admission.snapshot()}
++					go f.h.forward(a, rwext{b, 0}, s)
++					synctest.Wait()
++					return app, peer
++				}
++				exchange := func(a, b net.Conn) {
++					t.Helper()
++					go a.Write([]byte{'x'})
++					var v [1]byte
++					if _, err := io.ReadFull(b, v[:]); err != nil || v[0] != 'x' {
++						t.Fatalf("current generation transfer: %q, %v", v, err)
++					}
++				}
++				app, peer := open("existing")
++				exchange(app, peer)
++				var dnsApps []net.Conn
++				for i := 0; i < 2; i++ { // Kotlin can supply the same (or empty) CID.
++					dns, stub := net.Pipe()
++					t.Cleanup(func() { stub.Close() })
++					f.h.dnsOverride(dns, "test", &FlowSummary{ID: "same", Proto: proto, generation: f.h.admission.snapshot()})
++					dnsApps = append(dnsApps, stub)
++				}
++				synctest.Wait()
++				if f.resolver.calls.Load() != 2 {
++					t.Fatal("DNS fixtures did not enter Serve")
++				}
++				gen := f.h.admission.snapshot()
++				open("selected")
++				if f.CloseConns("selected") != "selected" || f.CloseConns("same") != "" || f.h.admission.snapshot() != gen {
++					t.Fatal("targeted close changed policy admission")
++				}
++				exchange(app, peer)
++				if got := f.CloseConns(""); got != "existing" {
++					t.Fatalf("upstream closed-ID result changed: %q", got)
++				}
++				synctest.Wait()
++				for _, c := range append(dnsApps, app, peer) {
++					// Deadlines bound the RED case when no sweep closed the DNS socket.
++					c.SetDeadline(time.Now().Add(time.Second))
++					if _, err := c.Write([]byte{'y'}); !errors.Is(err, io.ErrClosedPipe) {
++						t.Errorf("old endpoint after close-all: %v", err)
++					}
++				}
++				next, other := open("new")
++				exchange(next, other)
++			})
++		})
++	}
++}
++
++// Pause the real connection map after it has installed the sockets, before
++// admission releases its read lock and forwarding can enter either copy loop.
++type pausedTracker struct {
++	core.ConnMapper
++	installed, release chan struct{}
++}
++
++func (p *pausedTracker) Track(id, uid, pid string, conns ...core.MinConn) int {
++	n := p.ConnMapper.Track(id, uid, pid, conns...)
++	close(p.installed)
++	<-p.release
++	return n
++}
++
++func TestCutoffOverlapsTrack(t *testing.T) {
++	for _, proto := range []string{"tcp", "udp"} {
++		t.Run(proto, func(t *testing.T) {
++			synctest.Test(t, func(t *testing.T) {
++				f := newCutoffFixture(t, proto)
++				p := &pausedTracker{f.h.conntracker, make(chan struct{}), make(chan struct{})}
++				f.h.conntracker = p
++				a, app := net.Pipe()
++				b, peer := net.Pipe()
++				defer app.Close()
++				defer peer.Close()
++				go f.h.forward(a, rwext{b, 0}, &FlowSummary{ID: "paused", generation: f.h.admission.snapshot()})
++				<-p.installed
++				if f.admission.TryLock() {
++					f.admission.Unlock()
++					t.Error("registration is not ordered against the sweep")
++				}
++				receipt := make(chan string, 1)
++				started := make(chan struct{})
++				go func() { close(started); receipt <- f.CloseConns("") }()
++				<-started
++				close(p.release)
++				if <-receipt != "paused" {
++					t.Fatal("overlapping connection escaped the sweep")
++				}
++				synctest.Wait()
++				if _, err := app.Write([]byte{'x'}); !errors.Is(err, io.ErrClosedPipe) {
++					t.Fatalf("old application endpoint: %v", err)
++				}
++			})
++		})
++	}
++}
++
++func TestCutoffLateDNSUntrack(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		f := newCutoffFixture(t, "udp")
++		f.resolver.retiredDone = make(chan struct{})
++		old, app := net.Pipe()
++		defer app.Close()
++		f.h.dnsOverride(old, "7", &FlowSummary{ID: "retired", UID: "7", generation: f.h.admission.snapshot()})
++		synctest.Wait()
++		f.CloseConns("")
++		fresh, stub := net.Pipe()
++		defer stub.Close()
++		// The first retired socket used numeric tracking key 1. A different
++		// flow in the new generation can legitimately have UID 1.
++		f.h.dnsOverride(fresh, "1", &FlowSummary{ID: "fresh", UID: "1", generation: f.h.admission.snapshot()})
++		synctest.Wait()
++		close(f.resolver.retiredDone)
++		synctest.Wait()
++		if _, err := stub.Write([]byte{'n'}); err != nil {
++			t.Fatalf("retired Untrack closed the fresh DNS flow: %v", err)
++		}
++	})
++}
+diff --git a/intra/dialers/retrier.go b/intra/dialers/retrier.go
+index e5e0f464c65346d7310af86ffa43c6bd25ad8607..ced698521ccf2c761ef378613a1a5e9721222942 100644
+--- a/intra/dialers/retrier.go
++++ b/intra/dialers/retrier.go
+@@ -85,6 +85,11 @@ type retrier struct {
+ 	readDone  atomic.Bool
+ 	writeDone atomic.Bool
+ 
++	// Full close is terminal across retries. connMu orders it against publishing
++	// a replacement socket, independently of mu, which spans network operations.
++	closed atomic.Bool
++	connMu sync.Mutex
++
+ 	// mu is a lock that guards conn, retryCount, tee, timeout,
+ 	// retryErr, retryDone, readDeadline, and writeDeadline.
+ 	// After retryDoneCh is closed, these values will not be
+@@ -125,7 +130,7 @@ var _ core.DuplexConn = (*net.TCPConn)(nil)
+ func (r *retrier) retryCompleted() bool { return r.retryDone.Cond() }
+ 
+ func (r *retrier) canRetry() bool {
+-	return r.dialerOpts.Retry != settings.RetryNever
++	return !r.closed.Load() && r.dialerOpts.Retry != settings.RetryNever
+ }
+ 
+ // TODO: make sure "Auto" works as intended for netdev.vger.kernel.narkive.com and norskkalender.no
+@@ -322,6 +327,9 @@ func (r *retrier) dialerID() string {
+ // dialLocked establishes a new connection to r.raddr and closes existing, if any.
+ // Sets r.conn on non-errors and timeout as calculated from round-trip time.
+ func (r *retrier) dialLocked() error {
++	if r.closed.Load() {
++		return net.ErrClosed
++	}
+ 	clos(r.conn) // close existing connection, if any
+ 
+ 	strat, err := r.dialStratLocked()
+@@ -339,11 +347,18 @@ func (r *retrier) dialLocked() error {
+ 	c, err := r.doDialLocked(strat)
+ 	rtt := time.Since(begin)
+ 
++	r.connMu.Lock()
++	if r.closed.Load() {
++		r.connMu.Unlock()
++		clos(c) // Close won while the dial was in progress; never replay on c.
++		return net.ErrClosed
++	}
+ 	if c != nil && core.IsNotNil(c) { // c may be deep nil
+ 		r.conn = c
+ 	} else {
+ 		r.conn = nil
+ 	}
++	r.connMu.Unlock()
+ 
+ 	if r.canRetry() {
+ 		// final retry gets maximum possible timeout
+@@ -378,6 +393,9 @@ func (r *retrier) doDialLocked(dialStrat int32) (protect.Conn, error) {
+ 				r.dialerID(), r.retryCount, r.maxRetries)
+ 		}
+ 		for r.nextDialerIdx < len(r.dialers) {
++			if r.closed.Load() {
++				return nil, net.ErrClosed
++			}
+ 			d := r.dialers[r.nextDialerIdx]
+ 			c, err := protect.Dial(d, r.laddr, r.raddr)
+ 			logeif(err)("retrier: mult: #%d/%d dial(%s: %s) %s=>%s; err? %v",
+@@ -430,6 +448,11 @@ func (r *retrier) retryWriteReadLocked(buf []byte) (int, error) {
+ 		return 0, core.OneErr(err, errNoConn)
+ 	}
+ 
++	// The replacement is published. A concurrent full Close will synchronously
++	// interrupt its writes, including a replay already entering the socket.
++	if r.closed.Load() {
++		return 0, net.ErrClosed
++	}
+ 	var nw int
+ 	nw, r.retryWriteErr = newConn.Write(r.tee)
+ 	logeif(r.retryWriteErr)("retrier: retryLocked: strat(%s, mult? %d %T) %s=>%s; write? %d/%d; err? %v",
+@@ -471,6 +494,9 @@ func (r *retrier) CloseRead() error {
+ 
+ // Read data from r.conn into buf ("download" from remote to local).
+ func (r *retrier) Read(buf []byte) (n int, err error) {
++	if r.closed.Load() {
++		return 0, net.ErrClosed
++	}
+ 	note := log.VV
+ 	redoForTls := false
+ 
+@@ -602,6 +628,9 @@ func (r *retrier) readTimeoutLocked() time.Duration {
+ 
+ // Write data in b to retrier's underlying conn, r.conn ("upload" from local to remote).
+ func (r *retrier) Write(b []byte) (int, error) {
++	if r.closed.Load() {
++		return 0, net.ErrClosed
++	}
+ 	start := time.Now()
+ 	// Double-checked locking pattern.  This avoids lock acquisition on
+ 	// every packet after retry completes, while also ensuring that r.tee is
+@@ -642,6 +671,9 @@ func (r *retrier) Write(b []byte) (int, error) {
+ 				return n, core.JoinErr(err, rerr, errRetryTimeout)
+ 			}
+ 
++			if r.closed.Load() {
++				return n, net.ErrClosed
++			}
+ 			r.mu.Lock()
+ 			defer r.mu.Unlock()
+ 
+@@ -689,6 +721,9 @@ func (r *retrier) Write(b []byte) (int, error) {
+ // retries are done; before which reads are delegated to copyOnce.
+ // Usually, WriteTo is executing the "download" phase of egressing conn (w).
+ func (r *retrier) WriteTo(w io.Writer) (bytes int64, err error) {
++	if r.closed.Load() {
++		return 0, net.ErrClosed
++	}
+ 	start := time.Now()
+ 	copies := 0
+ 	// TODO: skip copyOnce if r.multidial set or if strat is SplitNever?
+@@ -767,6 +802,9 @@ func (r *retrier) WriteTo(w io.Writer) (bytes int64, err error) {
+ // retries are done; before which reads are delegated to copyOnce.
+ // Usually, ReadFrom is executing the "upload" phase of egressing conn (r).
+ func (r *retrier) ReadFrom(reader io.Reader) (bytes int64, err error) {
++	if r.closed.Load() {
++		return 0, net.ErrClosed
++	}
+ 	start := time.Now()
+ 	copies := 0
+ 	// TODO: skip copyOnce if r.multidial set or if strat is SplitNever?
+@@ -867,10 +905,16 @@ func (r *retrier) CloseWrite() error {
+ 	return nil
+ }
+ 
+-// Close closes the connection and the read and write flags.
++// Close retires the logical connection and interrupts its published socket.
++// Independent CloseRead and CloseWrite retain their TCP half-close semantics.
+ func (r *retrier) Close() error {
+-	// also close the read and write flags
+-	return core.JoinErr(r.CloseRead(), r.CloseWrite())
++	r.connMu.Lock()
++	defer r.connMu.Unlock()
++	if !r.closed.Swap(true) {
++		r.retryDone.Signal() // wake writes waiting for a first-response retry
++		clos(r.conn)
++	}
++	return nil
+ }
+ 
+ // LocalAddr behaves slightly strangely: its value may change as a
+diff --git a/intra/icmp.go b/intra/icmp.go
+index 844b08b1eee51abafb6da0ff3cb9c778e065b375..ea853acf06f5bbeb67eac9883f0b26040fd602d6 100644
+--- a/intra/icmp.go
++++ b/intra/icmp.go
+@@ -73,7 +73,7 @@ func (h *icmpHandler) Ping(msg []byte, source, target netip.AddrPort) (echoed bo
+ 	var rtt time.Duration
+ 
+ 	// flow is alg/nat-aware, do not change target or any addrs
+-	res, undidAlg, realips, doms := h.onFlow(source, target)
++	res, undidAlg, realips, doms, generation := h.onFlow(source, target)
+ 
+ 	h.maybeReplaceDest(res, &target)
+ 
+@@ -82,6 +82,7 @@ func (h *icmpHandler) Ping(msg []byte, source, target netip.AddrPort) (echoed bo
+ 	// on Android, uid is always "unknown" for icmp
+ 	cid, uid, _, pids := h.judge(res)
+ 	smm := icmpSummary(cid, uid)
++	smm.generation = generation
+ 
+ 	defer func() {
+ 		smm.PID = pidstr(px)
+@@ -156,7 +157,9 @@ func (h *icmpHandler) Ping(msg []byte, source, target netip.AddrPort) (echoed bo
+ 		return false // unhandled
+ 	}
+ 
+-	h.conntracker.Track(cid, uid, pidstr(px), uc)
++	if !h.admit(h.conntracker, smm.generation, cid, uid, pidstr(px), uc) {
++		return false
++	}
+ 	defer h.conntracker.Untrack(cid)
+ 
+ 	awaited := core.Await(func() {
+diff --git a/intra/listener.go b/intra/listener.go
+index 2fd7bb25189d1e718613c1825a9617b47286ec83..763f6dc308dd720e4eab037492f09e660186bf11 100644
+--- a/intra/listener.go
++++ b/intra/listener.go
+@@ -39,7 +39,8 @@ type FlowSummary struct {
+ 	// Duration in milliseconds.
+ 	Duration int64
+ 	// Tracks start time; unexported.
+-	start time.Time
++	start      time.Time
++	generation uint64
+ 	// Round-trip time (millis).
+ 	Rtt int64
+ 	// Err or other messages, if any.
+diff --git a/intra/netstack/cutoff_test.go b/intra/netstack/cutoff_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..5e506f22a648191968d0a335ac59af2c360e3436
+--- /dev/null
++++ b/intra/netstack/cutoff_test.go
+@@ -0,0 +1,20 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++package netstack
++
++import (
++	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
++	"testing"
++)
++
++func TestCutoffEstablishedEndpoints(t *testing.T) {
++	tcp, tcpEndpoint := new(GTCPConn), new(gonet.TCPConn)
++	tcp.c.Store(tcpEndpoint)
++	udp, udpEndpoint := new(GUDPConn), new(gonet.UDPConn)
++	udp.c.Store(udpEndpoint)
++	if EstablishedConn(tcp) != tcpEndpoint || EstablishedConn(udp) != udpEndpoint {
++		t.Fatal("cutoff would schedule the endpoint close asynchronously")
++	}
++}
+diff --git a/intra/netstack/hdl.go b/intra/netstack/hdl.go
+index 359c67ffde765f3e028673403b9eb76b2287303d..4e34d522b271240c096d5ae6d5c3b9bb28d25773 100644
+--- a/intra/netstack/hdl.go
++++ b/intra/netstack/hdl.go
+@@ -22,6 +22,22 @@ type gconns interface {
+ 	*GUDPConn | *GTCPConn | *GICMPConn
+ }
+ 
++// EstablishedConn returns the live endpoint for synchronous close in the
++// connection tracker. The forwarding wrappers schedule Close asynchronously.
++func EstablishedConn(conn net.Conn) net.Conn {
++	switch g := conn.(type) {
++	case *GTCPConn:
++		if c := g.conn(); c != nil {
++			return c
++		}
++	case *GUDPConn:
++		if c := g.conn(); c != nil {
++			return c
++		}
++	}
++	return conn
++}
++
+ type GBaseConnHandler interface {
+ 	// OpenConns returns the number of active connections.
+ 	OpenConns() string
+diff --git a/intra/tcp.go b/intra/tcp.go
+index 4fcb86d6cd973cb921c7c573f1d5e4b5afba8b03..7d8914e1fc365bc61a19d66a38684a2b95afaa4b 100644
+--- a/intra/tcp.go
++++ b/intra/tcp.go
+@@ -140,7 +140,7 @@ func (h *tcpHandler) Error(gconn *netstack.GTCPConn, src, dst netip.AddrPort, er
+ 	if !src.IsValid() || !dst.IsValid() {
+ 		return
+ 	}
+-	res, undidAlg, realips, domains := h.onFlow(src, dst)
++	res, undidAlg, realips, domains, _ := h.onFlow(src, dst)
+ 
+ 	h.maybeReplaceDest(res, &dst)
+ 
+@@ -169,9 +169,10 @@ func (h *tcpHandler) Error(gconn *netstack.GTCPConn, src, dst netip.AddrPort, er
+ }
+ 
+ func (h *tcpHandler) ReverseProxy(gconn *netstack.GTCPConn, in net.Conn, to, from netip.AddrPort) (open bool) {
+-	fm := h.onInflow(to, from)
++	fm, generation := h.onInflow(to, from)
+ 	cid, uid, _, pids := h.judge(fm)
+ 	smm := tcpSummary(cid, uid, to.Addr(), from.Addr())
++	smm.generation = generation
+ 
+ 	if log.Verbose {
+ 		log.V("tcp: %s [%s]: reverse: %s => %s; pids: %v", cid, uid, from, to, pids)
+@@ -262,7 +263,7 @@ func (h *tcpHandler) Proxy(gconn *netstack.GTCPConn, src, target netip.AddrPort)
+ 
+ 	// flow/dns-override are nat-aware, as in, they can deal with
+ 	// nat-ed ips just fine, and so, use target as-is instead of ipx4
+-	res, undidAlg, realips, domains := h.onFlow(src, target)
++	res, undidAlg, realips, domains, generation := h.onFlow(src, target)
+ 
+ 	h.maybeReplaceDest(res, &target)
+ 	// ref udp.go:Connect fn
+@@ -279,6 +280,7 @@ func (h *tcpHandler) Proxy(gconn *netstack.GTCPConn, src, target netip.AddrPort)
+ 
+ 	// actualTargets[0] may be same as target
+ 	smm = tcpSummary(cid, uid, src.Addr(), actualTargets[0].Addr())
++	smm.generation = generation
+ 
+ 	if h.status.Load() == HDLEND {
+ 		err = log.EE("tcp: proxy: %s end %s => %s [%v]", cid, src, target, actualTargets)
+diff --git a/intra/tunnel.go b/intra/tunnel.go
+index bc045130e1bfa047d7f8fee12f3a82f3b1ae38e6..03783c3d830864a4e7129e18a3fed81d0b901c9c 100644
+--- a/intra/tunnel.go
++++ b/intra/tunnel.go
+@@ -130,6 +130,8 @@ type rtunnel struct {
+ 	resolver dnsx.Resolver
+ 	services rnet.Services
+ 
++	admission *flowAdmission
++
+ 	linkmtu atomic.Int32
+ 
+ 	closed atomic.Bool
+@@ -244,9 +246,11 @@ func NewTunnel2(fd, linkmtu, tunmtu int, ifaddrs, fakedns string, dtr DefaultDNS
+ 		src = []netip.Prefix{netip.MustParsePrefix("10.111.222.1/24"), netip.MustParsePrefix("fd66:f83a:c650::1/120")}
+ 	}
+ 
+-	tcph := NewTCPHandler(ctx, resolver, proxies, bdg)
+-	udph := NewUDPHandler(ctx, resolver, proxies, bdg)
+-	icmph := NewICMPHandler(ctx, resolver, proxies, bdg)
++	admission := new(flowAdmission)
++	handlerCtx := context.WithValue(ctx, admissionKey{}, admission)
++	tcph := NewTCPHandler(handlerCtx, resolver, proxies, bdg)
++	udph := NewUDPHandler(handlerCtx, resolver, proxies, bdg)
++	icmph := NewICMPHandler(handlerCtx, resolver, proxies, bdg)
+ 	hdl := netstack.NewGConnHandler(src, tcph, udph, icmph)
+ 
+ 	log.D("tun: <<< new >>>; protocol handlers: ok")
+@@ -264,13 +268,14 @@ func NewTunnel2(fd, linkmtu, tunmtu int, ifaddrs, fakedns string, dtr DefaultDNS
+ 	rerr := proxies.Reverser(revhdl)
+ 
+ 	rt := &rtunnel{
+-		bar:      core.NewKeyedBarrier[*x.NetStat, string](ctx, "t.stat.bar", statttl),
+-		ctx:      ctx,
+-		done:     cancel,
+-		handlers: hdl,
+-		proxies:  proxies,
+-		resolver: resolver,
+-		services: services,
++		admission: admission,
++		bar:       core.NewKeyedBarrier[*x.NetStat, string](ctx, "t.stat.bar", statttl),
++		ctx:       ctx,
++		done:      cancel,
++		handlers:  hdl,
++		proxies:   proxies,
++		resolver:  resolver,
++		services:  services,
+ 	}
+ 	rt.t.Store(gt)
+ 	rt.linkmtu.Store(int32(linkmtu))
+@@ -554,6 +559,11 @@ func (t *rtunnel) stat() (*x.NetStat, error) {
+ func (t *rtunnel) CloseConns(activecsv string) (closedcsv string) {
+ 	defer core.Recover(core.Exit11, "i.CloseConns")
+ 
++	if activecsv == "" {
++		t.admission.Lock()
++		defer t.admission.Unlock()
++		t.admission.generation++
++	}
+ 	return t.handlers.CloseConns(activecsv)
+ }
+ 
+diff --git a/intra/udp.go b/intra/udp.go
+index 59c4391a67fae9dce2f82ed0827e43df08bd9c23..0c84474ce90577a38abb41783c0d8ed16b1ab516 100644
+--- a/intra/udp.go
++++ b/intra/udp.go
+@@ -101,9 +101,10 @@ func (h *udpHandler) Reset() {
+ }
+ 
+ func (h *udpHandler) ReverseProxy(gconn *netstack.GUDPConn, in net.Conn, to, from netip.AddrPort) (ok bool) {
+-	fm := h.onInflow(to, from)
++	fm, generation := h.onInflow(to, from)
+ 	cid, uid, _, pids := h.judge(fm)
+ 	smm := udpSummary(cid, uid, to.Addr(), from.Addr())
++	smm.generation = generation
+ 
+ 	if log.Verbose {
+ 		log.V("udp: %s [%s]: reverse: %s => %s; pids: %v", cid, uid, from, to, pids)
+@@ -143,7 +144,7 @@ func (h *udpHandler) Error(gconn *netstack.GUDPConn, src, target netip.AddrPort,
+ 		clos(gconn)
+ 		return
+ 	}
+-	res, undidAlg, realips, domains := h.onFlow(src, target)
++	res, undidAlg, realips, domains, _ := h.onFlow(src, target)
+ 	h.maybeReplaceDest(res, &target)
+ 	cid, uid, fid, pids := h.judge(res)
+ 	smm := udpSummary(cid, uid, src.Addr(), target.Addr())
+@@ -211,7 +212,7 @@ func (h *udpHandler) Connect(gconn *netstack.GUDPConn, src, target netip.AddrPor
+ 	mux := dmx != nil // also disabled for loopback mode, for now
+ 
+ 	// flow is alg/nat-aware, do not change target or any addrs
+-	res, undidAlg, realips, domains := h.onFlow(src, target)
++	res, undidAlg, realips, domains, generation := h.onFlow(src, target)
+ 
+ 	h.maybeReplaceDest(res, &target)
+ 
+@@ -236,6 +237,7 @@ func (h *udpHandler) Connect(gconn *netstack.GUDPConn, src, target netip.AddrPor
+ 		actualTargets = []netip.AddrPort{target}
+ 	}
+ 	smm = udpSummary(cid, uid, src.Addr(), actualTargets[0].Addr())
++	smm.generation = generation
+ 
+ 	if h.status.Load() == HDLEND {
+ 		err = log.EE("udp: connect: %s [%s] %v => %v, end", cid, uid, src, target)

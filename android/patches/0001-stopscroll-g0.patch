@@ -1,5 +1,5 @@
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index 0a2469d..cde5e12 100644
+index 0a2469d..f1c443c 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
 @@ -23,6 +23,7 @@ plugins {
@@ -9,14 +9,14 @@ index 0a2469d..cde5e12 100644
 +val stopscrollBuild = taskNames.contains("stopscrollrelease")
  // for alpha builds generate universal apk only
  val alphaBuild = taskNames.contains("alpha")
- 
+
 @@ -30,7 +31,7 @@ val alphaBuild = taskNames.contains("alpha")
  val fdroidBuildServer: String? = System.getenv("fdroidserver")
  val isFdroidBuildServer = !fdroidBuildServer.isNullOrEmpty() && fdroidBuildServer != "null"
  val deGoogled = !playBuild || fdroidBuild || isFdroidBuildServer || alphaBuild
 -val shouldSplit = !alphaBuild
 +val shouldSplit = !alphaBuild && !stopscrollBuild
- 
+
  // Pass -PwebsiteDegoogled=true when building the fdroid flavor with our own keys.
  // Official F-Droid builds omit this flag and will be labeled as "fdroid".
 @@ -168,9 +169,16 @@ android {
@@ -25,7 +25,7 @@ index 0a2469d..cde5e12 100644
          buildConfigField("boolean", "IS_WEBSITE_DEGOOGLD_BUILD", "false")
 +        buildConfigField("boolean", "STOPSCROLL_G0", "false")
      }
- 
+
      signingConfigs {
 +        create("stopscroll") {
 +            storeFile = System.getenv("STOPSCROLL_KEYSTORE")?.let { file(it) }
@@ -51,10 +51,10 @@ index 0a2469d..cde5e12 100644
          create("leakCanary") {
              matchingFallbacks += listOf("debug")
              initWith(getByName("debug"))
-@@ -395,7 +411,46 @@ kotlin {
+@@ -395,7 +411,52 @@ kotlin {
      }
  }
- 
+
 +abstract class PrepareStopscrollNotices : DefaultTask() {
 +    @get:InputFile
 +    @get:PathSensitive(PathSensitivity.NONE)
@@ -64,6 +64,10 @@ index 0a2469d..cde5e12 100644
 +    @get:PathSensitive(PathSensitivity.NONE)
 +    abstract val firestackLicense: RegularFileProperty
 +
++    @get:InputFile
++    @get:PathSensitive(PathSensitivity.NONE)
++    abstract val firestackPatch: RegularFileProperty
++
 +    @get:OutputDirectory
 +    abstract val destination: DirectoryProperty
 +
@@ -72,6 +76,7 @@ index 0a2469d..cde5e12 100644
 +        val out = destination.get().asFile
 +        rethinkLicense.get().asFile.copyTo(out.resolve("RethinkDNS-Apache-2.0.txt"), overwrite = true)
 +        firestackLicense.get().asFile.copyTo(out.resolve("Firestack-MPL-2.0.txt"), overwrite = true)
++        firestackPatch.get().asFile.copyTo(out.resolve("Firestack-modifications.patch"), overwrite = true)
 +    }
 +}
 +
@@ -79,6 +84,7 @@ index 0a2469d..cde5e12 100644
 +    tasks.register<PrepareStopscrollNotices>("prepareStopscrollNotices") {
 +        rethinkLicense.set(rootProject.file("LICENSE"))
 +        firestackLicense.set(file(requireNotNull(System.getenv("STOPSCROLL_FIRESTACK_LICENSE"))))
++        firestackPatch.set(file(requireNotNull(System.getenv("STOPSCROLL_FIRESTACK_PATCH"))))
 +    }
 +} else {
 +    null
@@ -98,7 +104,7 @@ index 0a2469d..cde5e12 100644
      onVariants(selector().all()) { variant ->
          variant.outputs.forEach { output ->
              val abi =
-@@ -508,7 +563,13 @@ dependencies {
+@@ -508,7 +569,13 @@ dependencies {
      // add ":debug" suffix to the dependency to include debug symbols
      download(firestackDependency())
      "websiteImplementation"(firestackDependency())
@@ -111,7 +117,7 @@ index 0a2469d..cde5e12 100644
 +        firestackDependency()
 +    })
      "playImplementation"(firestackDependency())
- 
+
      // Work manager
 diff --git a/app/src/main/java/com/celzero/bravedns/RethinkDnsApplication.kt b/app/src/main/java/com/celzero/bravedns/RethinkDnsApplication.kt
 index 6cd5717..3c568f8 100644
@@ -129,46 +135,70 @@ index 6cd5717..3c568f8 100644
 @@ -51,6 +53,11 @@ class RethinkDnsApplication : Application() {
              koin.loadModules(AppModules)
          }
- 
+
 +        if (BuildConfig.STOPSCROLL_G0) {
 +            G0Vpn.restore(this)
 +            G0Vpn.configure(get<PersistentState>())
 +        }
 +
          val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
- 
+
          // Initialize global exception handler
 @@ -61,7 +68,7 @@ class RethinkDnsApplication : Application() {
- 
+
          turnOnStrictMode()
- 
+
 -        appScope.launch {
 +        if (!BuildConfig.STOPSCROLL_G0) appScope.launch {
              scheduleJobs()
          }
      }
 diff --git a/app/src/main/java/com/celzero/bravedns/net/go/GoVpnAdapter.kt b/app/src/main/java/com/celzero/bravedns/net/go/GoVpnAdapter.kt
-index 143661a..927dc75 100644
+index 143661a..b54aa7a 100644
 --- a/app/src/main/java/com/celzero/bravedns/net/go/GoVpnAdapter.kt
 +++ b/app/src/main/java/com/celzero/bravedns/net/go/GoVpnAdapter.kt
-@@ -77,6 +77,8 @@ import com.celzero.bravedns.util.Utilities.isPlayStoreFlavour
+@@ -77,6 +77,10 @@ import com.celzero.bravedns.util.Utilities.isPlayStoreFlavour
  import com.celzero.bravedns.util.Utilities.showToastUiCentered
  import com.celzero.bravedns.wireguard.Config
  import com.celzero.bravedns.wireguard.WgHopManager
 +import com.celzero.bravedns.BuildConfig
++import com.celzero.bravedns.stopscroll.G0Tunnel
 +import com.celzero.bravedns.stopscroll.G0Vpn
++import com.celzero.bravedns.stopscroll.effectiveDialStrategy
  import com.celzero.firestack.backend.Backend
  import com.celzero.firestack.backend.Client
  import com.celzero.firestack.backend.DNSResolver
-@@ -247,6 +249,16 @@ class GoVpnAdapter : KoinComponent {
+@@ -118,7 +122,8 @@ class GoVpnAdapter : KoinComponent {
+     private val eventLogger by inject<EventLogger>()
+
+     // The Intra session object from go-tun2socks.  Initially null.
+-    private var tunnel: Tunnel
++    private val tunnel: Tunnel
++    internal val g0Tunnel: G0Tunnel?
+     private var context: Context
+     private var externalScope: CoroutineScope
+
+@@ -130,6 +135,7 @@ class GoVpnAdapter : KoinComponent {
+         mtu: Int,
+         nwMtu: Int,
+         opts: TunnelOptions) {
++        g0Tunnel = opts.bridge as? G0Tunnel
+         this.context = context
+         this.externalScope = externalScope
+         val defaultDns = newDefaultTransport(appConfig.getDefaultDns())
+@@ -247,6 +253,20 @@ class GoVpnAdapter : KoinComponent {
              return
          }
- 
+
 +        if (BuildConfig.STOPSCROLL_G0) {
 +            try {
-+                Intra.addDoHTransport(tunnel, Backend.Preferred, G0Vpn.resolverUrl, G0Vpn.resolverIps)
++                val identity = requireNotNull(g0Tunnel)
++                G0Vpn.cutoff.installPreferred(identity, G0Vpn::durableRevision) {
++                    Intra.addDoHTransport(tunnel, Backend.Preferred, G0Vpn.resolverUrl, G0Vpn.resolverIps)
++                    check(tunnel.resolver?.get(Backend.Preferred)?.id() == Backend.Preferred)
++                    G0Vpn.cutoff.withAlgLock { g0SetAlg(persistentState.enableDnsAlg) }
++                }
 +            } catch (e: Exception) {
-+                removeResolver(Backend.Preferred)
 +                Logger.e(LOG_TAG_VPN, "$TAG unable to add Stopscroll DoH", e)
 +            }
 +            return
@@ -177,10 +207,21 @@ index 143661a..927dc75 100644
          // TODO: #321 As of now there is no block free transport for dns types other than Rethink.
          // introduce block free transport for other dns types when there is a UI to configure the
          // block free transport
-@@ -1983,7 +1995,13 @@ class GoVpnAdapter : KoinComponent {
+@@ -1983,7 +2003,24 @@ class GoVpnAdapter : KoinComponent {
          }
      }
- 
+
++    internal fun g0Sweep() {
++        check(tunnel.isConnected)
++        tunnel.closeConns("")
++        check(tunnel.isConnected)
++    }
++
++    internal fun g0SetAlg(enabled: Boolean) {
++        check(tunnel.isConnected)
++        requireNotNull(tunnel.resolver).translate(enabled, false)
++    }
++
 +    internal fun g0DnsInfo() = if (tunnel.isConnected) tunnel.stat()?.rdnsinfo() else null
 +
      private fun newDefaultTransport(url: String): DefaultDNS? {
@@ -191,53 +232,165 @@ index 143661a..927dc75 100644
          val fallbackDns = getDefaultFallbackDns()
          try {
              // when the url is empty, set the default transport to 9.9.9.9, 2620:fe::fe or
-@@ -2043,6 +2061,7 @@ class GoVpnAdapter : KoinComponent {
+@@ -2043,6 +2080,7 @@ class GoVpnAdapter : KoinComponent {
              Logger.e(LOG_TAG_VPN, "$TAG no tunnel, skip add default dns")
              return false
          }
 +        if (BuildConfig.STOPSCROLL_G0) return true // fixed in the native tunnel constructor
          var type = Backend.DNS53
          val fallbackUrl = getDefaultFallbackDns()
- 
+
+@@ -2312,6 +2350,7 @@ class GoVpnAdapter : KoinComponent {
+     }
+
+     suspend fun setDnsAlg() {
++        if (BuildConfig.STOPSCROLL_G0) return // Applied during Preferred initialization and shell updates.
+         // set translate to false for dns mode (regardless of setting in dns screen),
+         // since apps cannot understand alg ips
+         if (appConfig.getBraveMode().isDnsMode()) {
+@@ -2670,15 +2709,16 @@ class GoVpnAdapter : KoinComponent {
+             return
+         }
+         try {
+-            Settings.setDialerOpts(mode, retry, bufferSize, timeoutSec, tcpKeepAlive)
++            val (dialMode, retryMode) = effectiveDialStrategy(BuildConfig.STOPSCROLL_G0, mode, retry)
++            Settings.setDialerOpts(dialMode, retryMode, bufferSize, timeoutSec, tcpKeepAlive)
+             Logger.i(
+                 LOG_TAG_VPN,
+-                "$TAG set dial strategy: $mode, retry: $retry, tcpKeepAlive: $tcpKeepAlive, timeout: $timeoutSec, bufSize: $bufferSize"
++                "$TAG set dial strategy: $dialMode, retry: $retryMode, tcpKeepAlive: $tcpKeepAlive, timeout: $timeoutSec, bufSize: $bufferSize"
+             )
+             logEvent(
+                 Severity.LOW,
+                 "dial strategy",
+-                "set dial strategy to: mode=$mode, retry=$retry, tcpKeepAlive=$tcpKeepAlive, timeout=$timeoutSec, bufSize: $bufferSize"
++                "set dial strategy to: mode=$dialMode, retry=$retryMode, tcpKeepAlive=$tcpKeepAlive, timeout=$timeoutSec, bufSize: $bufferSize"
+             )
+         } catch (e: Exception) {
+             Logger.e(LOG_TAG_VPN, "$TAG err set dial strategy: ${e.message}", e)
 diff --git a/app/src/main/java/com/celzero/bravedns/service/BraveVPNService.kt b/app/src/main/java/com/celzero/bravedns/service/BraveVPNService.kt
-index a0c06b4..70f30d2 100644
+index a0c06b4..19e17ac 100644
 --- a/app/src/main/java/com/celzero/bravedns/service/BraveVPNService.kt
 +++ b/app/src/main/java/com/celzero/bravedns/service/BraveVPNService.kt
-@@ -127,6 +127,7 @@ import com.celzero.bravedns.util.Utilities.isPlayStoreFlavour
+@@ -127,6 +127,9 @@ import com.celzero.bravedns.util.Utilities.isPlayStoreFlavour
  import com.celzero.bravedns.util.Utilities.showToastUiCentered
  import com.celzero.bravedns.wireguard.Config
  import com.celzero.bravedns.wireguard.WgHopManager
++import com.celzero.bravedns.stopscroll.G0Tunnel
++import com.celzero.bravedns.stopscroll.G0Vpn
 +import com.celzero.bravedns.BuildConfig
  import com.celzero.firestack.backend.Backend
  import com.celzero.firestack.backend.Client
  import com.celzero.firestack.backend.DNSOpts
-@@ -604,6 +605,8 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -604,6 +607,8 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
              logd("builder: set metered: ${persistentState.setVpnBuilderToMetered}")
          }
- 
+
 +        if (BuildConfig.STOPSCROLL_G0) return builder
 +
          if (!vpnLockdown && persistentState.allowBypass) {
              builder.allowBypass()
              logd("builder: allow bypass: true")
-@@ -1956,6 +1959,17 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -1637,7 +1642,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+             }
+
+             PersistentState.DNS_ALG -> {
+-                io("dnsAlg") { updateDnsAlg() }
++                if (!BuildConfig.STOPSCROLL_G0) io("dnsAlg") { updateDnsAlg() }
+             }
+
+             PersistentState.PRIVATE_IPS -> {
+@@ -1956,6 +1961,8 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
          }
      }
- 
-+    internal suspend fun g0CloseAll(): Boolean {
-+        val adapter = vpnAdapter ?: return false
-+        if (!adapter.hasTunnel()) return false
-+        adapter.closeConnections(emptyList(), reason = "Stopscroll G0")
-+        return adapter.hasTunnel()
-+    }
-+
-+    internal suspend fun g0UpdateDnsAlg() = updateDnsAlg()
-+
-+    internal fun g0DnsInfo() = vpnAdapter?.g0DnsInfo()
+
++    internal fun g0Protected() = isAtleastQ() && isAlwaysOn && isLockdownEnabled
 +
      private suspend fun updateDnsAlg() {
          vpnAdapter?.setDnsAlg()
      }
+@@ -1980,6 +1987,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+                 return@withContext
+             }
+
++            vpnAdapter?.g0Tunnel?.let { G0Vpn.cutoff.detach(it) }
+             vpnAdapter?.closeTun()
+             vpnAdapter = null
+             Logger.i(LOG_TAG_VPN, "stop vpn adapter")
+@@ -2281,9 +2289,13 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+                     val ifaceAddresses = getAddresses()
+                     Logger.i(LOG_TAG_VPN, "vpn-adapter doesn't exists, create one, fd: $fd, lockdown: $lockdown, protos: $protos, ifaddr: $ifaceAddresses, opts: $opts, mtu: $mtu, nwMtu: $nwMtu")
+                     GoVpnAdapter.setLogLevel(persistentState.goLoggerLevel.toInt(), includeFileTrace = persistentState.includeFileTrace)
+-                    vpnAdapter = GoVpnAdapter(ctx, vpnScope, fd, ifaceAddresses, mtu, nwMtu, opts) // may throw
++                    val bridge = if (BuildConfig.STOPSCROLL_G0) G0Tunnel(this@BraveVPNService) else null
++                    val nativeOpts = if (bridge == null) opts else opts.copy(bridge = bridge)
++                    val created = GoVpnAdapter(ctx, vpnScope, fd, ifaceAddresses, mtu, nwMtu, nativeOpts)
++                    vpnAdapter = created
++                    bridge?.attach(created)
+                     Logger.d(LOG_TAG_VPN, "vpn-adapter created with ifaddr: $ifaceAddresses, protos: $protos")
+-                    io("tunInit") { vpnAdapter?.initResolverProxiesPcap(opts) }
++                    io("tunInit") { created.initResolverProxiesPcap(nativeOpts) }
+                     io("rpnCheck") { checkForPlusSubscription() }
+                     return@withContext ok
+                 } else {
+@@ -3034,7 +3046,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+         networkLifecycleObserver.stop()
+         GlobalProxyHandler.stop()
+         wgProxyPingController.stopAll()
+-        VpnController.onVpnDestroyed()
++        VpnController.onVpnDestroyed(this)
+         // stop the inapp billing handler if it exists
+         //InAppBillingHandler.endConnection()
+         try {
+@@ -3180,7 +3192,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+                 )
+
+             // val mtu = mtu() // get mtu from the underlyingnetworks
+-            var builder: Builder = newBuilder().setSession("Rethink").setMtu(mtu)
++            var builder: Builder = newBuilder().setSession(if (BuildConfig.STOPSCROLL_G0) "Stopscroll" else "Rethink").setMtu(mtu)
+
+             // set the PendingIntent to an activity for users to configure the vpn connection.
+             // if it is not set, the button to configure will not be shown in system-managed dialogs
+@@ -3664,10 +3676,11 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+         withContext(CoroutineName(s) + Dispatchers.Main) { f() }
+
+     override fun onQuery(origin: String, uidGostr: String, fqdn: String, qtype: Long): DNSOpts {
+-        return go2kt(dnsQueryDispatcher) {
++        val result = go2kt(dnsQueryDispatcher) {
+             val d = TunDnsManager.DnsParams(origin, uidGostr, fqdn, qtype, isLockdown(), getUnderlyingSsid(), isIfaceCellular(""), isCaptivePortal())
+             TunDnsManager.handleOnQuery(d)
+         }
++        return result
+     }
+
+     private fun isCaptivePortal(): Boolean {
+@@ -3858,17 +3871,19 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+         probableDomains: String?,
+         blocklists: String?,
+         isAlg: Boolean
+-    ): Mark = go2kt(flowDispatcher) {
+-        TunFlowManager.handleFlow(
+-            buildFlowContext(),
+-            protocol, _uid, src, dst, realIps, d, probableDomains, blocklists, isAlg
+-        )
++    ): Mark {
++        val result = go2kt(flowDispatcher) {
++            TunFlowManager.handleFlow(buildFlowContext(), protocol, _uid, src, dst, realIps, d, probableDomains, blocklists, isAlg)
++        }
++        return result
+     }
+
+-    override fun inflow(protocol: Int, recvdUid: Int, src: String?, dst: String?): Mark =
+-        go2kt(inflowDispatcher) {
++    override fun inflow(protocol: Int, recvdUid: Int, src: String?, dst: String?): Mark {
++        val result = go2kt(inflowDispatcher) {
+             TunFlowManager.handleInflow(buildFlowContext(), protocol, recvdUid, src, dst)
+         }
++        return result
++    }
+
+     // no need of go2kt here as it is called from go and performs db operations with no return value
+     // requires go2kt if there any calls to go functions
 diff --git a/app/src/main/java/com/celzero/bravedns/service/TunFlowManager.kt b/app/src/main/java/com/celzero/bravedns/service/TunFlowManager.kt
 index 76bf7fc..2f98179 100644
 --- a/app/src/main/java/com/celzero/bravedns/service/TunFlowManager.kt
@@ -254,7 +407,7 @@ index 76bf7fc..2f98179 100644
 @@ -426,6 +428,15 @@ object TunFlowManager : KoinComponent {
                  connType
              )
- 
+
 +        if (BuildConfig.STOPSCROLL_G0) {
 +            val blocked = d?.split(',')?.any(G0Vpn.policy::blocks) == true
 +            G0Vpn.watch?.takeIf { it.uid == uid }?.record(protocol, blocked)
@@ -266,26 +419,263 @@ index 76bf7fc..2f98179 100644
 +
          val trapVpnDns = isDns(dstPort) && isVpnDns(dstIp)
          val trapVpnPrivateDns = isVpnDns(dstIp) && isPrivateDns(dstPort)
- 
+
 diff --git a/app/src/main/java/com/celzero/bravedns/service/VpnController.kt b/app/src/main/java/com/celzero/bravedns/service/VpnController.kt
-index d032e94..9b2a59e 100644
+index d032e94..66ac0dc 100644
 --- a/app/src/main/java/com/celzero/bravedns/service/VpnController.kt
 +++ b/app/src/main/java/com/celzero/bravedns/service/VpnController.kt
-@@ -181,6 +181,14 @@ object VpnController : KoinComponent {
-         rvpn?.refreshProxies()
+@@ -42,6 +42,8 @@ import com.celzero.firestack.backend.RpnServers
+ import com.celzero.firestack.intra.Controller
+ import org.koin.core.component.KoinComponent
+ import org.koin.core.component.inject
++import com.celzero.bravedns.BuildConfig
++import com.celzero.bravedns.stopscroll.G0Vpn
+ import java.net.Socket
+
+ object VpnController : KoinComponent {
+@@ -61,14 +63,17 @@ object VpnController : KoinComponent {
+     var connectionStatus: MutableLiveData<BraveVPNService.State?> = MutableLiveData()
+
+     // TODO: make clients listen on create, start, stop, destroy from vpn-service
+-    fun onVpnCreated(b: BraveVPNService) {
++    @Synchronized fun onVpnCreated(b: BraveVPNService) {
++        if (BuildConfig.STOPSCROLL_G0) G0Vpn.cutoff.register(b)
+         rvpn = b
+
+         // store app start time, used in HomeScreenBottomSheet
+         vpnStartElapsedTime = SystemClock.elapsedRealtime()
      }
- 
-+    internal suspend fun g0CloseAll() = rvpn?.g0CloseAll() == true
+
+-    fun onVpnDestroyed() {
++    @Synchronized fun onVpnDestroyed(service: BraveVPNService) {
++        if (rvpn !== service) return
++        if (BuildConfig.STOPSCROLL_G0) G0Vpn.cutoff.unregister(service)
+         rvpn = null
+         states = null
+         vpnStartElapsedTime = SystemClock.elapsedRealtime()
+diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/G0Cutoff.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Cutoff.kt
+new file mode 100644
+index 0000000..7ff4e50
+--- /dev/null
++++ b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Cutoff.kt
+@@ -0,0 +1,203 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
 +
-+    internal suspend fun g0UpdateDnsAlg() {
-+        rvpn?.g0UpdateDnsAlg()
++import java.util.concurrent.CountDownLatch
++
++/** Each Target is the bridge of one native adapter, including during native callbacks. */
++internal class G0Cutoff<T : G0Cutoff.Target>(private val now: () -> Long) {
++    interface Target {
++        val owner: Any
++        fun sweep()
++        fun protectedNow(): Boolean
 +    }
 +
-+    internal fun g0DnsInfo() = rvpn?.g0DnsInfo()
++    enum class Preferred { PENDING, INSTALLING, READY, FAILED }
 +
-     fun hasTunnel(): Boolean {
-         return rvpn?.hasTunnel() == true
-     }
++    data class State<T>(
++        val target: T? = null,
++        val generation: Long = 0,
++        val preferred: Preferred = Preferred.PENDING,
++        val appliedRevision: Long? = null,
++        val changing: Boolean = false,
++        val algUncertain: Boolean = false,
++        val due: Long? = null,
++        val trigger: Long? = null,
++        val cutoff: Long? = null,
++        val closeMs: Long? = null,
++        val error: String? = null
++    )
++
++    class Claim<T>(val target: T?, val generation: Long) {
++        internal val settled = CountDownLatch(1)
++    }
++
++    private val writes = Any()
++    private val alg = Any()
++    private var active: Claim<T>? = null
++    private var service: Any? = null
++    @Volatile var state = State<T>()
++        private set
++
++    @Synchronized fun register(owner: Any) {
++        service = owner
++        changeTarget(null)
++    }
++
++    @Synchronized fun unregister(owner: Any) {
++        if (service !== owner) return
++        service = null
++        changeTarget(null)
++    }
++
++    @Synchronized fun attach(target: T) {
++        if (service === target.owner) changeTarget(target)
++    }
++
++    @Synchronized fun detach(target: T) {
++        if (state.target === target) changeTarget(null)
++    }
++
++    private fun changeTarget(target: T?) {
++        state = state.copy(target = target, preferred = Preferred.PENDING, appliedRevision = null, algUncertain = false)
++    }
++
++    fun receipt(target: T): State<T>? = state.takeIf { it.target === target && it.appliedRevision != null }
++
++    fun permits(target: T, receipt: State<T>?): Boolean =
++        receipt != null && receipt.target === target && state === receipt
++
++    // Platform and native probes can block. Revalidate their subject after returning.
++    fun protectedTarget(target: T? = state.target): T? =
++        target?.takeIf { it.protectedNow() && state.target === it }
++
++    fun protectedReceipt(target: T, sample: State<T>): Boolean =
++        receipt(target) === sample && target.protectedNow() && permits(target, sample)
++
++    // This lock serializes ALG changes, activation on a replacement, and ALG status reads.
++    // Neither deadline claims nor native sweeps ever acquire it.
++    fun <R> withAlgLock(action: () -> R): R = synchronized(alg, action)
++
++    fun updateAlg(target: T, before: State<T>, enabled: Boolean, read: () -> Boolean,
++                  apply: (Boolean) -> Unit, store: (Boolean) -> Unit): Boolean = synchronized(alg) {
++        if (!protectedReceipt(target, before)) return false
++        val previous = read()
++        var storing = false
++        try {
++            apply(enabled)
++            if (protectedReceipt(target, before)) {
++                // The final guard authorizes commit. A replacement reads the committed value
++                // under this same ALG lock before it can obtain an activation receipt.
++                storing = true
++                store(enabled)
++                return true
++            }
++        } catch (_: Exception) {
++            // An exception after the native write also requires reconciliation.
++        }
++        try {
++            apply(previous)
++            if (storing) store(previous)
++        } catch (_: Exception) {
++            synchronized(this) {
++                if (state.target === target) state = state.copy(algUncertain = true,
++                    appliedRevision = null, error = "Native ALG mode is unconfirmed")
++            }
++        }
++        false
++    }
++
++    @Synchronized fun begin(target: T?, due: Long? = null): Claim<T> {
++        val trigger = now()
++        state = state.copy(generation = state.generation + 1, appliedRevision = null,
++            changing = true, due = due ?: trigger, trigger = trigger, cutoff = null, closeMs = null, error = null)
++        active?.settled?.countDown()
++        return Claim(target, state.generation).also { active = it }
++    }
++
++    // Sweep before disk and platform calls so an existing stream is revoked immediately.
++    fun complete(claim: Claim<T>, save: () -> Long?): Boolean {
++        if (state.generation != claim.generation) return false
++        val target = claim.target
++        val started = now()
++        val swept = target != null && try { target.sweep(); true } catch (_: Exception) { false }
++        val completed = now()
++        // Only persistence is serialized. A deadline can close admission and sweep while an
++        // older writer or its protection probe is stalled. Its save is ordered after that writer.
++        val revision = synchronized(writes) {
++            if (state.generation != claim.generation || !state.changing) return false
++            try { save() } catch (_: Exception) { null }
++        }
++        val protected = swept && try { target.protectedNow() } catch (_: Exception) { false }
++        synchronized(this) {
++            val s = state
++            if (s.generation != claim.generation || !s.changing) return false
++            val error = when {
++                revision == null -> "Policy save failed"
++                !protected || target !== s.target -> "Native cutoff unconfirmed or VPN protection changed"
++                s.algUncertain -> "Native ALG mode is unconfirmed"
++                s.preferred != Preferred.READY -> "Preferred DNS is ${s.preferred.name.lowercase()}"
++                else -> null
++            }
++            state = s.copy(changing = false, appliedRevision = revision.takeIf { error == null },
++                cutoff = completed.takeIf { swept }, closeMs = completed - started,
++                error = error ?: if (completed - (s.due ?: completed) > 2_000L) "Cutoff exceeded 2000 ms" else null)
++            active = null
++            claim.settled.countDown()
++            return state.error == null
++        }
++    }
++
++    /** Installation is idempotent for the fixed resolver and never occupies the cutoff monitor. */
++    fun installPreferred(target: T, savedRevision: () -> Long?, install: () -> Unit) {
++        synchronized(this) {
++            if (state.target !== target || state.preferred in listOf(Preferred.READY, Preferred.INSTALLING)) return
++            state = state.copy(preferred = Preferred.INSTALLING, appliedRevision = null)
++        }
++        try {
++            install()
++        } catch (e: Exception) {
++            synchronized(this) {
++                if (state.target === target) state = state.copy(preferred = Preferred.FAILED, appliedRevision = null)
++            }
++            throw e
++        }
++        synchronized(this) {
++            if (state.target !== target || state.preferred != Preferred.INSTALLING) return
++            state = state.copy(preferred = Preferred.READY)
++        }
++        while (true) {
++            val previous = synchronized(this) {
++                if (state.target !== target || receipt(target) != null) return
++                val claim = active
++                if (claim?.target === target) return // that transition owns the acknowledgement
++                if (claim == null) begin(target) else claim
++            }
++            if (previous.target === target) {
++                complete(previous, savedRevision)
++                return
++            }
++            // Another adapter's transition may still own a policy save. Never transfer its
++            // acknowledgement. Activate against this adapter once that write has settled.
++            previous.settled.await()
++        }
++    }
++}
++
++/** A replaced alarm may already be running when coroutine cancellation arrives. */
++internal class G0Deadlines<T : G0Cutoff.Target, D : Any>(private val gate: G0Cutoff<T>) {
++    var pending: D? = null
++        private set
++
++    fun arm(before: G0Cutoff.State<T>, next: D): D? = synchronized(gate) {
++        if (gate.state !== before || before.appliedRevision == null) return@synchronized next
++        pending.also { pending = next }
++    }
++
++    fun clear(): D? = synchronized(gate) { pending.also { pending = null } }
++
++    fun claim(expected: D, due: Long): G0Cutoff.Claim<T>? = synchronized(gate) {
++        if (pending !== expected) return@synchronized null
++        pending = null
++        gate.begin(gate.state.target, due)
++    }
++}
+diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/G0Dial.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Dial.kt
+new file mode 100644
+index 0000000..e03e46b
+--- /dev/null
++++ b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Dial.kt
+@@ -0,0 +1,8 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import com.celzero.firestack.settings.Settings
++
++/** The G0 cutoff is verified for the default TCP writer and its normal retries. */
++internal fun effectiveDialStrategy(g0: Boolean, mode: Int, retry: Int): Pair<Int, Int> =
++    if (g0) Settings.SplitAuto to Settings.RetryAfterSplit else mode to retry
 diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/G0Domains.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Domains.kt
 new file mode 100644
 index 0000000..df935ec
@@ -337,16 +727,73 @@ index 0000000..df935ec
 +        }
 +    }
 +}
+diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/G0Tunnel.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Tunnel.kt
+new file mode 100644
+index 0000000..32752de
+--- /dev/null
++++ b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Tunnel.kt
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import com.celzero.bravedns.net.go.GoVpnAdapter
++import com.celzero.bravedns.service.BraveVPNService
++import com.celzero.firestack.backend.Backend
++import com.celzero.firestack.backend.DNSOpts
++import com.celzero.firestack.intra.Bridge
++import com.celzero.firestack.intra.Mark
++
++/** A native callback retains this bridge even if its service later publishes another adapter. */
++internal class G0Tunnel(override val owner: BraveVPNService) : Bridge by owner, G0Cutoff.Target {
++    lateinit var adapter: GoVpnAdapter
++        private set
++
++    fun attach(created: GoVpnAdapter) {
++        adapter = created
++        G0Vpn.cutoff.attach(this)
++    }
++
++    override fun sweep() = adapter.g0Sweep()
++    override fun protectedNow() = adapter.hasTunnel() && owner.g0Protected()
++
++    override fun flow(protocol: Int, uid: Int, src: String?, dst: String?, realIps: String?,
++                      domains: String?, probable: String?, blocklists: String?, isAlg: Boolean): Mark {
++        val receipt = G0Vpn.cutoff.receipt(this) ?: return blocked(uid)
++        val result = owner.flow(protocol, uid, src, dst, realIps, domains, probable, blocklists, isAlg)
++        return if (G0Vpn.cutoff.permits(this, receipt) && !result.pidcsv.isNullOrBlank()) result else blocked(uid)
++    }
++
++    override fun inflow(protocol: Int, uid: Int, src: String?, dst: String?): Mark {
++        val receipt = G0Vpn.cutoff.receipt(this) ?: return blocked(uid)
++        val result = owner.inflow(protocol, uid, src, dst)
++        return if (G0Vpn.cutoff.permits(this, receipt) && !result.pidcsv.isNullOrBlank()) result else blocked(uid)
++    }
++
++    private fun blocked(flowUid: Int) = Mark().apply {
++        uid = flowUid.toString()
++        pidcsv = Backend.Block
++    }
++
++    override fun onQuery(origin: String, uidGostr: String, fqdn: String, qtype: Long): DNSOpts {
++        val receipt = G0Vpn.cutoff.receipt(this)
++        if (receipt != null) {
++            val result = owner.onQuery(origin, uidGostr, fqdn, qtype)
++            if (G0Vpn.cutoff.permits(this, receipt) && !result.tidcsv.isNullOrBlank()) return result
++        }
++        return DNSOpts().apply { uid = uidGostr; tidcsv = "${Backend.BlockAll}:${Backend.Base}" }
++    }
++}
 diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/G0Vpn.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Vpn.kt
 new file mode 100644
-index 0000000..a9248d6
+index 0000000..509f94f
 --- /dev/null
 +++ b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Vpn.kt
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,84 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package com.celzero.bravedns.stopscroll
 +
 +import android.content.Context
++import android.os.SystemClock
 +import com.celzero.bravedns.data.AppConfig
 +import com.celzero.bravedns.service.PersistentState
 +import org.json.JSONArray
@@ -358,7 +805,13 @@ index 0000000..a9248d6
 +    const val resolverUrl = "https://cloudflare-dns.com/dns-query"
 +    const val resolverIps = "1.1.1.1,1.0.0.1,2606:4700:4700::1111,2606:4700:4700::1001"
 +
-+    @Volatile var policy = G0Domains.EMPTY
++    data class Saved(val revision: Long, val policy: G0Domains)
++
++    @Volatile var saved = Saved(0L, G0Domains.EMPTY)
++        private set
++    val cutoff = G0Cutoff<G0Tunnel>(SystemClock::elapsedRealtime)
++    val policy get() = saved.policy
++    @Volatile var saveFailed = false
 +        private set
 +    @Volatile var watch: FlowWatch? = null
 +
@@ -391,17 +844,24 @@ index 0000000..a9248d6
 +    fun restore(context: Context) {
 +        val text = preferences(context).getString("policy", null) ?: return
 +        val json = JSONObject(text)
-+        policy = G0Domains.create(strings(json.getJSONArray("domains")), strings(json.getJSONArray("exceptions")))
++        val policy = G0Domains.create(strings(json.getJSONArray("domains")), strings(json.getJSONArray("exceptions")))
++        saved = Saved(json.optLong("revision", 0L), policy)
 +    }
 +
++    fun durableRevision(): Long? = saved.revision.takeUnless { saveFailed }
++
 +    fun replace(context: Context, next: G0Domains) {
++        val revision = saved.revision + 1
 +        val json = JSONObject()
++            .put("revision", revision)
 +            .put("domains", JSONArray(next.domains))
 +            .put("exceptions", JSONArray(next.exceptions))
++        saveFailed = true
 +        check(preferences(context).edit().putString("policy", json.toString()).commit()) {
 +            "Unable to save G0 domains"
 +        }
-+        policy = next
++        saved = Saved(revision, next)
++        saveFailed = false
 +    }
 +
 +    fun strings(array: JSONArray): List<String> {
@@ -427,7 +887,7 @@ index 2c71613..33f0c0d 100644
  import com.celzero.firestack.backend.DNSOpts
  import com.celzero.firestack.backend.DNSSummary
 @@ -152,6 +154,13 @@ object TunDnsManager: KoinComponent {
- 
+
          val uid = getUid(uidStr)
          val rinr = persistentState.routeRethinkInRethink
 +        if (BuildConfig.STOPSCROLL_G0) {
@@ -438,11 +898,11 @@ index 2c71613..33f0c0d 100644
 +            }
 +        }
          val appMode = appConfig.getBraveMode()
- 
+
          // when the active network is behind a captive portal, route every query to the system
 diff --git a/app/src/stopscrollRelease/AndroidManifest.xml b/app/src/stopscrollRelease/AndroidManifest.xml
 new file mode 100644
-index 0000000..a018e5e
+index 0000000..e319ada
 --- /dev/null
 +++ b/app/src/stopscrollRelease/AndroidManifest.xml
 @@ -0,0 +1,24 @@
@@ -450,7 +910,7 @@ index 0000000..a018e5e
 +<manifest xmlns:android="http://schemas.android.com/apk/res/android"
 +    xmlns:tools="http://schemas.android.com/tools">
 +    <uses-permission android:name="android.permission.WAKE_LOCK" />
-+    <application>
++    <application android:label="Stopscroll" tools:replace="android:label">
 +        <provider
 +            android:name="com.celzero.bravedns.stopscroll.UsbControlProvider"
 +            android:authorities="${applicationId}.usb"
@@ -470,6 +930,20 @@ index 0000000..a018e5e
 +        <receiver android:name=".receiver.VpnControlReceiver" tools:node="remove" />
 +    </application>
 +</manifest>
+diff --git a/app/src/stopscrollRelease/assets/Firestack-source.txt b/app/src/stopscrollRelease/assets/Firestack-source.txt
+new file mode 100644
+index 0000000..09c828f
+--- /dev/null
++++ b/app/src/stopscrollRelease/assets/Firestack-source.txt
+@@ -0,0 +1,8 @@
++Firestack is distributed under the Mozilla Public License, version 2.0.
++The accompanying Firestack-modifications.patch contains the changes used in
++this build. Apply it to the following Firestack source revision.
++
++https://github.com/celzero/firestack/tree/d3d530ea3e67a3ca9dd2e0ad472d20908ea0b596
++
++The Stopscroll source distribution includes the native build script under
++android/native/build-firestack.sh and input hashes in android/upstream.lock.json.
 diff --git a/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/G0VpnActivity.kt b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/G0VpnActivity.kt
 new file mode 100644
 index 0000000..49287a1
@@ -528,10 +1002,10 @@ index 0000000..49287a1
 +}
 diff --git a/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProvider.kt b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProvider.kt
 new file mode 100644
-index 0000000..b020249
+index 0000000..55fb609
 --- /dev/null
 +++ b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProvider.kt
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,252 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package com.celzero.bravedns.stopscroll
 +
@@ -550,142 +1024,188 @@ index 0000000..b020249
 +import com.celzero.bravedns.service.VpnController
 +import kotlinx.coroutines.CoroutineScope
 +import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.CoroutineStart
 +import kotlinx.coroutines.Job
 +import kotlinx.coroutines.SupervisorJob
 +import kotlinx.coroutines.delay
 +import kotlinx.coroutines.launch
-+import kotlinx.coroutines.runBlocking
 +import org.json.JSONArray
 +import org.json.JSONObject
 +import org.koin.core.component.KoinComponent
 +import org.koin.core.component.inject
 +import java.nio.ByteBuffer
++import java.util.concurrent.atomic.AtomicBoolean
 +
 +/** G0 acceptance hooks, reachable only through the Android shell UID. */
 +class UsbControlProvider : ContentProvider(), KoinComponent {
 +    private val persistentState by inject<PersistentState>()
 +    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-+    private var timer: Job? = null
-+    private var deadline = 0L
-+    private var wakeLock: PowerManager.WakeLock? = null
-+    private var lastCloseMs: Long? = null
-+    private var lastError: String? = null
++    private val gate = G0Vpn.cutoff
++    private val deadlines = G0Deadlines<G0Tunnel, Deadline>(gate)
++
++    private class Deadline(val due: Long, val lock: PowerManager.WakeLock) {
++        lateinit var job: Job
++        private val released = AtomicBoolean()
++        fun release() {
++            if (released.compareAndSet(false, true) && lock.isHeld) lock.release()
++        }
++        fun cancel() {
++            job.cancel()
++            release()
++        }
++    }
 +
 +    override fun onCreate() = true
 +
 +    override fun call(method: String, arg: String?, extras: Bundle?): Bundle {
 +        val uid = requireShell()
 +        require(method == "rpc") { "Expected rpc method" }
-+        val reply = synchronized(this) {
-+            try {
-+                val request = decode(arg)
-+                val app = requireNotNull(context)
-+                dispatch(app, request)
-+            } catch (_: Exception) {
-+                JSONObject().put("ok", false).put("error", "G0 request failed")
-+            }.put("uid", uid)
-+        }
++        val reply = try {
++            dispatch(requireNotNull(context), decode(arg))
++        } catch (_: Exception) {
++            JSONObject().put("ok", false).put("error", "G0 request failed")
++        }.put("uid", uid)
 +        return Bundle().apply {
 +            putString("result_b64", Base64.encodeToString(reply.toString().toByteArray(Charsets.UTF_8), Base64.NO_WRAP))
 +        }
 +    }
 +
 +    private fun dispatch(app: Context, request: JSONObject): JSONObject {
-+        val operation = request.get("op") as? String
-+        when (operation) {
++        val op = request.get("op") as? String
++        when (op) {
 +            "status" -> Unit
 +            "enable" -> app.startActivity(Intent(app, G0VpnActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-+            "blockDomains" -> {
-+                val policy = policy(request)
-+                G0Vpn.replace(app, policy)
-+                cancelTimer()
-+                closeAll()
-+            }
-+            "closeAll" -> closeAll()
-+            "setAlg" -> {
-+                persistentState.enableDnsAlg = request.get("enabled") as? Boolean
-+                    ?: throw IllegalArgumentException("enabled must be a boolean")
-+                runBlocking(Dispatchers.IO) { VpnController.g0UpdateDnsAlg() }
-+            }
 +            "watchUid" -> {
-+                val watchUid = number(request, "uid")
-+                require(watchUid == -1L || watchUid in 10_000L..99_999L)
-+                G0Vpn.watch = if (watchUid < 0) null else G0Vpn.FlowWatch(watchUid.toInt())
++                val uid = number(request, "uid")
++                require(uid == -1L || uid in 10_000L..99_999L)
++                G0Vpn.watch = if (uid < 0) null else G0Vpn.FlowWatch(uid.toInt())
 +            }
-+            "timedBlock" -> {
-+                val policy = policy(request)
-+                val duration = number(request, "duration_ms")
-+                require(duration in 1L..120_000L)
-+                require(VpnController.hasTunnel()) { "VPN is inactive" }
-+                scheduleBlock(app, policy, duration)
++            "blockDomains", "closeAll", "setAlg", "timedBlock" -> {
++                val before = gate.state
++                val live = gate.protectedTarget() ?: return refused(app)
++                if (before.target !== live) return refused(app)
++                when (op) {
++                    "timedBlock" -> {
++                        val duration = number(request, "duration_ms")
++                        require(duration in 1L..120_000L)
++                        if (!scheduleBlock(app, policy(request), duration, before)) return refused(app)
++                    }
++                    "setAlg" -> {
++                        val enabled = request.get("enabled") as? Boolean ?: error("Expected boolean")
++                        if (!setAlg(live, before, enabled)) return refused(app)
++                    }
++                    else -> {
++                        val next = if (op == "blockDomains") policy(request) else null
++                        val (oldTimer, claim) = synchronized(gate) {
++                            if (gate.state !== before || before.changing) null to null
++                            else {
++                                val old = if (next != null) deadlines.clear() else null
++                                old to gate.begin(live)
++                            }
++                        }
++                        if (claim == null) return refused(app)
++                        val applied = try { transition(app, claim, next) } finally { oldTimer?.cancel() }
++                        if (!applied) return status(app).put("ok", false)
++                    }
++                }
 +            }
 +            else -> throw IllegalArgumentException("Unknown G0 operation")
 +        }
 +        return status(app)
 +    }
 +
-+    private fun closeAll() {
-+        val started = SystemClock.elapsedRealtime()
-+        val dispatched = runBlocking(Dispatchers.IO) { VpnController.g0CloseAll() }
-+        lastCloseMs = SystemClock.elapsedRealtime() - started
-+        lastError = if (dispatched) null else "VPN inactive during close"
-+    }
++    private fun refused(app: Context) = status(app).put("ok", false)
++        .put("error", "Active Always-on VPN with lockdown and a current tunnel are required")
 +
-+    private fun scheduleBlock(app: Context, policy: G0Domains, duration: Long) {
-+        cancelTimer()
++    private fun setAlg(live: G0Tunnel, before: G0Cutoff.State<G0Tunnel>, enabled: Boolean): Boolean =
++        gate.updateAlg(live, before, enabled, { persistentState.enableDnsAlg }, live.adapter::g0SetAlg) {
++            persistentState.enableDnsAlg = it
++        }
++
++    private fun transition(app: Context, claim: G0Cutoff.Claim<G0Tunnel>, policy: G0Domains?): Boolean =
++        gate.complete(claim) {
++            if (policy != null) G0Vpn.replace(app, policy)
++            G0Vpn.durableRevision()
++        }
++
++    private fun scheduleBlock(app: Context, policy: G0Domains, duration: Long,
++                              before: G0Cutoff.State<G0Tunnel>): Boolean {
 +        val power = app.getSystemService(PowerManager::class.java)
 +        val lock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Stopscroll:G0Deadline")
 +        lock.setReferenceCounted(false)
 +        lock.acquire(duration + 2_000L)
-+        wakeLock = lock
-+        val expires = SystemClock.elapsedRealtime() + duration
-+        deadline = expires
-+        timer = scope.launch {
-+            delay((expires - SystemClock.elapsedRealtime()).coerceAtLeast(0L))
-+            synchronized(this@UsbControlProvider) {
-+                if (wakeLock !== lock) return@synchronized
-+                try {
-+                    G0Vpn.replace(app, policy)
-+                    closeAll()
-+                } catch (_: Exception) {
-+                    lastError = "Timed close failed"
-+                } finally {
-+                    timer = null
-+                    cancelTimer()
-+                }
++        val next = Deadline(SystemClock.elapsedRealtime() + duration, lock)
++        next.job = scope.launch(start = CoroutineStart.LAZY) {
++            try {
++                delay((next.due - SystemClock.elapsedRealtime()).coerceAtLeast(0L))
++                val claim = deadlines.claim(next, next.due) ?: return@launch
++                transition(app, claim, policy)
++            } finally {
++                next.release()
 +            }
 +        }
-+    }
-+
-+    private fun cancelTimer() {
-+        timer?.cancel()
-+        timer = null
-+        deadline = 0L
-+        wakeLock?.let { if (it.isHeld) it.release() }
-+        wakeLock = null
++        val old = deadlines.arm(before, next)
++        if (old === next) {
++            next.cancel()
++            return false
++        }
++        next.job.start()
++        old?.cancel()
++        return true
 +    }
 +
 +    private fun status(app: Context): JSONObject {
-+        val info = runBlocking(Dispatchers.IO) { VpnController.g0DnsInfo() }
++        // Slow Android/native calls finish before taking the receipt snapshot. A replacement
++        // during any query cannot inherit the sampled adapter's platform protection or stats.
++        val live = gate.state.target
 +        val response = JSONObject()
-+            .put("ok", lastError == null)
-+            .put("tunnel", VpnController.hasTunnel())
 +            .put("always_on", VpnController.isAlwaysOn(app))
 +            .put("lockdown", VpnController.isVpnLockdown())
 +            .put("mode", "dns_firewall")
 +            .put("resolver", G0Vpn.resolverUrl)
 +            .put("bootstrap", G0Vpn.resolverIps)
-+            .put("dns_alg", persistentState.enableDnsAlg)
 +            .put("dns_cache", persistentState.enableDnsCache)
 +            .put("logs_enabled", persistentState.logsEnabled)
-+            .put("domains", JSONArray(G0Vpn.policy.domains))
-+            .put("exceptions", JSONArray(G0Vpn.policy.exceptions))
-+            .put("deadline_elapsed_ms", deadline)
++            .put("ignoring_battery_optimizations", app.getSystemService(PowerManager::class.java)
++                .isIgnoringBatteryOptimizations(app.packageName))
++        val info = try { live?.adapter?.g0DnsInfo() } catch (_: Exception) { null }
++        val active = live?.adapter?.hasTunnel() == true
++        val platform = active && live != null && gate.protectedTarget(live) === live
++        val currentTimer = synchronized(gate) { deadlines.pending }
++        val held = currentTimer?.lock?.isHeld == true
++        val (configuredAlg, snapshot) = gate.withAlgLock {
++            val configured = persistentState.enableDnsAlg
++            configured to synchronized(gate) { Triple(gate.state, deadlines.pending, G0Vpn.saved) }
++        }
++        val (s, deadline, saved) = snapshot
++        val same = live != null && s.target === live
++        val protected = same && platform && s.appliedRevision != null
++        val error = s.error ?: when {
++            s.target != null && s.preferred != G0Cutoff.Preferred.READY -> "Preferred DNS is ${s.preferred.name.lowercase()}"
++            s.target != null && !protected -> "No protected native receipt"
++            else -> null
++        }
++        response.put("ok", error == null)
++            .put("tunnel", same && active)
++            .put("protected", protected)
++            .put("dns_alg", if (s.algUncertain) JSONObject.NULL else configuredAlg)
++            .put("dns_alg_confirmed", same && s.preferred == G0Cutoff.Preferred.READY && !s.algUncertain)
++            .put("saved_revision", saved.revision)
++            .put("applied_revision", s.appliedRevision?.takeIf { protected } ?: JSONObject.NULL)
++            .put("cutoff_generation", s.generation)
++            .put("admission_closed", s.appliedRevision == null)
++            .put("preferred_state", s.preferred.name.lowercase())
++            .put("last_transition_due_elapsed_ms", s.due ?: JSONObject.NULL)
++            .put("last_transition_trigger_elapsed_ms", s.trigger ?: JSONObject.NULL)
++            .put("last_cutoff_elapsed_ms", s.cutoff ?: JSONObject.NULL)
++            .put("domains", JSONArray(saved.policy.domains))
++            .put("exceptions", JSONArray(saved.policy.exceptions))
++            .put("deadline_elapsed_ms", deadline?.due ?: 0L)
 +            .put("now_elapsed_ms", SystemClock.elapsedRealtime())
-+            .put("wake_lock_held", wakeLock?.isHeld == true)
-+            .put("last_close_call_ms", lastCloseMs ?: JSONObject.NULL)
-+            .put("error", lastError ?: JSONObject.NULL)
-+        if (info != null) {
++            .put("wake_lock_held", deadline === currentTimer && held)
++            .put("last_close_call_ms", s.closeMs ?: JSONObject.NULL)
++            .put("error", error ?: JSONObject.NULL)
++        if (same && info != null) {
 +            response.put("native_preferred_dns", info.dnsPreferred)
 +                .put("native_default_dns", info.dnsDefault)
 +                .put("native_fallback", info.defaultDNSAsFallback)
@@ -758,6 +1278,302 @@ index 0000000..bb28ea8
 +    <string name="stopscroll_g0_title" translatable="false">Start Stopscroll VPN</string>
 +    <string name="stopscroll_g0_resolver" translatable="false">Stopscroll G0 test build based on RethinkDNS and Firestack.\n\nDNS over HTTPS: %1$s</string>
 +</resources>
+diff --git a/app/src/test/java/com/celzero/bravedns/service/BraveVPNServiceLifecycleTest.kt b/app/src/test/java/com/celzero/bravedns/service/BraveVPNServiceLifecycleTest.kt
+index 9090842..3cc95ec 100644
+--- a/app/src/test/java/com/celzero/bravedns/service/BraveVPNServiceLifecycleTest.kt
++++ b/app/src/test/java/com/celzero/bravedns/service/BraveVPNServiceLifecycleTest.kt
+@@ -79,7 +79,7 @@ class BraveVPNServiceLifecycleTest : KoinTest {
+     @Test
+     fun `service should unregister from VpnController on destroy`() {
+         serviceController.create().destroy()
+-        verify { VpnController.onVpnDestroyed() }
++        verify { VpnController.onVpnDestroyed(serviceController.get()) }
+     }
+
+     @Test
+diff --git a/app/src/test/java/com/celzero/bravedns/stopscroll/G0CutoffTest.kt b/app/src/test/java/com/celzero/bravedns/stopscroll/G0CutoffTest.kt
+new file mode 100644
+index 0000000..253429a
+--- /dev/null
++++ b/app/src/test/java/com/celzero/bravedns/stopscroll/G0CutoffTest.kt
+@@ -0,0 +1,256 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.FutureTask
++import java.util.concurrent.TimeUnit.SECONDS
++import java.util.concurrent.atomic.AtomicLong
++import kotlin.concurrent.thread
++import org.junit.Assert.*
++import org.junit.Test
++
++class G0CutoffTest {
++    private class Adapter(override val owner: Any = Any()) : G0Cutoff.Target {
++        var close: () -> Unit = {}
++        var probe: () -> Boolean = { true }
++        override fun sweep() = close()
++        override fun protectedNow() = probe()
++    }
++
++    private val time = AtomicLong(100)
++    private val gate = G0Cutoff<Adapter>(time::get)
++    private val first = Adapter()
++    private fun attach(target: Adapter = first) {
++        gate.register(target.owner)
++        gate.attach(target)
++    }
++
++    private fun activate() {
++        attach()
++        gate.installPreferred(first, { 8L }) {}
++        assertEquals(8L, gate.receipt(first)?.appliedRevision)
++    }
++
++    private fun <T> worker(action: () -> T) = FutureTask(action).also { task ->
++        thread(isDaemon = true) { task.run() }
++    }
++
++    private fun await(latch: CountDownLatch) = assertTrue("worker timed out", latch.await(4, SECONDS))
++
++    @Test fun aNewProcessAndRestoredPolicyNeedANativeActivation() {
++        assertNull(gate.state.appliedRevision)
++        attach()
++        val savedRevision = 8L
++        assertNull(gate.receipt(first))
++        var sweeps = 0
++        first.close = { sweeps++ }
++        gate.installPreferred(first, { savedRevision }) {}
++        assertEquals(1, sweeps)
++        assertEquals(savedRevision, gate.receipt(first)?.appliedRevision)
++    }
++
++    @Test fun activationAndReceiptsBelongToOneServiceAndAdapter() {
++        activate()
++        val oldReceipt = gate.receipt(first)
++        val claim = gate.begin(first)
++        val oldSweep = CountDownLatch(1)
++        val resume = CountDownLatch(1)
++        first.close = { oldSweep.countDown(); await(resume) }
++        val saving = worker { gate.complete(claim) { 9L } }
++        await(oldSweep)
++        val second = Adapter()
++        attach(second)
++        gate.unregister(first.owner)
++        gate.attach(first)
++        assertNull(gate.receipt(second))
++        assertFalse(gate.permits(first, oldReceipt))
++        val installed = CountDownLatch(1)
++        var newSweeps = 0
++        second.close = { newSweeps++ }
++        val activating = worker { gate.installPreferred(second, { 9L }) { installed.countDown() } }
++        await(installed)
++        resume.countDown()
++        assertFalse(saving.get(4, SECONDS))
++        activating.get(4, SECONDS)
++        assertEquals(1, newSweeps)
++        assertEquals(9L, gate.receipt(second)?.appliedRevision)
++        val third = Adapter(second.owner)
++        gate.attach(third)
++        gate.detach(second)
++        assertSame(third, gate.state.target)
++        assertNull(gate.receipt(third))
++    }
++
++    @Test fun preferredInstallMustSucceedAndStayOnTheSameAdapter() {
++        attach()
++        val started = CountDownLatch(1)
++        val resume = CountDownLatch(1)
++        val setup = worker {
++            assertThrows(IllegalStateException::class.java) {
++                gate.installPreferred(first, { 7L }) {
++                    started.countDown()
++                    await(resume)
++                    error("install failed")
++                }
++            }
++        }
++        await(started)
++        assertEquals(G0Cutoff.Preferred.INSTALLING, gate.state.preferred)
++        assertFalse(gate.complete(gate.begin(first, 90L)) { 7L })
++        assertNull(gate.receipt(first))
++        resume.countDown()
++        setup.get(4, SECONDS)
++        assertEquals(G0Cutoff.Preferred.FAILED, gate.state.preferred)
++        assertFalse(gate.complete(gate.begin(first)) { 7L })
++        gate.installPreferred(first, { 7L }) {}
++        assertEquals(7L, gate.receipt(first)?.appliedRevision)
++    }
++
++    @Test fun slowStatusOrAlgProtectionProbeCannotHoldUpADeadline() {
++        activate()
++        val sampled = gate.state
++        val blocked = CountDownLatch(2)
++        val resume = CountDownLatch(1)
++        first.probe = { blocked.countDown(); await(resume); true }
++        val status = worker { gate.protectedTarget() }
++        val alg = worker { gate.protectedReceipt(first, sampled) }
++        await(blocked)
++        val swept = CountDownLatch(1)
++        first.close = { time.set(132); swept.countDown() }
++        time.set(117)
++        val revoke = worker { gate.complete(gate.begin(first, 110L)) { 9L } }
++        await(swept)
++        assertNull(gate.receipt(first))
++        resume.countDown()
++        assertSame(first, status.get(4, SECONDS))
++        assertFalse(alg.get(4, SECONDS))
++        assertTrue(revoke.get(4, SECONDS))
++        assertEquals(110L, gate.state.due)
++        assertEquals(117L, gate.state.trigger)
++        assertEquals(132L, gate.state.cutoff)
++        assertEquals(15L, gate.state.closeMs)
++        assertFalse(gate.permits(first, sampled))
++    }
++
++    @Test fun deadlineSweepsWhileOldSaveIsBlockedAndItsPolicyWins() {
++        activate()
++        val oldSaving = CountDownLatch(1)
++        val finish = CountDownLatch(1)
++        val saved = AtomicLong(8)
++        val old = worker {
++            gate.complete(gate.begin(first)) {
++                oldSaving.countDown()
++                await(finish)
++                saved.incrementAndGet()
++            }
++        }
++        await(oldSaving)
++        val swept = CountDownLatch(1)
++        first.close = { swept.countDown() }
++        val latest = worker { gate.complete(gate.begin(first, 99L)) { saved.addAndGet(10) } }
++        await(swept)
++        assertNull(gate.receipt(first))
++        finish.countDown()
++        assertFalse(old.get(4, SECONDS))
++        assertTrue(latest.get(4, SECONDS))
++        assertEquals(19L, saved.get())
++        assertEquals(19L, gate.state.appliedRevision)
++    }
++
++    @Test fun replacedOrCancelledDeadlineCannotConsumeTheNewGrant() {
++        activate()
++        val deadlines = G0Deadlines<Adapter, Any>(gate)
++        val firstAlarm = Any()
++        val nextAlarm = Any()
++        val receipt = gate.state
++        assertNull(deadlines.arm(receipt, firstAlarm))
++        assertSame(firstAlarm, deadlines.arm(receipt, nextAlarm))
++        assertNull(deadlines.claim(firstAlarm, 100))
++        assertTrue(gate.permits(first, receipt))
++        val claim = requireNotNull(deadlines.claim(nextAlarm, 101))
++        assertNull(deadlines.claim(nextAlarm, 101))
++        assertNull(gate.receipt(first))
++        assertTrue(gate.complete(claim) { 9L })
++        assertSame(firstAlarm, deadlines.arm(receipt, firstAlarm))
++        assertNull(deadlines.arm(gate.state, firstAlarm))
++        assertSame(firstAlarm, deadlines.clear())
++        assertNull(deadlines.claim(firstAlarm, 102))
++    }
++
++    @Test fun invalidationAfterNativeAlgMutationRestoresTheReportedMode() {
++        activate()
++        var effective = false
++        var reported = false
++        val before = gate.state
++        val result = gate.updateAlg(first, before, true, { reported }, { enabled ->
++            effective = enabled
++            if (enabled) {
++                assertTrue(gate.complete(gate.begin(first, 99L)) { 9L })
++            }
++        }, { reported = it })
++        assertFalse(result)
++        assertFalse(reported)
++        assertEquals(reported, effective)
++        assertEquals(9L, gate.receipt(first)?.appliedRevision)
++    }
++
++    @Test fun rollbackFailureClosesTheCurrentAdapterUntilAReplacementIsInitialized() {
++        activate()
++        val changed = CountDownLatch(1)
++        val finish = CountDownLatch(1)
++        var effective = false
++        var reported = false
++        val before = gate.state
++        val updating = worker {
++            gate.updateAlg(first, before, true, { reported }, { enabled ->
++                if (!enabled) error("resolver no longer accepts a rollback")
++                effective = true
++                changed.countDown()
++                await(finish)
++            }, { reported = it })
++        }
++        await(changed)
++        // The timer must be able to sweep and publish while the ALG caller is still blocked.
++        assertTrue(gate.complete(gate.begin(first, 99L)) { 9L })
++        finish.countDown()
++        assertFalse(updating.get(4, SECONDS))
++        assertTrue(effective)
++        assertFalse(reported)
++        assertTrue(gate.state.algUncertain)
++        assertNull(gate.receipt(first))
++        assertFalse(gate.complete(gate.begin(first)) { 9L })
++        val next = Adapter()
++        attach(next)
++        gate.installPreferred(next, { 9L }) { gate.withAlgLock { effective = reported } }
++        assertFalse(effective)
++        assertFalse(gate.state.algUncertain)
++        assertEquals(9L, gate.receipt(next)?.appliedRevision)
++    }
++
++    @Test fun authorizedAlgCommitAndInitializationUseTheSameCommittedMode() {
++        activate()
++        var effective = false
++        var reported = false
++        assertTrue(gate.updateAlg(first, gate.state, true, { reported }, { effective = it }, { reported = it }))
++        assertTrue(reported && effective)
++        assertTrue(gate.withAlgLock { reported })
++    }
++
++    @Test fun staleSaveSweepFailureOrMissingProtectionCannotOpenAdmission() {
++        activate()
++        val old = gate.begin(first)
++        val current = gate.begin(first)
++        assertFalse(gate.complete(old) { fail("stale save"); 8L })
++        first.close = { error("native failure") }
++        assertFalse(gate.complete(current) { 9L })
++        assertNull(gate.state.cutoff)
++        assertNull(gate.receipt(first))
++        first.close = {}
++        assertFalse(gate.complete(gate.begin(first)) { null })
++        assertNull(gate.receipt(first))
++        first.probe = { false }
++        assertNull(gate.protectedTarget())
++        assertFalse(gate.complete(gate.begin(first)) { 9L })
++        assertNull(gate.receipt(first))
++    }
++}
+diff --git a/app/src/test/java/com/celzero/bravedns/stopscroll/G0DialTest.kt b/app/src/test/java/com/celzero/bravedns/stopscroll/G0DialTest.kt
+new file mode 100644
+index 0000000..0ac7441
+--- /dev/null
++++ b/app/src/test/java/com/celzero/bravedns/stopscroll/G0DialTest.kt
+@@ -0,0 +1,15 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import com.celzero.firestack.settings.Settings
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class G0DialTest {
++    @Test fun persistedStrategiesCannotSelectAnUnverifiedWriterForG0() {
++        val oldMode = Settings.SplitDesync
++        val oldRetry = Settings.RetryWithSplit
++        assertEquals(Settings.SplitAuto to Settings.RetryAfterSplit, effectiveDialStrategy(true, oldMode, oldRetry))
++        assertEquals(oldMode to oldRetry, effectiveDialStrategy(false, oldMode, oldRetry))
++    }
++}
 diff --git a/app/src/test/java/com/celzero/bravedns/stopscroll/G0DomainsTest.kt b/app/src/test/java/com/celzero/bravedns/stopscroll/G0DomainsTest.kt
 new file mode 100644
 index 0000000..bb21c7b

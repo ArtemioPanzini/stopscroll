@@ -61,6 +61,7 @@ export STOPSCROLL_KEY_PASSWORD="$STOPSCROLL_STORE_PASSWORD"
 mkdir -p -- "$cache"
 scratch=$(mktemp -d "$cache/build.XXXXXXXX")
 trap 'rm -rf -- "$scratch"' EXIT
+verify_sha256 "$(lock_value rethink_patch_sha256)" "$patch" || fail 'Rethink patch differs from the lock.'
 commit=$(lock_value upstream_commit)
 if [[ ! -e $upstream ]]; then
   git init --quiet "$upstream"
@@ -74,8 +75,9 @@ fi
 
 # Compute the expected tree in a separate index. A repeat build accepts exactly that patch.
 GIT_INDEX_FILE="$scratch/index" git -C "$upstream" read-tree HEAD
-GIT_INDEX_FILE="$scratch/index" git -C "$upstream" apply --cached "$patch"
+GIT_INDEX_FILE="$scratch/index" git -C "$upstream" apply --cached --whitespace=error-all "$patch"
 expected_tree=$(GIT_INDEX_FILE="$scratch/index" git -C "$upstream" write-tree)
+[[ $expected_tree == "$(lock_value rethink_patched_tree)" ]] || fail 'Patched Rethink source tree differs from the lock.'
 if [[ -z $(git -C "$upstream" status --porcelain) ]]; then
   git -C "$upstream" apply --index "$patch"
 fi
@@ -85,8 +87,17 @@ git -C "$upstream" diff --quiet || fail 'Unexpected unstaged changes in the upst
 wrapper_hash=$(sed -n 's/^distributionSha256Sum=//p' "$upstream/gradle/wrapper/gradle-wrapper.properties")
 [[ $wrapper_hash == "$(lock_value gradle_distribution_sha256)" ]] || fail 'Gradle wrapper checksum differs from the lock.'
 
-export STOPSCROLL_FIRESTACK_AAR="$cache/firestack-d3d530ea3e.aar"
-fetch_verified "$(lock_value firestack_aar_url)" "$(lock_value firestack_aar_sha256)" "$STOPSCROLL_FIRESTACK_AAR"
+published="$cache/firestack-d3d530ea3e.aar"
+fetch_verified "$(lock_value firestack_aar_url)" "$(lock_value firestack_published_aar_sha256)" "$published"
+export STOPSCROLL_FIRESTACK_PATCH="$android_dir/native/firestack-cutoff.patch"
+verify_sha256 "$(lock_value firestack_patch_sha256)" "$STOPSCROLL_FIRESTACK_PATCH" || fail 'Firestack patch differs from the lock.'
+native_hash=$(lock_value firestack_aar_sha256)
+export STOPSCROLL_FIRESTACK_AAR="$cache/firestack-stopscroll-$native_hash.aar"
+if [[ ! -f $STOPSCROLL_FIRESTACK_AAR ]] || ! verify_sha256 "$native_hash" "$STOPSCROLL_FIRESTACK_AAR"; then
+  "$android_dir/native/build-firestack.sh" "$published" "$scratch/firestack.aar"
+  verify_sha256 "$native_hash" "$scratch/firestack.aar" || fail 'Rebuilt Firestack AAR differs from the lock.'
+  mv -- "$scratch/firestack.aar" "$STOPSCROLL_FIRESTACK_AAR"
+fi
 export STOPSCROLL_FIRESTACK_LICENSE="$cache/firestack-license.txt"
 fetch_verified "https://raw.githubusercontent.com/celzero/firestack/$(lock_value firestack_commit)/LICENSE" \
   "$(lock_value firestack_license_sha256)" "$STOPSCROLL_FIRESTACK_LICENSE"
@@ -119,6 +130,7 @@ from xml.etree import ElementTree as ET
 
 android = '{http://schemas.android.com/apk/res/android}'
 app = ET.parse(sys.argv[1]).getroot().find('application')
+assert app.get(android + 'label') == 'Stopscroll'
 authority = 'com.celzero.bravedns.stopscroll.usb'
 providers = [p for p in app.findall('provider') if p.get(android + 'authorities') == authority]
 assert len(providers) == 1
@@ -127,8 +139,23 @@ assert providers[0].get(android + 'grantUriPermissions') == 'false'
 assert providers[0].get(android + 'name') == 'com.celzero.bravedns.stopscroll.UsbControlProvider'
 assert all('VpnControlReceiver' not in r.get(android + 'name', '') for r in app.findall('receiver'))
 PY
-unzip -p "$apk" lib/arm64-v8a/libgojni.so > "$scratch/libgojni.so"
-[[ -s $scratch/libgojni.so ]] || fail 'APK has no arm64-v8a Firestack library.'
+python3 - "$apk" "$STOPSCROLL_FIRESTACK_AAR" "$STOPSCROLL_FIRESTACK_PATCH" "$STOPSCROLL_FIRESTACK_LICENSE" <<'PYZIP'
+import hashlib
+import sys
+from pathlib import Path
+from zipfile import ZipFile
+
+with ZipFile(sys.argv[1]) as apk_zip, ZipFile(sys.argv[2]) as aar:
+    natives = [name for name in apk_zip.namelist() if name.endswith('/libgojni.so')]
+    assert 'lib/arm64-v8a/libgojni.so' in natives
+    for name in natives:
+        expected = aar.read('jni/' + name.removeprefix('lib/'))
+        actual = apk_zip.read(name)
+        assert actual == expected, f'{name} differs from the locked native build'
+        print(f'{hashlib.sha256(actual).hexdigest()}  {name}')
+    assert apk_zip.read('assets/Firestack-modifications.patch') == Path(sys.argv[3]).read_bytes()
+    assert apk_zip.read('assets/Firestack-MPL-2.0.txt') == Path(sys.argv[4]).read_bytes()
+PYZIP
 install -d -m 700 "$android_dir/out"
 output="$android_dir/out/stopscroll-g0.apk"
 if ! cmp -s "$apk" "$output"; then
