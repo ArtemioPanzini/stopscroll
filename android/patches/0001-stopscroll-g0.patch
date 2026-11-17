@@ -1,0 +1,812 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 0a2469d..cde5e12 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -23,6 +23,7 @@ plugins {
+ val taskNames = gradle.startParameter.taskNames.joinToString(",").lowercase()
+ val playBuild = taskNames.contains("play")
+ val fdroidBuild = taskNames.contains("fdroid")
++val stopscrollBuild = taskNames.contains("stopscrollrelease")
+ // for alpha builds generate universal apk only
+ val alphaBuild = taskNames.contains("alpha")
+ 
+@@ -30,7 +31,7 @@ val alphaBuild = taskNames.contains("alpha")
+ val fdroidBuildServer: String? = System.getenv("fdroidserver")
+ val isFdroidBuildServer = !fdroidBuildServer.isNullOrEmpty() && fdroidBuildServer != "null"
+ val deGoogled = !playBuild || fdroidBuild || isFdroidBuildServer || alphaBuild
+-val shouldSplit = !alphaBuild
++val shouldSplit = !alphaBuild && !stopscrollBuild
+ 
+ // Pass -PwebsiteDegoogled=true when building the fdroid flavor with our own keys.
+ // Official F-Droid builds omit this flag and will be labeled as "fdroid".
+@@ -168,9 +169,16 @@ android {
+         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+         // Defaults to false; the fdroid flavor overrides it via -PwebsiteDegoogled=true.
+         buildConfigField("boolean", "IS_WEBSITE_DEGOOGLD_BUILD", "false")
++        buildConfigField("boolean", "STOPSCROLL_G0", "false")
+     }
+ 
+     signingConfigs {
++        create("stopscroll") {
++            storeFile = System.getenv("STOPSCROLL_KEYSTORE")?.let { file(it) }
++            storePassword = System.getenv("STOPSCROLL_STORE_PASSWORD")
++            keyAlias = System.getenv("STOPSCROLL_KEY_ALIAS")
++            keyPassword = System.getenv("STOPSCROLL_KEY_PASSWORD")
++        }
+         create("config") {
+             keyAlias = keystoreProperties.getProperty("keyAlias", "")
+             keyPassword = keystoreProperties.getProperty("keyPassword", "")
+@@ -258,6 +266,14 @@ android {
+                 applicationIdSuffix = ".izzy"
+             }
+         }
++        create("stopscrollRelease") {
++            initWith(getByName("release"))
++            optimization { enable = true }
++            applicationIdSuffix = ".stopscroll"
++            isDebuggable = false
++            signingConfig = signingConfigs.getByName("stopscroll")
++            buildConfigField("boolean", "STOPSCROLL_G0", "true")
++        }
+         create("leakCanary") {
+             matchingFallbacks += listOf("debug")
+             initWith(getByName("debug"))
+@@ -395,7 +411,46 @@ kotlin {
+     }
+ }
+ 
++abstract class PrepareStopscrollNotices : DefaultTask() {
++    @get:InputFile
++    @get:PathSensitive(PathSensitivity.NONE)
++    abstract val rethinkLicense: RegularFileProperty
++
++    @get:InputFile
++    @get:PathSensitive(PathSensitivity.NONE)
++    abstract val firestackLicense: RegularFileProperty
++
++    @get:OutputDirectory
++    abstract val destination: DirectoryProperty
++
++    @TaskAction
++    fun copyLicenses() {
++        val out = destination.get().asFile
++        rethinkLicense.get().asFile.copyTo(out.resolve("RethinkDNS-Apache-2.0.txt"), overwrite = true)
++        firestackLicense.get().asFile.copyTo(out.resolve("Firestack-MPL-2.0.txt"), overwrite = true)
++    }
++}
++
++val stopscrollNotices = if (stopscrollBuild) {
++    tasks.register<PrepareStopscrollNotices>("prepareStopscrollNotices") {
++        rethinkLicense.set(rootProject.file("LICENSE"))
++        firestackLicense.set(file(requireNotNull(System.getenv("STOPSCROLL_FIRESTACK_LICENSE"))))
++    }
++} else {
++    null
++}
++
+ androidComponents {
++    if (stopscrollNotices != null) {
++        onVariants(selector().withBuildType("stopscrollRelease")) { variant ->
++            variant.sources.assets?.addGeneratedSourceDirectory(stopscrollNotices, PrepareStopscrollNotices::destination)
++        }
++    }
++    beforeVariants(selector().withBuildType("stopscrollRelease")) { variant ->
++        variant.enable = variant.productFlavors.containsAll(
++            listOf("releaseChannel" to "fdroid", "releaseType" to "full")
++        )
++    }
+     onVariants(selector().all()) { variant ->
+         variant.outputs.forEach { output ->
+             val abi =
+@@ -508,7 +563,13 @@ dependencies {
+     // add ":debug" suffix to the dependency to include debug symbols
+     download(firestackDependency())
+     "websiteImplementation"(firestackDependency())
+-    "fdroidImplementation"(firestackDependency())
++    "fdroidImplementation"(if (stopscrollBuild) {
++        files(requireNotNull(System.getenv("STOPSCROLL_FIRESTACK_AAR")) {
++            "Set STOPSCROLL_FIRESTACK_AAR to the verified AAR via android/build.sh"
++        })
++    } else {
++        firestackDependency()
++    })
+     "playImplementation"(firestackDependency())
+ 
+     // Work manager
+diff --git a/app/src/main/java/com/celzero/bravedns/RethinkDnsApplication.kt b/app/src/main/java/com/celzero/bravedns/RethinkDnsApplication.kt
+index 6cd5717..3c568f8 100644
+--- a/app/src/main/java/com/celzero/bravedns/RethinkDnsApplication.kt
++++ b/app/src/main/java/com/celzero/bravedns/RethinkDnsApplication.kt
+@@ -21,6 +21,8 @@ import android.app.Application
+ import android.content.pm.ApplicationInfo
+ import android.os.StrictMode
+ import com.celzero.bravedns.scheduler.EnhancedBugReport
++import com.celzero.bravedns.service.PersistentState
++import com.celzero.bravedns.stopscroll.G0Vpn
+ import com.celzero.bravedns.scheduler.ScheduleManager
+ import com.celzero.bravedns.scheduler.WorkScheduler
+ import com.celzero.bravedns.util.GlobalExceptionHandler
+@@ -51,6 +53,11 @@ class RethinkDnsApplication : Application() {
+             koin.loadModules(AppModules)
+         }
+ 
++        if (BuildConfig.STOPSCROLL_G0) {
++            G0Vpn.restore(this)
++            G0Vpn.configure(get<PersistentState>())
++        }
++
+         val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+ 
+         // Initialize global exception handler
+@@ -61,7 +68,7 @@ class RethinkDnsApplication : Application() {
+ 
+         turnOnStrictMode()
+ 
+-        appScope.launch {
++        if (!BuildConfig.STOPSCROLL_G0) appScope.launch {
+             scheduleJobs()
+         }
+     }
+diff --git a/app/src/main/java/com/celzero/bravedns/net/go/GoVpnAdapter.kt b/app/src/main/java/com/celzero/bravedns/net/go/GoVpnAdapter.kt
+index 143661a..927dc75 100644
+--- a/app/src/main/java/com/celzero/bravedns/net/go/GoVpnAdapter.kt
++++ b/app/src/main/java/com/celzero/bravedns/net/go/GoVpnAdapter.kt
+@@ -77,6 +77,8 @@ import com.celzero.bravedns.util.Utilities.isPlayStoreFlavour
+ import com.celzero.bravedns.util.Utilities.showToastUiCentered
+ import com.celzero.bravedns.wireguard.Config
+ import com.celzero.bravedns.wireguard.WgHopManager
++import com.celzero.bravedns.BuildConfig
++import com.celzero.bravedns.stopscroll.G0Vpn
+ import com.celzero.firestack.backend.Backend
+ import com.celzero.firestack.backend.Client
+ import com.celzero.firestack.backend.DNSResolver
+@@ -247,6 +249,16 @@ class GoVpnAdapter : KoinComponent {
+             return
+         }
+ 
++        if (BuildConfig.STOPSCROLL_G0) {
++            try {
++                Intra.addDoHTransport(tunnel, Backend.Preferred, G0Vpn.resolverUrl, G0Vpn.resolverIps)
++            } catch (e: Exception) {
++                removeResolver(Backend.Preferred)
++                Logger.e(LOG_TAG_VPN, "$TAG unable to add Stopscroll DoH", e)
++            }
++            return
++        }
++
+         // TODO: #321 As of now there is no block free transport for dns types other than Rethink.
+         // introduce block free transport for other dns types when there is a UI to configure the
+         // block free transport
+@@ -1983,7 +1995,13 @@ class GoVpnAdapter : KoinComponent {
+         }
+     }
+ 
++    internal fun g0DnsInfo() = if (tunnel.isConnected) tunnel.stat()?.rdnsinfo() else null
++
+     private fun newDefaultTransport(url: String): DefaultDNS? {
++        if (BuildConfig.STOPSCROLL_G0) {
++            Intra.defaultDNSAsFallback(false)
++            return requireNotNull(Intra.newDefaultDNS(Backend.DOH, G0Vpn.resolverUrl, G0Vpn.resolverIps))
++        }
+         val fallbackDns = getDefaultFallbackDns()
+         try {
+             // when the url is empty, set the default transport to 9.9.9.9, 2620:fe::fe or
+@@ -2043,6 +2061,7 @@ class GoVpnAdapter : KoinComponent {
+             Logger.e(LOG_TAG_VPN, "$TAG no tunnel, skip add default dns")
+             return false
+         }
++        if (BuildConfig.STOPSCROLL_G0) return true // fixed in the native tunnel constructor
+         var type = Backend.DNS53
+         val fallbackUrl = getDefaultFallbackDns()
+ 
+diff --git a/app/src/main/java/com/celzero/bravedns/service/BraveVPNService.kt b/app/src/main/java/com/celzero/bravedns/service/BraveVPNService.kt
+index a0c06b4..70f30d2 100644
+--- a/app/src/main/java/com/celzero/bravedns/service/BraveVPNService.kt
++++ b/app/src/main/java/com/celzero/bravedns/service/BraveVPNService.kt
+@@ -127,6 +127,7 @@ import com.celzero.bravedns.util.Utilities.isPlayStoreFlavour
+ import com.celzero.bravedns.util.Utilities.showToastUiCentered
+ import com.celzero.bravedns.wireguard.Config
+ import com.celzero.bravedns.wireguard.WgHopManager
++import com.celzero.bravedns.BuildConfig
+ import com.celzero.firestack.backend.Backend
+ import com.celzero.firestack.backend.Client
+ import com.celzero.firestack.backend.DNSOpts
+@@ -604,6 +605,8 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+             logd("builder: set metered: ${persistentState.setVpnBuilderToMetered}")
+         }
+ 
++        if (BuildConfig.STOPSCROLL_G0) return builder
++
+         if (!vpnLockdown && persistentState.allowBypass) {
+             builder.allowBypass()
+             logd("builder: allow bypass: true")
+@@ -1956,6 +1959,17 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+         }
+     }
+ 
++    internal suspend fun g0CloseAll(): Boolean {
++        val adapter = vpnAdapter ?: return false
++        if (!adapter.hasTunnel()) return false
++        adapter.closeConnections(emptyList(), reason = "Stopscroll G0")
++        return adapter.hasTunnel()
++    }
++
++    internal suspend fun g0UpdateDnsAlg() = updateDnsAlg()
++
++    internal fun g0DnsInfo() = vpnAdapter?.g0DnsInfo()
++
+     private suspend fun updateDnsAlg() {
+         vpnAdapter?.setDnsAlg()
+     }
+diff --git a/app/src/main/java/com/celzero/bravedns/service/TunFlowManager.kt b/app/src/main/java/com/celzero/bravedns/service/TunFlowManager.kt
+index 76bf7fc..2f98179 100644
+--- a/app/src/main/java/com/celzero/bravedns/service/TunFlowManager.kt
++++ b/app/src/main/java/com/celzero/bravedns/service/TunFlowManager.kt
+@@ -56,6 +56,8 @@ import com.celzero.bravedns.util.Utilities.isAtleastO
+ import com.celzero.bravedns.util.Utilities.isAtleastQ
+ import com.celzero.bravedns.util.Utilities.isPlayStoreFlavour
+ import com.celzero.bravedns.util.Utilities.isUnspecifiedIp
++import com.celzero.bravedns.BuildConfig
++import com.celzero.bravedns.stopscroll.G0Vpn
+ import com.celzero.firestack.backend.Backend
+ import com.celzero.firestack.intra.FlowSummary
+ import com.celzero.firestack.intra.Mark
+@@ -426,6 +428,15 @@ object TunFlowManager : KoinComponent {
+                 connType
+             )
+ 
++        if (BuildConfig.STOPSCROLL_G0) {
++            val blocked = d?.split(',')?.any(G0Vpn.policy::blocks) == true
++            G0Vpn.watch?.takeIf { it.uid == uid }?.record(protocol, blocked)
++            if (blocked) {
++                cm.isBlocked = true
++                return persistAndConstructFlowResponse(ctx, cm, Backend.Block, connId, uid)
++            }
++        }
++
+         val trapVpnDns = isDns(dstPort) && isVpnDns(dstIp)
+         val trapVpnPrivateDns = isVpnDns(dstIp) && isPrivateDns(dstPort)
+ 
+diff --git a/app/src/main/java/com/celzero/bravedns/service/VpnController.kt b/app/src/main/java/com/celzero/bravedns/service/VpnController.kt
+index d032e94..9b2a59e 100644
+--- a/app/src/main/java/com/celzero/bravedns/service/VpnController.kt
++++ b/app/src/main/java/com/celzero/bravedns/service/VpnController.kt
+@@ -181,6 +181,14 @@ object VpnController : KoinComponent {
+         rvpn?.refreshProxies()
+     }
+ 
++    internal suspend fun g0CloseAll() = rvpn?.g0CloseAll() == true
++
++    internal suspend fun g0UpdateDnsAlg() {
++        rvpn?.g0UpdateDnsAlg()
++    }
++
++    internal fun g0DnsInfo() = rvpn?.g0DnsInfo()
++
+     fun hasTunnel(): Boolean {
+         return rvpn?.hasTunnel() == true
+     }
+diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/G0Domains.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Domains.kt
+new file mode 100644
+index 0000000..df935ec
+--- /dev/null
++++ b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Domains.kt
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import java.util.Locale
++
++/** The disposable G0 domain list, shared by DNS and connection callbacks. */
++internal class G0Domains private constructor(
++    val domains: Set<String>,
++    val exceptions: Set<String>
++) {
++    fun blocks(host: String): Boolean {
++        val name = canonical(host)
++        return matches(domains, name) && !matches(exceptions, name)
++    }
++
++    private fun matches(entries: Set<String>, name: String): Boolean {
++        var candidate = name
++        while (candidate.isNotEmpty()) {
++            if (candidate in entries) return true
++            candidate = candidate.substringAfter('.', "")
++        }
++        return false
++    }
++
++    companion object {
++        private val label = Regex("[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
++
++        val EMPTY = create(emptyList(), emptyList())
++
++        fun create(domains: List<String>, exceptions: List<String>): G0Domains {
++            val entries = domains + exceptions
++            require(entries.size <= 1_000) { "Too many domain entries" }
++            require(entries.sumOf { it.length + 1 } <= 64 * 1024) { "Domain policy too large" }
++            return G0Domains(domains.map(::validate).toSet(), exceptions.map(::validate).toSet())
++        }
++
++        private fun canonical(host: String) = host.removeSuffix(".").lowercase(Locale.ROOT)
++
++        private fun validate(host: String): String {
++            val name = canonical(host)
++            require(name.length in 1..253 && name.split('.').all(label::matches)) { "Invalid domain" }
++            return name
++        }
++    }
++}
+diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/G0Vpn.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Vpn.kt
+new file mode 100644
+index 0000000..a9248d6
+--- /dev/null
++++ b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Vpn.kt
+@@ -0,0 +1,70 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import android.content.Context
++import com.celzero.bravedns.data.AppConfig
++import com.celzero.bravedns.service.PersistentState
++import org.json.JSONArray
++import org.json.JSONObject
++import java.util.concurrent.atomic.AtomicLong
++
++/** Temporary diagnostic state for the signed G0 build. */
++internal object G0Vpn {
++    const val resolverUrl = "https://cloudflare-dns.com/dns-query"
++    const val resolverIps = "1.1.1.1,1.0.0.1,2606:4700:4700::1111,2606:4700:4700::1001"
++
++    @Volatile var policy = G0Domains.EMPTY
++        private set
++    @Volatile var watch: FlowWatch? = null
++
++    class FlowWatch(val uid: Int) {
++        val tcp = AtomicLong()
++        val udp = AtomicLong()
++        val blocked = AtomicLong()
++
++        fun record(protocol: Int, blockedFlow: Boolean) {
++            when (protocol) {
++                6 -> tcp.incrementAndGet()
++                17 -> udp.incrementAndGet()
++            }
++            if (blockedFlow) blocked.incrementAndGet()
++        }
++    }
++
++    fun configure(state: PersistentState) {
++        state.braveMode = AppConfig.BraveMode.DNS_FIREWALL.mode
++        state.logsEnabled = false
++        state.blocklistEnabled = false
++        state.allowBypass = false
++        state.splitDns = false
++        state.useSystemDnsOnCaptivePortal = false
++        state.useSystemDnsForUndelegatedDomains = false
++        state.defaultDnsUrl = resolverUrl
++        state.dnsType = AppConfig.DnsType.DOH.type
++    }
++
++    fun restore(context: Context) {
++        val text = preferences(context).getString("policy", null) ?: return
++        val json = JSONObject(text)
++        policy = G0Domains.create(strings(json.getJSONArray("domains")), strings(json.getJSONArray("exceptions")))
++    }
++
++    fun replace(context: Context, next: G0Domains) {
++        val json = JSONObject()
++            .put("domains", JSONArray(next.domains))
++            .put("exceptions", JSONArray(next.exceptions))
++        check(preferences(context).edit().putString("policy", json.toString()).commit()) {
++            "Unable to save G0 domains"
++        }
++        policy = next
++    }
++
++    fun strings(array: JSONArray): List<String> {
++        require(array.length() <= 1_000) { "Too many domain entries" }
++        return List(array.length()) { index ->
++            requireNotNull(array.get(index) as? String) { "Domain entry must be a string" }
++        }
++    }
++
++    private fun preferences(context: Context) = context.getSharedPreferences("stopscroll-g0", Context.MODE_PRIVATE)
++}
+diff --git a/app/src/main/java/com/celzero/bravedns/tunnel/TunDnsManager.kt b/app/src/main/java/com/celzero/bravedns/tunnel/TunDnsManager.kt
+index 2c71613..33f0c0d 100644
+--- a/app/src/main/java/com/celzero/bravedns/tunnel/TunDnsManager.kt
++++ b/app/src/main/java/com/celzero/bravedns/tunnel/TunDnsManager.kt
+@@ -34,6 +34,8 @@ import com.celzero.bravedns.util.Logger
+ import com.celzero.bravedns.util.Logger.LOG_TAG_VPN
+ import com.celzero.bravedns.util.ResourceRecordTypes
+ import com.celzero.bravedns.util.Utilities.isAtleastR
++import com.celzero.bravedns.BuildConfig
++import com.celzero.bravedns.stopscroll.G0Vpn
+ import com.celzero.firestack.backend.Backend
+ import com.celzero.firestack.backend.DNSOpts
+ import com.celzero.firestack.backend.DNSSummary
+@@ -152,6 +154,13 @@ object TunDnsManager: KoinComponent {
+ 
+         val uid = getUid(uidStr)
+         val rinr = persistentState.routeRethinkInRethink
++        if (BuildConfig.STOPSCROLL_G0) {
++            val transport = if (G0Vpn.policy.blocks(d.fqdn)) Backend.BlockAll else appendDnsCacheIfNeeded(Backend.Preferred)
++            return dnsOptsFactory().apply {
++                this.uid = uid.toString()
++                tidcsv = "$transport:${Backend.Base}"
++            }
++        }
+         val appMode = appConfig.getBraveMode()
+ 
+         // when the active network is behind a captive portal, route every query to the system
+diff --git a/app/src/stopscrollRelease/AndroidManifest.xml b/app/src/stopscrollRelease/AndroidManifest.xml
+new file mode 100644
+index 0000000..a018e5e
+--- /dev/null
++++ b/app/src/stopscrollRelease/AndroidManifest.xml
+@@ -0,0 +1,24 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:tools="http://schemas.android.com/tools">
++    <uses-permission android:name="android.permission.WAKE_LOCK" />
++    <application>
++        <provider
++            android:name="com.celzero.bravedns.stopscroll.UsbControlProvider"
++            android:authorities="${applicationId}.usb"
++            android:exported="true"
++            android:grantUriPermissions="false" />
++        <activity
++            android:name="com.celzero.bravedns.stopscroll.G0VpnActivity"
++            android:exported="true"
++            android:excludeFromRecents="true">
++            <intent-filter>
++                <action android:name="android.intent.action.MAIN" />
++                <category android:name="android.intent.category.LAUNCHER" />
++            </intent-filter>
++        </activity>
++        <activity-alias android:name=".ui.activity.LauncherAliasAppLock" tools:node="remove" />
++        <activity-alias android:name=".ui.LauncherAliasHome" tools:node="remove" />
++        <receiver android:name=".receiver.VpnControlReceiver" tools:node="remove" />
++    </application>
++</manifest>
+diff --git a/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/G0VpnActivity.kt b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/G0VpnActivity.kt
+new file mode 100644
+index 0000000..49287a1
+--- /dev/null
++++ b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/G0VpnActivity.kt
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import android.app.Activity
++import android.app.AlertDialog
++import android.content.Intent
++import android.net.VpnService
++import android.os.Bundle
++import com.celzero.bravedns.R
++import com.celzero.bravedns.service.VpnController
++
++/** VPN permission must be granted by the device owner through Android's consent activity. */
++class G0VpnActivity : Activity() {
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++        if (savedInstanceState != null) return
++        AlertDialog.Builder(this)
++            .setTitle(R.string.stopscroll_g0_title)
++            .setMessage(getString(R.string.stopscroll_g0_resolver, G0Vpn.resolverUrl))
++            .setPositiveButton(android.R.string.ok) { _, _ ->
++                val prepare = VpnService.prepare(this)
++                if (prepare == null) {
++                    startVpn()
++                } else {
++                    @Suppress("DEPRECATION")
++                    startActivityForResult(prepare, REQUEST_VPN)
++                }
++            }
++            .setNegativeButton(android.R.string.cancel) { _, _ -> finish() }
++            .setOnCancelListener { finish() }
++            .show()
++    }
++
++    @Deprecated("Android compatibility callback for the system VPN consent screen")
++    @Suppress("DEPRECATION")
++    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
++        super.onActivityResult(requestCode, resultCode, data)
++        if (requestCode != REQUEST_VPN) return
++        if (resultCode == RESULT_OK) startVpn() else finish()
++    }
++
++    private fun startVpn() {
++        VpnController.start(this)
++        finish()
++    }
++
++    companion object {
++        private const val REQUEST_VPN = 1
++    }
++}
+diff --git a/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProvider.kt b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProvider.kt
+new file mode 100644
+index 0000000..b020249
+--- /dev/null
++++ b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProvider.kt
+@@ -0,0 +1,206 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import android.content.ContentProvider
++import android.content.ContentValues
++import android.content.Context
++import android.content.Intent
++import android.database.Cursor
++import android.net.Uri
++import android.os.Binder
++import android.os.Bundle
++import android.os.PowerManager
++import android.os.SystemClock
++import android.util.Base64
++import com.celzero.bravedns.service.PersistentState
++import com.celzero.bravedns.service.VpnController
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.runBlocking
++import org.json.JSONArray
++import org.json.JSONObject
++import org.koin.core.component.KoinComponent
++import org.koin.core.component.inject
++import java.nio.ByteBuffer
++
++/** G0 acceptance hooks, reachable only through the Android shell UID. */
++class UsbControlProvider : ContentProvider(), KoinComponent {
++    private val persistentState by inject<PersistentState>()
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private var timer: Job? = null
++    private var deadline = 0L
++    private var wakeLock: PowerManager.WakeLock? = null
++    private var lastCloseMs: Long? = null
++    private var lastError: String? = null
++
++    override fun onCreate() = true
++
++    override fun call(method: String, arg: String?, extras: Bundle?): Bundle {
++        val uid = requireShell()
++        require(method == "rpc") { "Expected rpc method" }
++        val reply = synchronized(this) {
++            try {
++                val request = decode(arg)
++                val app = requireNotNull(context)
++                dispatch(app, request)
++            } catch (_: Exception) {
++                JSONObject().put("ok", false).put("error", "G0 request failed")
++            }.put("uid", uid)
++        }
++        return Bundle().apply {
++            putString("result_b64", Base64.encodeToString(reply.toString().toByteArray(Charsets.UTF_8), Base64.NO_WRAP))
++        }
++    }
++
++    private fun dispatch(app: Context, request: JSONObject): JSONObject {
++        val operation = request.get("op") as? String
++        when (operation) {
++            "status" -> Unit
++            "enable" -> app.startActivity(Intent(app, G0VpnActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
++            "blockDomains" -> {
++                val policy = policy(request)
++                G0Vpn.replace(app, policy)
++                cancelTimer()
++                closeAll()
++            }
++            "closeAll" -> closeAll()
++            "setAlg" -> {
++                persistentState.enableDnsAlg = request.get("enabled") as? Boolean
++                    ?: throw IllegalArgumentException("enabled must be a boolean")
++                runBlocking(Dispatchers.IO) { VpnController.g0UpdateDnsAlg() }
++            }
++            "watchUid" -> {
++                val watchUid = number(request, "uid")
++                require(watchUid == -1L || watchUid in 10_000L..99_999L)
++                G0Vpn.watch = if (watchUid < 0) null else G0Vpn.FlowWatch(watchUid.toInt())
++            }
++            "timedBlock" -> {
++                val policy = policy(request)
++                val duration = number(request, "duration_ms")
++                require(duration in 1L..120_000L)
++                require(VpnController.hasTunnel()) { "VPN is inactive" }
++                scheduleBlock(app, policy, duration)
++            }
++            else -> throw IllegalArgumentException("Unknown G0 operation")
++        }
++        return status(app)
++    }
++
++    private fun closeAll() {
++        val started = SystemClock.elapsedRealtime()
++        val dispatched = runBlocking(Dispatchers.IO) { VpnController.g0CloseAll() }
++        lastCloseMs = SystemClock.elapsedRealtime() - started
++        lastError = if (dispatched) null else "VPN inactive during close"
++    }
++
++    private fun scheduleBlock(app: Context, policy: G0Domains, duration: Long) {
++        cancelTimer()
++        val power = app.getSystemService(PowerManager::class.java)
++        val lock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Stopscroll:G0Deadline")
++        lock.setReferenceCounted(false)
++        lock.acquire(duration + 2_000L)
++        wakeLock = lock
++        val expires = SystemClock.elapsedRealtime() + duration
++        deadline = expires
++        timer = scope.launch {
++            delay((expires - SystemClock.elapsedRealtime()).coerceAtLeast(0L))
++            synchronized(this@UsbControlProvider) {
++                if (wakeLock !== lock) return@synchronized
++                try {
++                    G0Vpn.replace(app, policy)
++                    closeAll()
++                } catch (_: Exception) {
++                    lastError = "Timed close failed"
++                } finally {
++                    timer = null
++                    cancelTimer()
++                }
++            }
++        }
++    }
++
++    private fun cancelTimer() {
++        timer?.cancel()
++        timer = null
++        deadline = 0L
++        wakeLock?.let { if (it.isHeld) it.release() }
++        wakeLock = null
++    }
++
++    private fun status(app: Context): JSONObject {
++        val info = runBlocking(Dispatchers.IO) { VpnController.g0DnsInfo() }
++        val response = JSONObject()
++            .put("ok", lastError == null)
++            .put("tunnel", VpnController.hasTunnel())
++            .put("always_on", VpnController.isAlwaysOn(app))
++            .put("lockdown", VpnController.isVpnLockdown())
++            .put("mode", "dns_firewall")
++            .put("resolver", G0Vpn.resolverUrl)
++            .put("bootstrap", G0Vpn.resolverIps)
++            .put("dns_alg", persistentState.enableDnsAlg)
++            .put("dns_cache", persistentState.enableDnsCache)
++            .put("logs_enabled", persistentState.logsEnabled)
++            .put("domains", JSONArray(G0Vpn.policy.domains))
++            .put("exceptions", JSONArray(G0Vpn.policy.exceptions))
++            .put("deadline_elapsed_ms", deadline)
++            .put("now_elapsed_ms", SystemClock.elapsedRealtime())
++            .put("wake_lock_held", wakeLock?.isHeld == true)
++            .put("last_close_call_ms", lastCloseMs ?: JSONObject.NULL)
++            .put("error", lastError ?: JSONObject.NULL)
++        if (info != null) {
++            response.put("native_preferred_dns", info.dnsPreferred)
++                .put("native_default_dns", info.dnsDefault)
++                .put("native_fallback", info.defaultDNSAsFallback)
++        }
++        G0Vpn.watch?.let {
++            response.put("watched_uid", it.uid)
++                .put("watched_tcp", it.tcp.get())
++                .put("watched_udp", it.udp.get())
++                .put("watched_blocked", it.blocked.get())
++        }
++        return response
++    }
++
++    private fun policy(request: JSONObject): G0Domains {
++        val domains = G0Vpn.strings(request.getJSONArray("domains"))
++        val exceptions = if (request.has("exceptions")) G0Vpn.strings(request.getJSONArray("exceptions")) else emptyList()
++        return G0Domains.create(domains, exceptions)
++    }
++
++    private fun number(request: JSONObject, key: String): Long = when (val value = request.get(key)) {
++        is Int -> value.toLong()
++        is Long -> value
++        else -> throw IllegalArgumentException("Expected integer")
++    }
++
++    private fun decode(arg: String?): JSONObject {
++        val encoded = requireNotNull(arg)
++        require(encoded.length <= REQUEST_LIMIT / 3 * 4)
++        val decoded = Base64.decode(encoded, Base64.NO_WRAP)
++        require(decoded.size <= REQUEST_LIMIT)
++        return JSONObject(Charsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(decoded)).toString())
++    }
++
++    private fun requireShell(): Int = Binder.getCallingUid().also {
++        if (it != 2_000) throw SecurityException("Stopscroll USB control requires shell UID 2000")
++    }
++
++    private fun unsupported(): Nothing {
++        requireShell()
++        throw UnsupportedOperationException("Stopscroll supports content call only")
++    }
++
++    override fun query(uri: Uri, projection: Array<out String>?, selection: String?, selectionArgs: Array<out String>?, sortOrder: String?): Cursor? = unsupported()
++    override fun getType(uri: Uri): String? = unsupported()
++    override fun insert(uri: Uri, values: ContentValues?): Uri? = unsupported()
++    override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = unsupported()
++    override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = unsupported()
++
++    companion object {
++        private const val REQUEST_LIMIT = 96 * 1024
++    }
++}
+diff --git a/app/src/stopscrollRelease/keepRules/stopscroll.keep b/app/src/stopscrollRelease/keepRules/stopscroll.keep
+new file mode 100644
+index 0000000..5f21215
+--- /dev/null
++++ b/app/src/stopscrollRelease/keepRules/stopscroll.keep
+@@ -0,0 +1,2 @@
++-keep class com.celzero.bravedns.stopscroll.UsbControlProvider { *; }
++-keep class com.celzero.bravedns.stopscroll.G0VpnActivity { *; }
+diff --git a/app/src/stopscrollRelease/res/values/stopscroll.xml b/app/src/stopscrollRelease/res/values/stopscroll.xml
+new file mode 100644
+index 0000000..bb28ea8
+--- /dev/null
++++ b/app/src/stopscrollRelease/res/values/stopscroll.xml
+@@ -0,0 +1,6 @@
++<resources>
++    <string name="app_name" translatable="false">Stopscroll</string>
++    <string name="app_name_small_case" translatable="false">stopscroll</string>
++    <string name="stopscroll_g0_title" translatable="false">Start Stopscroll VPN</string>
++    <string name="stopscroll_g0_resolver" translatable="false">Stopscroll G0 test build based on RethinkDNS and Firestack.\n\nDNS over HTTPS: %1$s</string>
++</resources>
+diff --git a/app/src/test/java/com/celzero/bravedns/stopscroll/G0DomainsTest.kt b/app/src/test/java/com/celzero/bravedns/stopscroll/G0DomainsTest.kt
+new file mode 100644
+index 0000000..bb21c7b
+--- /dev/null
++++ b/app/src/test/java/com/celzero/bravedns/stopscroll/G0DomainsTest.kt
+@@ -0,0 +1,34 @@
++package com.celzero.bravedns.stopscroll
++
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertThrows
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class G0DomainsTest {
++    @Test
++    fun `matches DNS labels and honors exceptions for entire subtrees`() {
++        val policy = G0Domains.create(listOf("YouTube.COM."), listOf("accounts.youtube.com"))
++
++        assertTrue(policy.blocks("YOUTUBE.COM."))
++        assertTrue(policy.blocks("www.youtube.com"))
++        assertFalse(policy.blocks("notyoutube.com"))
++        assertFalse(policy.blocks("youtube.com.example"))
++        assertFalse(policy.blocks("accounts.youtube.com."))
++        assertFalse(policy.blocks("login.accounts.youtube.com"))
++        assertFalse(policy.blocks("accounts.google.com"))
++    }
++
++    @Test
++    fun `rejects invalid or oversized inputs before replacing anything`() {
++        for (bad in listOf("", "*.example.com", "a..example", "a.test..", "https://test", "-a.test")) {
++            assertThrows(IllegalArgumentException::class.java) { G0Domains.create(listOf(bad), emptyList()) }
++        }
++        assertThrows(IllegalArgumentException::class.java) {
++            G0Domains.create(List(1_001) { "domain$it.example" }, emptyList())
++        }
++        assertThrows(IllegalArgumentException::class.java) {
++            G0Domains.create(List(700) { "${"a".repeat(60)}.${"b".repeat(60)}.$it.example" }, emptyList())
++        }
++    }
++}
+diff --git a/gradle/wrapper/gradle-wrapper.properties b/gradle/wrapper/gradle-wrapper.properties
+index eb84db6..906dbb9 100644
+--- a/gradle/wrapper/gradle-wrapper.properties
++++ b/gradle/wrapper/gradle-wrapper.properties
+@@ -1,6 +1,7 @@
+ distributionBase=GRADLE_USER_HOME
+ distributionPath=wrapper/dists
+ distributionUrl=https\://services.gradle.org/distributions/gradle-9.6.0-bin.zip
++distributionSha256Sum=bbaeb2fef8710818cf0e261201dab964c572f92b942812df0c3620d62a529a01
+ networkTimeout=10000
+ retries=0
+ retryBackOffMs=500

@@ -1,0 +1,21 @@
+{
+  "upstream_repository": "https://github.com/celzero/rethink-app.git",
+  "upstream_tag": "v0.5.8",
+  "upstream_commit": "b750334a363065b94f83e818ac5dc38048713c1f",
+  "firestack_commit": "d3d530ea3e67a3ca9dd2e0ad472d20908ea0b596",
+  "firestack_coordinate": "com.celzero:firestack:d3d530ea3e@aar",
+  "firestack_aar_url": "https://repo.maven.apache.org/maven2/com/celzero/firestack/d3d530ea3e/firestack-d3d530ea3e.aar",
+  "firestack_aar_sha256": "7fa2cc5493005bdd9e31730b19baf7af2acac1e8e833f205a00a483b3df56d64",
+  "firestack_license_sha256": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5",
+  "gradle_distribution": "9.6.0",
+  "gradle_distribution_sha256": "bbaeb2fef8710818cf0e261201dab964c572f92b942812df0c3620d62a529a01",
+  "jdk_major": 17,
+  "compile_sdk": 37,
+  "compile_sdk_revision": 2,
+  "target_sdk": 37,
+  "build_tools": "36.0.0",
+  "build_variant": "fdroidFullStopscrollRelease",
+  "resolver": "https://cloudflare-dns.com/dns-query",
+  "resolver_bootstrap": ["1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001"],
+  "dns_alg": false
+}

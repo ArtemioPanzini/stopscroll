@@ -48,6 +48,11 @@ venv/
 /out/
 /telegram/build/
 /telegram/out/
+/android/rethink-app/
+/android/out/
+/android/**/*.apk
+/android/**/*.jks
+/android/**/*.keystore
 CMakeFiles/
 CMakeCache.txt
 compile_commands.json
