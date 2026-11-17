@@ -174,6 +174,10 @@ ID; удаление и повторное добавление того же ID
   до ближайшего deadline с переустановкой для оставшихся сессий. Это осознанная цена
   точного закрытия в Doze. На G0 измеряем её и проверяем реальное закрытие; не заменяем
   его неточным alarm и не обещаем нулевое влияние на батарею.
+  Для этого только Stopscroll должен быть исключён из battery optimization:
+  без исключения Android в Doze игнорирует частичные wake locks. При настройке
+  проверяем `PowerManager.isIgnoringBatteryOptimizations`; остальные приложения
+  и глобальное энергосбережение не меняем.
 - Предупреждение за 2 минуты, если отрезок длиннее 2 минут; отсутствие разрешения
   уведомлений не мешает сетевому закрытию. Разрешение VPN запрашивается стандартным UI.
 
@@ -340,6 +344,7 @@ Always-on VPN включается при настройке. «Блокиров
 - [ContentProvider.call: собственная проверка прав обязательна](https://developer.android.com/reference/android/content/ContentProvider).
 - [SystemClock: монотонное время со сном](https://developer.android.com/reference/android/os/SystemClock).
 - [AtomicFile](https://developer.android.com/reference/android/util/AtomicFile).
+- [Doze, исключения энергосбережения и partial wake locks](https://developer.android.com/training/monitoring-device-state/doze-standby).
 - [Rethink v0.5.8](https://github.com/celzero/rethink-app/releases/tag/v0.5.8),
   [закреплённый исходный код](https://github.com/celzero/rethink-app/tree/b750334a363065b94f83e818ac5dc38048713c1f).
 - [NetGuard FAQ: DNS, кэш, Always-on и ограничения устройств](https://github.com/M66B/NetGuard/blob/master/FAQ.md).

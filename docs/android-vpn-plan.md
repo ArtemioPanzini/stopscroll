@@ -261,6 +261,9 @@ private fun requireShell() {
 - [ ] Описать ручной initial setup VPN/Always-on/lockdown, HyperOS autostart/battery,
   browser Secure DNS, независимые бюджеты, немедленные ADB-ослабления и recovery
   отключением нашего VPN через системные настройки. Не предлагать удаление других приложений.
+  Проверять `isIgnoringBatteryOptimizations` и настраивать исключение только нашего
+  пакета: без него Doze игнорирует ограниченный partial wake lock. Отдельно подтвердить
+  actual elapsedRealtime trigger/retirement, не считать поздний RPC-просып доказательством.
 - [ ] Выключить по умолчанию посещенческие query/connection logs и телеметрию;
   не включать дополнительные upstream-блоклисты. Проверить выходные соединения
   собственной сборки: без неожиданного Firebase/analytics или обязательной учётной записи.
