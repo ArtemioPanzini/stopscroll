@@ -18,7 +18,7 @@ HELP = '''Использование: stopscroll [status | doctor | open САЙ�
   request budget САЙТ МИНУТЫ | request bonus САЙТ МИНУТЫ |
   request unblock САЙТ [ДОМЕН] | request limit САЙТ МИНУТЫ |
   request except САЙТ ДОМЕН | request delay МИНУТЫ |
-  request pause МИНУТЫ | request uninstall]
+  request pause МИНУТЫ | request uninstall | android --help]
 --yes — подтвердить немедленное изменение без вопроса.'''
 
 
@@ -180,6 +180,9 @@ def exchange(req):
 
 def main(argv=None):
     args=list(sys.argv[1:] if argv is None else argv) or ['status']
+    if args[0] == 'android':
+        from .android_cli import main as android_main
+        return android_main(args[1:], exchange=exchange)
     if args in (['--help'],['-h']):
         print(HELP)
         return 0

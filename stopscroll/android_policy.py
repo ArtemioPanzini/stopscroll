@@ -50,6 +50,10 @@ def _is_public_suffix(domain: str) -> bool:
     return domain in rules or ('*.' + parent in rules and '!' + domain not in rules)
 
 
+def domain_within(domain: str, parent: str) -> bool:
+    return domain == parent or domain.endswith('.' + parent)
+
+
 def normalize_policy_domain(raw: str) -> str:
     """Normalize a command argument with the desktop URL and IDNA rules."""
     try:
@@ -100,7 +104,7 @@ def _validate_site(site_id: str, site: object, available_entries: int) -> int:
             if normalized != domain:
                 raise PolicyError(f'Домен {repr(domain)[:100]} группы {site_id!r} должен быть нормализован')
     for exception in exceptions:
-        if not any(exception == domain or exception.endswith('.' + domain) for domain in domains):
+        if not any(domain_within(exception, domain) for domain in domains):
             raise PolicyError(f'Исключение {exception!r} за пределами доменов группы {site_id!r}')
     return entries
 

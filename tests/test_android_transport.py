@@ -1,13 +1,16 @@
 import base64
 import json
+from pathlib import Path
 import shlex
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import Mock
 
 from stopscroll.android_transport import (
     AndroidProtocolError,
     AndroidRequestError,
+    AndroidTimeoutError,
     AndroidTransport,
     AndroidTransportError,
 )
@@ -41,6 +44,24 @@ def wrap(encoded):
 
 def completed(output, returncode=0):
     return subprocess.CompletedProcess([], returncode, stdout=output, stderr=b'')
+
+
+def script_action(script):
+    guard, _, action = script.decode().rstrip('\n').rpartition('\n')
+    return guard, shlex.split(action)
+
+
+def execute_guard(script, serial='usb123', boot_serial='', users=USERS):
+    guard, _ = script_action(script)
+    properties = f"""getprop() {{
+        case "$1" in
+            ro.serialno) printf '%s' {shlex.quote(serial)} ;;
+            ro.boot.serialno) printf '%s' {shlex.quote(boot_serial)} ;;
+        esac
+    }}
+    pm() {{ printf '%s' {shlex.quote(users.decode())}; }}
+    """
+    return subprocess.run(['sh'], input=(properties + guard + '\n').encode(), capture_output=True).returncode
 
 
 class AndroidTransportTests(unittest.TestCase):
@@ -118,6 +139,44 @@ class AndroidTransportTests(unittest.TestCase):
         self.assertEqual(self.transport.call(self.request), response())
         self.assertEqual(self.runner.call_args_list[1].args[0][1], '-d')
 
+    def test_bound_default_does_not_reselect_between_calls(self):
+        self.runner.side_effect = [
+            completed(DEVICES_HEADER + USB),
+            completed(bundle(response())), completed(b'', returncode=1),
+        ]
+        bound = self.transport.bind()
+        self.assertEqual(bound.call(self.request), response())
+        with self.assertRaises(AndroidTransportError):
+            bound.call(self.request)
+        self.assertEqual(self.runner.call_count, 3)
+        for invocation in self.runner.call_args_list[1:]:
+            self.assertEqual(invocation.args[0][:3], ['adb', '-s', 'usb:1-2'])
+            self.assertEqual(execute_guard(invocation.kwargs['input']), 0)
+            self.assertNotEqual(execute_guard(invocation.kwargs['input'], users=b'Users:\n'), 0)
+
+    def test_bound_package_inspection_reads_use_the_verified_transport(self):
+        def runner(argv, **kwargs):
+            if argv == ['adb', 'devices', '-l']:
+                return completed(DEVICES_HEADER + USB.replace(b'usb:1-2', b'usb:1:4'))
+            self.assertEqual(argv, ['adb', '-s', 'usb:1:4', 'shell', '-T', 'sh'])
+            self.assertEqual(execute_guard(kwargs['input'], serial='', boot_serial='usb123'), 0)
+            self.assertNotEqual(execute_guard(kwargs['input'], serial='usb456', boot_serial=''), 0)
+            _, action = script_action(kwargs['input'])
+            if action == ['exec', 'pm', 'path', '--user', '0', 'org.example']:
+                return completed(b'package:/data/app/example/base.apk\n')
+            self.assertEqual(action, ['exec', 'cat', '/data/app/example/base.apk'])
+            kwargs['stdout'].write(b'binary\x00apk')
+            return completed(None)
+
+        self.runner.side_effect = runner
+        bound = self.transport.bind()
+        self.assertTrue(bound.shell('pm', 'path', '--user', '0', 'org.example').startswith(b'package:'))
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'local example.apk'
+            bound.pull('/data/app/example/base.apk', output)
+            self.assertEqual(output.read_bytes(), b'binary\x00apk')
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+
     def test_missing_or_unauthorized_usb_and_multiple_devices_stop_before_shell(self):
         for devices, reason in (
             (b'', 'USB'), (WIRELESS, 'USB'),
@@ -178,7 +237,7 @@ class AndroidTransportTests(unittest.TestCase):
                                    subprocess.TimeoutExpired('adb', 5)]
         request = self.request | {'op': 'session.open', 'args': {'site': 'video', 'minutes': None},
                                   'expected_revision': 3}
-        with self.assertRaisesRegex(AndroidTransportError, 'время'):
+        with self.assertRaisesRegex(AndroidTimeoutError, 'время'):
             self.transport.call(request)
         self.assertEqual(self.runner.call_count, 3)
 

@@ -2,6 +2,7 @@
 import base64
 import json
 import math
+import os
 import re
 import shlex
 import subprocess
@@ -24,6 +25,7 @@ ARG_FIELDS = {
 MUTATIONS = {'policy.replace', 'session.open', 'session.close'}
 REQUEST_FIELDS = {'schema', 'request_id', 'op', 'args'}
 REPLY_FIELDS = {'schema', 'request_id', 'ok', 'revision', 'applied_revision'}
+USB_DEVPATH = re.compile(rb'usb:[0-9]+(?::[0-9]+|-[0-9]+(?:\.[0-9]+)*)')
 
 
 class AndroidRequestError(ValueError):
@@ -36,6 +38,16 @@ class AndroidTransportError(RuntimeError):
 
 class AndroidProtocolError(AndroidTransportError):
     """The device response could not be verified as an RPC reply."""
+
+
+class AndroidTimeoutError(AndroidTransportError):
+    """A bounded ADB command did not complete before its deadline."""
+
+
+def validate_usb_serial(serial: str) -> str:
+    if not isinstance(serial, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]*', serial):
+        raise AndroidRequestError('Некорректный серийный номер --usb-serial')
+    return serial
 
 
 def _revision(value: object) -> bool:
@@ -112,6 +124,14 @@ def _validate_unicode(value: object) -> None:
             _validate_unicode(member)
 
 
+def decode_json(raw: bytes) -> object:
+    """Decode strict UTF-8 JSON, including checked strings and unique object keys."""
+    value = json.loads(raw.decode('utf-8'), object_pairs_hook=_unique_object,
+                       parse_constant=_finite_number, parse_float=_finite_number)
+    _validate_unicode(value)
+    return value
+
+
 def _reply(output: bytes, request_id: str) -> dict:
     if len(output) > MAX_REPLY_BYTES:
         raise AndroidProtocolError('Размер ответа Android RPC превышает 96 КиБ')
@@ -125,9 +145,7 @@ def _reply(output: bytes, request_id: str) -> dict:
         raw = base64.b64decode(encoded, validate=True)
         if base64.b64encode(raw) != encoded:
             raise ValueError('noncanonical Base64')
-        reply = json.loads(raw.decode('utf-8'), object_pairs_hook=_unique_object,
-                           parse_constant=_finite_number, parse_float=_finite_number)
-        _validate_unicode(reply)
+        reply = decode_json(raw)
     except (ValueError, RecursionError) as exc:
         raise AndroidProtocolError('Некорректные Base64, UTF-8 или JSON в ответе Android RPC') from exc
 
@@ -154,31 +172,43 @@ def _reply(output: bytes, request_id: str) -> dict:
     return reply
 
 
+def _rpc_command(request_bytes: bytes) -> tuple[str, ...]:
+    encoded = base64.b64encode(request_bytes).decode('ascii')
+    return ('content', 'call', '--user', '0', '--uri', PROVIDER_URI, '--method', 'rpc', '--arg', encoded)
+
+
+def _exec_line(arguments: tuple[str, ...]) -> str:
+    return shlex.join(('exec', *arguments)) + '\n'
+
+
 class AndroidTransport:
     def __init__(self, usb_serial: str | None = None, *, runner=subprocess.run, timeout: float = 20):
         self.usb_serial = usb_serial
         self._runner = runner
         self._timeout = timeout
 
-    def _run(self, *arguments: str, input: bytes = b'') -> bytes:
+    def _run(self, *arguments: str, input: bytes = b'', stdout=subprocess.PIPE) -> bytes:
         try:
-            result = self._runner(['adb', *arguments], input=input, stdout=subprocess.PIPE,
+            result = self._runner(['adb', *arguments], input=input, stdout=stdout,
                                   stderr=subprocess.DEVNULL, timeout=self._timeout)
         except FileNotFoundError:
             raise AndroidTransportError('Команда adb не найдена') from None
         except subprocess.TimeoutExpired:
-            raise AndroidTransportError('Истекло время ожидания ответа adb') from None
+            raise AndroidTimeoutError('Истекло время ожидания ответа adb') from None
         except OSError as exc:
             raise AndroidTransportError('Не удалось запустить adb') from exc
+        if result.returncode == 75:
+            raise AndroidTransportError('Серийный номер Android не совпадает с выбранным USB-устройством')
+        if result.returncode == 76:
+            raise AndroidTransportError('Android-пользователь 0 недоступен')
         if result.returncode:
             raise AndroidTransportError('Команда adb завершилась с ошибкой')
-        return result.stdout
+        return result.stdout or b''
 
-    def _usb_selector(self) -> list[str]:
+    def _usb_device(self) -> tuple[bytes, list[bytes]]:
         explicit = self.usb_serial
-        if explicit is not None and (not isinstance(explicit, str)
-                                     or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]*', explicit)):
-            raise AndroidRequestError('Некорректный серийный номер --usb-serial')
+        if explicit is not None:
+            validate_usb_serial(explicit)
         output = self._run('devices', '-l')
         header, _, rows = output.partition(b'\n')
         if header.rstrip(b'\r') != b'List of devices attached':
@@ -190,7 +220,8 @@ class AndroidTransport:
                 if len(columns) < 2:
                     raise AndroidTransportError('Не удалось прочитать список устройств adb')
                 serial, state, *details = columns
-                usb = any(detail.startswith(b'usb:') and len(detail) > 4 for detail in details)
+                # adb devices -l emits devpath immediately after the connection state.
+                usb = bool(details and details[0].startswith(b'usb:') and len(details[0]) > 4)
                 devices.append((serial, state, usb, details))
         matches = ([device for device in devices if device[0] == explicit.encode('ascii')]
                    if explicit is not None else [device for device in devices if device[2]])
@@ -198,12 +229,16 @@ class AndroidTransport:
             raise AndroidTransportError('Подключено несколько USB-устройств, укажите --usb-serial')
         if len(matches) != 1 or not matches[0][2]:
             raise AndroidTransportError('Не найдено подходящее USB-устройство adb')
-        _, state, _, details = matches[0]
+        serial, state, _, details = matches[0]
         if state == b'unauthorized':
             raise AndroidTransportError('Разрешите отладку по USB на телефоне')
         if state != b'device':
             raise AndroidTransportError(f'USB-устройство недоступно ({state.decode("ascii", "replace")})')
-        if explicit is None:
+        return serial, details
+
+    def _usb_selector(self) -> list[str]:
+        _, details = self._usb_device()
+        if self.usb_serial is None:
             return ['-d']
         ids = [detail.removeprefix(b'transport_id:') for detail in details
                if detail.startswith(b'transport_id:')]
@@ -212,17 +247,56 @@ class AndroidTransport:
             raise AndroidTransportError('Не удалось определить transport_id USB-устройства')
         return ['-t', ids[0].decode('ascii')]
 
+    def bind(self) -> 'BoundAndroidTransport':
+        """Bind the Linux USB path and the device's serial across one command."""
+        serial, details = self._usb_device()
+        usb_path = details[0]
+        if not USB_DEVPATH.fullmatch(usb_path):
+            raise AndroidTransportError('Не удалось определить путь USB-устройства Linux')
+        try:
+            identity = validate_usb_serial(serial.decode('ascii'))
+        except (UnicodeError, AndroidRequestError):
+            raise AndroidTransportError('Не удалось определить серийный номер USB-устройства') from None
+        return BoundAndroidTransport(self._run, usb_path.decode('ascii'), identity)
+
     def call(self, request: dict) -> dict:
         """Make one RPC call. A well-formed ok=false reply is returned to the CLI."""
         request_bytes, request_id = _request_bytes(request)
-        encoded = base64.b64encode(request_bytes).decode('ascii')
         selector = self._usb_selector()
         users = self._run(*selector, 'shell', 'pm', 'list', 'users')
         if not re.search(rb'^[ \t]*UserInfo\{0:[^\r\n]*\}(?:[ \t]+running)?\r?$', users, re.MULTILINE):
             raise AndroidTransportError('Android-пользователь 0 недоступен')
-
-        # Stream the command over stdin to fit policies larger than ADB's 16-bit service string.
-        command = ['exec', 'content', 'call', '--user', '0', '--uri', PROVIDER_URI,
-                   '--method', 'rpc', '--arg', encoded]
-        output = self._run(*selector, 'shell', '-T', 'sh', input=(shlex.join(command) + '\n').encode('ascii'))
+        script = _exec_line(_rpc_command(request_bytes)).encode('ascii')
+        output = self._run(*selector, 'shell', '-T', 'sh', input=script)
         return _reply(output, request_id)
+
+
+class BoundAndroidTransport:
+    def __init__(self, run, usb_path: str, serial: str):
+        self._run = run
+        self._usb_path = usb_path
+        identity = shlex.quote(serial)
+        self._guard = (
+            f'if [ "$(getprop ro.serialno)" != {identity} ] && '
+            f'[ "$(getprop ro.boot.serialno)" != {identity} ]; then exit 75; fi\n'
+            'users="$(pm list users)" || exit 76\n'
+            "printf '%s\\n' \"$users\" | grep -qE '^[[:blank:]]*UserInfo[{]0:.*[}]"
+            "([[:blank:]]+running)?[[:space:]]*$' || exit 76\n"
+        )
+
+    def _execute(self, arguments: tuple[str, ...], *, stdout=subprocess.PIPE) -> bytes:
+        # ADB can restart between subprocesses. Check the phone and user in this
+        # shell, before exec. Stdin also avoids the ADB service-string length limit.
+        script = (self._guard + _exec_line(arguments)).encode('utf-8')
+        return self._run('-s', self._usb_path, 'shell', '-T', 'sh', input=script, stdout=stdout)
+
+    def shell(self, *arguments: str) -> bytes:
+        return self._execute(arguments)
+
+    def pull(self, source: str, destination) -> None:
+        with os.fdopen(os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as stream:
+            self._execute(('cat', source), stdout=stream)
+
+    def call(self, request: dict) -> dict:
+        request_bytes, request_id = _request_bytes(request)
+        return _reply(self._execute(_rpc_command(request_bytes)), request_id)
