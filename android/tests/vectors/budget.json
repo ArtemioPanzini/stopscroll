@@ -1,0 +1,32 @@
+{
+  "zone": "Europe/Belgrade",
+  "scenarios": [
+    {"name":"reserve and refund once","start":"2026-07-12T10:00:00Z","steps":[
+      {"op":"open","seconds":600,"remaining":2700,"reserved":600},
+      {"op":"open","after_ms":120000,"seconds":600,"error":"SESSION_ACTIVE","remaining":2580,"reserved":480},
+      {"op":"close","remaining":2580,"reserved":0},{"op":"close","remaining":2580,"reserved":0},
+      {"op":"open","seconds":3000,"remaining":2580,"reserved":2580},
+      {"op":"tick","after_ms":2580000,"effects":["CLOSE"],"remaining":0},
+      {"op":"open","seconds":1,"error":"NO_BUDGET","remaining":0}]},
+    {"name":"short boundary","start":"2026-07-12T01:59:00Z","steps":[
+      {"op":"open","seconds":600,"reserved":60,"day":"2026-07-11"},
+      {"op":"tick","after_ms":60000,"day":"2026-07-12","remaining":2700,"reserved":0,"effects":["CLOSE"]}]},
+    {"name":"spring gap","start":"2026-03-29T00:59:00Z","steps":[
+      {"op":"open","seconds":7200,"reserved":2700},{"op":"tick","after_ms":60000,"remaining":2640,"reserved":2640,"day":"2026-03-28"}]},
+    {"name":"autumn overlap","start":"2026-10-25T00:59:00Z","steps":[
+      {"op":"open","seconds":600,"reserved":600},{"op":"tick","after_ms":120000,"remaining":2580,"reserved":480,"day":"2026-10-24"}]},
+    {"name":"backward wall and same boot restore","start":"2026-07-12T10:00:00Z","steps":[
+      {"op":"open","seconds":600},{"op":"restore","after_ms":1001,"wall_delta_ms":-86400000,"remaining":2698,"reserved":598,"day":"2026-07-12"},
+      {"op":"tick","after_ms":598999,"remaining":2100,"reserved":0,"effects":["CLOSE"]}]},
+    {"name":"different boot charges full reserve","start":"2026-07-12T10:00:00Z","steps":[
+      {"op":"open","seconds":600},{"op":"reboot","after_ms":1000,"remaining":2100,"reserved":0,"effects":["CLOSE"]}]},
+    {"name":"identical policy, reduction and tombstone","start":"2026-07-12T10:00:00Z","steps":[
+      {"op":"open","seconds":600},{"op":"same","after_ms":120000,"effects":[],"remaining":2580,"reserved":480,"revision":1},
+      {"op":"limit","minutes":1,"remaining":0,"reserved":0,"effects":["CLOSE","RECONFIGURE"]},
+      {"op":"remove"},{"op":"limit","minutes":45,"remaining":2580}]},
+    {"name":"short segments omit warning","start":"2026-07-12T10:00:00Z","steps":[
+      {"op":"open","seconds":120,"effects":["OPEN"]},{"op":"tick","after_ms":1,"effects":[]},
+      {"op":"tick","after_ms":119999,"effects":["CLOSE"]},{"op":"open","seconds":121},
+      {"op":"tick","after_ms":1000,"effects":["WARN"]},{"op":"tick","effects":[]}]}
+  ]
+}

@@ -1,5 +1,5 @@
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index 0a2469d..f1c443c 100644
+index 0a2469d..f20c3af 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
 @@ -23,6 +23,7 @@ plugins {
@@ -51,7 +51,15 @@ index 0a2469d..f1c443c 100644
          create("leakCanary") {
              matchingFallbacks += listOf("debug")
              initWith(getByName("debug"))
-@@ -395,7 +411,52 @@ kotlin {
+@@ -360,6 +376,7 @@ android {
+     }
+     sourceSets {
+         getByName("main").res.directories.add("src/full/res")
++        getByName("test").resources.srcDir(rootProject.file("../tests/vectors"))
+         getByName("full").res.directories.clear()
+     }
+     lint {
+@@ -395,7 +412,53 @@ kotlin {
      }
  }
 
@@ -97,6 +105,7 @@ index 0a2469d..f1c443c 100644
 +        }
 +    }
 +    beforeVariants(selector().withBuildType("stopscrollRelease")) { variant ->
++        variant.hostTests[com.android.build.api.variant.HostTestBuilder.UNIT_TEST_TYPE]?.enable = true
 +        variant.enable = variant.productFlavors.containsAll(
 +            listOf("releaseChannel" to "fdroid", "releaseType" to "full")
 +        )
@@ -104,7 +113,7 @@ index 0a2469d..f1c443c 100644
      onVariants(selector().all()) { variant ->
          variant.outputs.forEach { output ->
              val abi =
-@@ -508,7 +569,13 @@ dependencies {
+@@ -508,7 +571,13 @@ dependencies {
      // add ":debug" suffix to the dependency to include debug symbols
      download(firestackDependency())
      "websiteImplementation"(firestackDependency())
@@ -873,6 +882,609 @@ index 0000000..509f94f
 +
 +    private fun preferences(context: Context) = context.getSharedPreferences("stopscroll-g0", Context.MODE_PRIVATE)
 +}
+diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/LimitEngine.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/LimitEngine.kt
+new file mode 100644
+index 0000000..ea352ce
+--- /dev/null
++++ b/app/src/main/java/com/celzero/bravedns/stopscroll/LimitEngine.kt
+@@ -0,0 +1,182 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import com.google.common.collect.ImmutableList
++import com.google.common.collect.ImmutableMap
++import java.time.Instant
++import java.time.LocalDate
++import java.time.ZoneId
++
++internal data class ClockSample(val wallMs: Long, val elapsedMs: Long, val bootCount: Int) {
++    init { require(elapsedMs >= 0 && bootCount >= 0) }
++}
++
++private fun LocalDate.resetMs(zone: ZoneId) = atTime(4, 0).atZone(zone).toInstant().toEpochMilli()
++
++private fun dayAt(clock: ClockSample, zone: ZoneId): LocalDate {
++    val date = Instant.ofEpochMilli(clock.wallMs).atZone(zone).toLocalDate()
++    return if (clock.wallMs < date.resetMs(zone)) date.minusDays(1) else date
++}
++
++internal fun roundedSeconds(durationMs: Long): Int = ((durationMs + 999) / 1000).toInt()
++
++internal data class Session(val startMs: Long, val deadlineMs: Long, val warned: Boolean = false) {
++    val reservedSeconds get() = roundedSeconds(deadlineMs - startMs)
++    fun consumed(elapsedMs: Long) = roundedSeconds(elapsedMs.coerceIn(startMs, deadlineMs) - startMs)
++}
++
++internal data class Account(val spentSeconds: Int = 0, val session: Session? = null)
++
++// Task 3 owns the protocol envelope. Persist opaque replies alongside their request hashes.
++internal data class MutationReceipt(val requestId: String, val requestHash: String, val replyJson: String)
++
++internal data class JournalState(
++    val policy: Policy, val timezone: ZoneId, val dayId: LocalDate, val bootCount: Int,
++    val revision: Long, val accounts: ImmutableMap<String, Account>,
++    val receipts: ImmutableList<MutationReceipt> = ImmutableList.of()
++) {
++    fun withReceipt(receipt: MutationReceipt): JournalState {
++        val recent = receipts.filterNot { it.requestId == receipt.requestId }.takeLast(63)
++        return copy(receipts = ImmutableList.copyOf(recent + receipt))
++    }
++
++    companion object {
++        fun initial(timezone: ZoneId, clock: ClockSample, policy: Policy = Policy.EMPTY) =
++            JournalState(policy, timezone, dayAt(clock, timezone), clock.bootCount, 0,
++                ImmutableMap.copyOf(policy.sites.keys.associateWith { Account() }))
++    }
++}
++
++internal enum class EffectKind { OPEN, CLOSE, WARN, RECONFIGURE }
++internal data class Effect(val kind: EffectKind, val site: String? = null)
++internal data class Transition(val state: JournalState, val effects: List<Effect>, val error: String? = null)
++internal data class SiteBudget(val remainingSeconds: Int, val reservedSeconds: Int, val session: Session?) {
++    val unreservedSeconds get() = remainingSeconds - reservedSeconds
++}
++internal data class PolicySnapshot(
++    val policy: Policy, val revision: Long, val timezone: ZoneId, val dayId: LocalDate,
++    val bootCount: Int, val sites: ImmutableMap<String, SiteBudget>
++) {
++    private val matcher = PolicyMatcher(policy)
++    private val nextReset = dayId.plusDays(1).resetMs(timezone)
++
++    /** Even a previously published snapshot cannot grant past its deadline. */
++    fun blocks(host: String, clock: ClockSample): Boolean {
++        return matcher.blocks(host) { id ->
++            val s = sites[id]?.session
++            s != null && clock.bootCount == bootCount && clock.wallMs < nextReset &&
++                clock.elapsedMs >= s.startMs && clock.elapsedMs < s.deadlineMs
++        }
++    }
++}
++
++internal interface LimitEngine {
++    fun open(site: String, seconds: Int, clock: ClockSample): Transition
++    fun close(site: String, clock: ClockSample): Transition
++    fun tick(clock: ClockSample): Transition
++    fun replacePolicy(policy: Policy, clock: ClockSample): Transition
++    fun snapshot(clock: ClockSample): PolicySnapshot
++}
++
++/** Each invocation starts with exactly the supplied journal. Only StateStore commits a transition. */
++internal class BudgetEngine(private val state: JournalState) : LimitEngine {
++    private class Update(val original: JournalState, val clock: ClockSample) {
++        val accounts = original.accounts.toMutableMap()
++        val effects = mutableListOf<Effect>()
++        var policy = original.policy
++        var day = original.dayId
++        var changed = false
++
++        init {
++            val observedDay = dayAt(clock, original.timezone)
++            if (observedDay > day) {
++                for ((id, account) in accounts) if (account.session != null) effects.add(Effect(EffectKind.CLOSE, id))
++                accounts.clear()
++                policy.sites.keys.forEach { accounts[it] = Account() }
++                day = observedDay
++                changed = true
++            }
++            val rebooted = original.bootCount != clock.bootCount
++            if (rebooted) changed = true
++            for ((id, account) in accounts) {
++                val s = account.session ?: continue
++                if (rebooted || clock.elapsedMs < s.startMs || clock.elapsedMs >= s.deadlineMs) {
++                    settle(id, full = true)
++                } else if (!s.warned && s.deadlineMs - s.startMs > 120000 && s.deadlineMs - clock.elapsedMs <= 120000) {
++                    accounts[id] = account.copy(session = s.copy(warned = true))
++                    effects.add(Effect(EffectKind.WARN, id))
++                }
++            }
++        }
++
++        fun settle(id: String, full: Boolean = false) {
++            val account = accounts.getValue(id)
++            val s = account.session ?: return
++            val used = if (full) s.reservedSeconds else s.consumed(clock.elapsedMs)
++            accounts[id] = Account(account.spentSeconds + used)
++            effects.remove(Effect(EffectKind.WARN, id))
++            effects.add(Effect(EffectKind.CLOSE, id))
++            changed = true
++        }
++
++        fun result(error: String? = null): Transition {
++            val next = if (changed || effects.isNotEmpty()) original.copy(
++                policy = policy, accounts = ImmutableMap.copyOf(accounts), dayId = day, bootCount = clock.bootCount,
++                revision = if (changed) Math.incrementExact(original.revision) else original.revision
++            ) else original
++            return Transition(next, ImmutableList.copyOf(effects), error)
++        }
++    }
++
++    override fun open(site: String, seconds: Int, clock: ClockSample): Transition {
++        val u = Update(state, clock)
++        if (seconds <= 0) return u.result("INVALID_REQUEST")
++        val rule = state.policy.sites[site]
++        if (rule?.limited != true) return u.result("NOT_LIMITED")
++        val account = u.accounts.getValue(site)
++        if (account.session != null) return u.result("SESSION_ACTIVE")
++        val available = rule.budgetMin * 60 - account.spentSeconds
++        if (available <= 0) return u.result("NO_BUDGET")
++        val untilReset = u.day.plusDays(1).resetMs(state.timezone) - clock.wallMs
++        val duration = minOf(minOf(available, seconds) * 1000L, untilReset)
++        val s = Session(clock.elapsedMs, Math.addExact(clock.elapsedMs, duration))
++        u.accounts[site] = account.copy(session = s)
++        u.changed = true
++        u.effects.add(Effect(EffectKind.OPEN, site))
++        return u.result()
++    }
++
++    override fun close(site: String, clock: ClockSample): Transition {
++        val u = Update(state, clock)
++        if (state.policy.sites[site]?.limited != true) return u.result("NOT_LIMITED")
++        u.settle(site)
++        return u.result()
++    }
++
++    override fun replacePolicy(policy: Policy, clock: ClockSample): Transition {
++        val u = Update(state, clock)
++        if (policy == state.policy) return u.result()
++        if (u.accounts.size + policy.sites.keys.count { it !in u.accounts } > 1000) return u.result("TOO_LARGE")
++        for (id in u.accounts.keys) u.settle(id)
++        for (id in policy.sites.keys) u.accounts.putIfAbsent(id, Account())
++        u.changed = true
++        u.policy = policy
++        u.effects.add(Effect(EffectKind.RECONFIGURE))
++        return u.result()
++    }
++
++    override fun tick(clock: ClockSample): Transition = Update(state, clock).result()
++
++    override fun snapshot(clock: ClockSample): PolicySnapshot {
++        val current = tick(clock).state
++        val budgets = current.policy.sites.mapValues { (id, group) ->
++            val account = current.accounts.getValue(id)
++            val s = account.session
++            val consumed = s?.consumed(clock.elapsedMs) ?: 0
++            SiteBudget((group.budgetMin * 60 - account.spentSeconds - consumed).coerceAtLeast(0),
++                (s?.reservedSeconds ?: 0) - consumed, s)
++        }
++        return PolicySnapshot(current.policy, state.revision, current.timezone, current.dayId,
++            current.bootCount, ImmutableMap.copyOf(budgets))
++    }
++}
+diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/Policy.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/Policy.kt
+new file mode 100644
+index 0000000..c7ea905
+--- /dev/null
++++ b/app/src/main/java/com/celzero/bravedns/stopscroll/Policy.kt
+@@ -0,0 +1,27 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import com.google.common.collect.ImmutableList
++import com.google.common.collect.ImmutableMap
++import java.security.MessageDigest
++
++internal class PolicyException(val code: String, message: String) : IllegalArgumentException(message)
++internal fun invalid(reason: String): Nothing = throw PolicyException("INVALID_REQUEST", reason)
++internal fun oversized(reason: String): Nothing = throw PolicyException("TOO_LARGE", reason)
++internal val siteId = Regex("[a-z][a-z0-9]{0,23}")
++internal fun sha256(bytes: ByteArray): String =
++    MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
++
++internal data class SitePolicy(
++    val limited: Boolean,
++    val budgetMin: Int,
++    val domains: ImmutableList<String>,
++    val exceptions: ImmutableList<String>
++)
++
++internal data class Policy(val defaultSessionMin: Int, val sites: ImmutableMap<String, SitePolicy>) {
++    val hash: String by lazy { sha256(PolicyCodec.encode(this).toByteArray()) }
++    companion object {
++        val EMPTY = Policy(15, ImmutableMap.of())
++    }
++}
+diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/PolicyCodec.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/PolicyCodec.kt
+new file mode 100644
+index 0000000..01fe395
+--- /dev/null
++++ b/app/src/main/java/com/celzero/bravedns/stopscroll/PolicyCodec.kt
+@@ -0,0 +1,148 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import com.google.common.collect.ImmutableList
++import com.google.common.collect.ImmutableMap
++import com.google.common.net.InternetDomainName
++import com.google.gson.JsonArray
++import com.google.gson.JsonElement
++import com.google.gson.JsonObject
++import com.google.gson.JsonPrimitive
++import com.google.gson.Strictness
++import com.google.gson.stream.JsonReader
++import com.google.gson.stream.JsonToken
++import java.io.StringReader
++import java.net.IDN
++
++private val integerToken = Regex("-?(?:0|[1-9][0-9]*)")
++
++private fun jsonLong(token: String): Long {
++    if (token.length > 20 || !integerToken.matches(token)) invalid("Expected integer")
++    return token.toLongOrNull() ?: invalid("Integer out of range")
++}
++
++/** Gson's tree parser silently overwrites duplicate keys. Check them while streaming. */
++internal fun strictJson(raw: String): JsonElement {
++    val reader = JsonReader(StringReader(raw)).apply { strictness = Strictness.STRICT }
++    fun value(depth: Int): JsonElement {
++        if (depth > 16) invalid("JSON nesting is too deep")
++        return when (reader.peek()) {
++            JsonToken.BEGIN_OBJECT -> JsonObject().apply {
++                reader.beginObject()
++                while (reader.hasNext()) {
++                    val key = reader.nextName()
++                    if (has(key)) invalid("Repeated JSON field")
++                    add(key, value(depth + 1))
++                }
++                reader.endObject()
++            }
++            JsonToken.BEGIN_ARRAY -> JsonArray().apply {
++                reader.beginArray()
++                while (reader.hasNext()) add(value(depth + 1))
++                reader.endArray()
++            }
++            JsonToken.STRING -> JsonPrimitive(reader.nextString())
++            JsonToken.NUMBER -> JsonPrimitive(jsonLong(reader.nextString()))
++            JsonToken.BOOLEAN -> JsonPrimitive(reader.nextBoolean())
++            else -> invalid("Unexpected JSON token")
++        }
++    }
++    return try {
++        val parsed = value(0)
++        if (reader.peek() != JsonToken.END_DOCUMENT) invalid("Trailing JSON")
++        parsed
++    } catch (e: PolicyException) {
++        throw e
++    } catch (e: Exception) {
++        invalid("Malformed JSON")
++    }
++}
++
++internal fun JsonElement.obj(): JsonObject = if (isJsonObject) asJsonObject else invalid("Expected object")
++internal fun JsonElement.array(): JsonArray = if (isJsonArray) asJsonArray else invalid("Expected array")
++internal fun JsonElement.string(): String =
++    if (isJsonPrimitive && asJsonPrimitive.isString) asString else invalid("Expected string")
++internal fun JsonElement.number(min: Long, max: Long): Long {
++    if (!isJsonPrimitive || !asJsonPrimitive.isNumber) invalid("Expected integer")
++    val value = jsonLong(asString)
++    if (value !in min..max) invalid("Integer out of range")
++    return value
++}
++internal fun JsonObject.fields(vararg names: String) {
++    if (keySet() != names.toSet()) invalid("Missing or unknown field")
++}
++
++internal object PolicyCodec {
++    const val MAX_BYTES = 65536
++    private val label = Regex("[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
++
++    private val ipv4Component = Regex("[0-9]+|0x[0-9a-f]*")
++
++    fun decode(raw: String): Policy = fromJson(strictJson(raw))
++
++    /** A parsed tree retains number types and tokens. Reject duplicate keys at the raw JSON boundary. */
++    fun fromJson(element: JsonElement): Policy {
++        val root = element.obj()
++        root.fields("schema", "reset_hour", "default_session_min", "sites")
++        if (root["schema"].number(0, Long.MAX_VALUE) != 1L) throw PolicyException("UNSUPPORTED_SCHEMA", "Policy schema must be 1")
++        root["reset_hour"].number(4, 4)
++        val defaultMin = root["default_session_min"].number(1, 1440).toInt()
++        val sites = root["sites"].obj()
++        if (sites.size() > 100) oversized("At most 100 site groups")
++        var count = 0
++        fun domains(element: JsonElement): ImmutableList<String> {
++            val array = element.array()
++            count += array.size()
++            if (count > 1000) oversized("At most 1000 domains and exceptions")
++            return ImmutableList.copyOf(array.map { validateDomain(it.string()) })
++        }
++        val policies = sites.entrySet().associate { (id, entry) ->
++            if (!siteId.matches(id)) invalid("Invalid site ID")
++            val group = entry.obj()
++            group.fields("mode", "budget_min", "domains", "exceptions")
++            val limited = when (group["mode"].string()) {
++                "limited" -> true
++                "blocked" -> false
++                else -> invalid("Invalid mode")
++            }
++            val budget = if (limited) group["budget_min"].number(1, 1440) else group["budget_min"].number(0, 0)
++            val entries = domains(group["domains"])
++            if (entries.isEmpty()) invalid("Group requires a domain")
++            val exceptions = domains(group["exceptions"])
++            val roots = entries.toSet()
++            if (exceptions.any { !PolicyMatcher.matches(it, roots) }) invalid("Exception is outside group domains")
++            id to SitePolicy(limited, budget.toInt(), entries, exceptions)
++        }
++        val policy = Policy(defaultMin, ImmutableMap.copyOf(policies.toSortedMap()))
++        if (encode(policy).toByteArray().size > MAX_BYTES) oversized("Canonical policy exceeds 64 KiB")
++        return policy
++    }
++
++    private fun validateDomain(host: String): String {
++        val labels = host.split('.')
++        if (host.length > 253 || host.startsWith("www.") || labels.size < 2 || !labels.all(label::matches))
++            invalid("Expected normalized ASCII domain")
++        if (labels.size <= 4 && labels.all(ipv4Component::matches))
++            invalid("IP address is not a domain")
++        if (labels.any { it.startsWith("xn--") && IDN.toUnicode(it) == it }) invalid("Invalid IDNA label")
++        if (InternetDomainName.isValid(host) && InternetDomainName.from(host).isPublicSuffix) invalid("Public suffix is not a site")
++        return host
++    }
++
++    // Compact UTF-8, sorted object keys, original array order. No reflection on persisted field names.
++    fun toJson(policy: Policy): JsonObject = JsonObject().apply {
++        addProperty("default_session_min", policy.defaultSessionMin)
++        addProperty("reset_hour", 4)
++        addProperty("schema", 1)
++        add("sites", JsonObject().apply {
++            for ((id, group) in policy.sites.toSortedMap()) add(id, JsonObject().apply {
++                addProperty("budget_min", group.budgetMin)
++                add("domains", JsonArray().apply { group.domains.forEach(::add) })
++                add("exceptions", JsonArray().apply { group.exceptions.forEach(::add) })
++                addProperty("mode", if (group.limited) "limited" else "blocked")
++            })
++        })
++    }
++
++    fun encode(policy: Policy): String = toJson(policy).toString()
++}
+diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/PolicyMatcher.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/PolicyMatcher.kt
+new file mode 100644
+index 0000000..29de335
+--- /dev/null
++++ b/app/src/main/java/com/celzero/bravedns/stopscroll/PolicyMatcher.kt
+@@ -0,0 +1,25 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++internal class PolicyMatcher(policy: Policy) {
++    private data class Rule(val id: String, val limited: Boolean, val domains: Set<String>, val exceptions: Set<String>)
++    private val rules = policy.sites.map { (id, s) -> Rule(id, s.limited, s.domains.toSet(), s.exceptions.toSet()) }
++
++    fun blocks(host: String, openSites: Set<String>): Boolean = blocks(host, openSites::contains)
++
++    fun blocks(host: String, isOpen: (String) -> Boolean): Boolean {
++        val name = host.removeSuffix(".").lowercase(java.util.Locale.ROOT)
++        return rules.any { (!it.limited || !isOpen(it.id)) && matches(name, it.domains) && !matches(name, it.exceptions) }
++    }
++
++    companion object {
++        fun matches(host: String, entries: Set<String>): Boolean {
++            var name = host
++            while (name.isNotEmpty()) {
++                if (name in entries) return true
++                name = name.substringAfter('.', "")
++            }
++            return false
++        }
++    }
++}
+diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/StateStore.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/StateStore.kt
+new file mode 100644
+index 0000000..b8ad1c1
+--- /dev/null
++++ b/app/src/main/java/com/celzero/bravedns/stopscroll/StateStore.kt
+@@ -0,0 +1,191 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import android.util.AtomicFile
++import com.google.common.collect.ImmutableList
++import com.google.common.collect.ImmutableMap
++import com.google.gson.JsonArray
++import com.google.gson.JsonObject
++import java.io.File
++import java.io.IOException
++import java.nio.ByteBuffer
++import java.nio.channels.FileChannel
++import java.nio.charset.StandardCharsets
++import java.nio.file.StandardOpenOption
++import java.time.LocalDate
++import java.time.ZoneId
++import java.util.Base64
++import java.util.UUID
++
++internal object JournalCodec {
++    // 64 replies of at most 96 KiB, base64 encoded, plus policy and 1000 accounts.
++    const val MAX_BYTES = 9 * 1024 * 1024
++    private val hashPattern = Regex("[0-9a-f]{64}")
++    private const val MAX_REPLY = 96 * 1024
++    private fun utf8(bytes: ByteArray) = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString()
++
++    private fun validate(state: JournalState) {
++        require(state.revision >= 0 && state.bootCount >= 0)
++        require(state.accounts.size <= 1000 && state.accounts.keys.containsAll(state.policy.sites.keys))
++        for ((id, account) in state.accounts) {
++            require(siteId.matches(id) && account.spentSeconds in 0..86400)
++            val s = account.session ?: continue
++            val group = state.policy.sites[id]
++            require(group != null && group.limited)
++            require(s.startMs >= 0 && s.deadlineMs > s.startMs && s.deadlineMs - s.startMs <= 86400000)
++            require(account.spentSeconds + s.reservedSeconds <= group.budgetMin * 60)
++        }
++        require(state.receipts.size <= 64 && state.receipts.distinctBy { it.requestId }.size == state.receipts.size)
++        for (r in state.receipts) {
++            require(UUID.fromString(r.requestId).toString() == r.requestId && hashPattern.matches(r.requestHash))
++            require(r.replyJson.toByteArray().size in 1..MAX_REPLY)
++        }
++    }
++
++    fun encode(state: JournalState): ByteArray {
++        validate(state)
++        val body = JsonObject().apply {
++            addProperty("format", 1)
++            add("policy", PolicyCodec.toJson(state.policy))
++            addProperty("timezone", state.timezone.id)
++            addProperty("day_id", state.dayId.toString())
++            addProperty("boot_count", state.bootCount)
++            addProperty("revision", state.revision)
++            add("accounts", JsonObject().apply {
++                for ((id, account) in state.accounts) add(id, JsonObject().apply {
++                    addProperty("spent", account.spentSeconds)
++                    account.session?.let { s ->
++                        add("session", JsonObject().apply {
++                            addProperty("start_ms", s.startMs)
++                            addProperty("deadline_ms", s.deadlineMs)
++                            addProperty("reserved", s.reservedSeconds)
++                            addProperty("warned", s.warned)
++                        })
++                    }
++                })
++            })
++            add("receipts", JsonArray().apply {
++                for (r in state.receipts) add(JsonObject().apply {
++                    addProperty("id", r.requestId)
++                    addProperty("hash", r.requestHash)
++                    addProperty("reply_b64", Base64.getEncoder().encodeToString(r.replyJson.toByteArray()))
++                })
++            })
++        }
++        return JsonObject().apply {
++            addProperty("sha256", sha256(body.toString().toByteArray()))
++            add("state", body)
++        }.toString().toByteArray()
++    }
++
++    fun decode(bytes: ByteArray): JournalState {
++        require(bytes.size <= MAX_BYTES)
++        val envelope = strictJson(utf8(bytes)).obj()
++        envelope.fields("sha256", "state")
++        val body = envelope["state"].obj()
++        require(sha256(body.toString().toByteArray()) == envelope["sha256"].string())
++        body.fields("format", "policy", "timezone", "day_id", "boot_count", "revision", "accounts", "receipts")
++        body["format"].number(1, 1)
++        val records = body["accounts"].obj()
++        require(records.size() <= 1000)
++        val accounts = records.entrySet().associate { (id, entry) ->
++            val a = entry.obj()
++            val session = if (a.has("session")) {
++                a.fields("spent", "session")
++                val s = a["session"].obj()
++                s.fields("start_ms", "deadline_ms", "reserved", "warned")
++                val warned = s["warned"]
++                require(warned.isJsonPrimitive && warned.asJsonPrimitive.isBoolean)
++                Session(s["start_ms"].number(0, Long.MAX_VALUE), s["deadline_ms"].number(0, Long.MAX_VALUE),
++                    warned.asBoolean).also { require(it.reservedSeconds.toLong() == s["reserved"].number(1, 86400)) }
++            } else {
++                a.fields("spent")
++                null
++            }
++            id to Account(a["spent"].number(0, 86400).toInt(), session)
++        }
++        val history = body["receipts"].array()
++        require(history.size() <= 64)
++        val receipts = history.map { entry ->
++            val r = entry.obj()
++            r.fields("id", "hash", "reply_b64")
++            MutationReceipt(r["id"].string(), r["hash"].string(), utf8(Base64.getDecoder().decode(r["reply_b64"].string())))
++        }
++        return JournalState(PolicyCodec.fromJson(body["policy"]), ZoneId.of(body["timezone"].string()),
++            LocalDate.parse(body["day_id"].string()), body["boot_count"].number(0, Int.MAX_VALUE.toLong()).toInt(),
++            body["revision"].number(0, Long.MAX_VALUE), ImmutableMap.copyOf(accounts), ImmutableList.copyOf(receipts)
++        ).also(::validate)
++    }
++}
++
++internal class StateStore(private val file: File, private val beforeFinish: () -> Unit = {}) {
++    private val atomic = AtomicFile(file)
++
++    // Provider, VPN and UI share one process. Serialize even across separate store handles.
++    private companion object { val journalLock = Any() }
++
++    fun loadOrCreate(initial: () -> JournalState): JournalState = synchronized(journalLock) {
++        if (listOf(file, File(file.path + ".bak"), File(file.path + ".new")).any { it.exists() }) {
++            read()
++        } else {
++            val state = initial()
++            save(state)
++            state
++        }
++    }
++
++    private fun readBytes(): ByteArray = atomic.openRead().use { stream ->
++        val size = stream.channel.size()
++        if (size !in 1L..JournalCodec.MAX_BYTES.toLong()) throw IOException("Invalid journal size")
++        val data = ByteArray(size.toInt())
++        java.io.DataInputStream(stream).readFully(data)
++        if (stream.read() != -1) throw IOException("Journal grew during read")
++        data
++    }
++
++    fun read(): JournalState = synchronized(journalLock) {
++        try {
++            JournalCodec.decode(readBytes())
++        } catch (e: Exception) {
++            throw IOException("Cannot read Stopscroll journal", e)
++        }
++    }
++
++    /** No effects escape this call until the complete transition has been committed. */
++    fun update(transform: (JournalState) -> Transition): Transition = synchronized(journalLock) {
++        val previous = read()
++        val next = transform(previous)
++        if (next.state != previous) save(next.state)
++        next
++    }
++
++    private fun syncDirectory(dir: File) {
++        FileChannel.open(dir.toPath(), StandardOpenOption.READ).use { it.force(true) }
++    }
++
++    private fun save(state: JournalState) {
++        try {
++            val data = JournalCodec.encode(state)
++            val dir = requireNotNull(file.parentFile)
++            if (!dir.exists()) {
++                if (!dir.mkdir()) throw IOException("Cannot create journal directory")
++                syncDirectory(requireNotNull(dir.parentFile))
++            }
++            val stream = atomic.startWrite()
++            try {
++                stream.write(data)
++                // AtomicFile.finishWrite logs some sync/rename failures without throwing.
++                stream.fd.sync()
++                beforeFinish()
++            } catch (e: Exception) {
++                atomic.failWrite(stream)
++                throw e
++            }
++            atomic.finishWrite(stream)
++            syncDirectory(dir)
++            if (!readBytes().contentEquals(data)) throw IOException("Journal commit did not publish expected bytes")
++        } catch (e: Exception) {
++            throw IOException("Cannot commit Stopscroll journal", e)
++        }
++    }
++}
 diff --git a/app/src/main/java/com/celzero/bravedns/tunnel/TunDnsManager.kt b/app/src/main/java/com/celzero/bravedns/tunnel/TunDnsManager.kt
 index 2c71613..33f0c0d 100644
 --- a/app/src/main/java/com/celzero/bravedns/tunnel/TunDnsManager.kt
@@ -1291,6 +1903,41 @@ index 9090842..3cc95ec 100644
      }
 
      @Test
+diff --git a/app/src/test/java/com/celzero/bravedns/stopscroll/AndroidIdnaTest.kt b/app/src/test/java/com/celzero/bravedns/stopscroll/AndroidIdnaTest.kt
+new file mode 100644
+index 0000000..c05e17a
+--- /dev/null
++++ b/app/src/test/java/com/celzero/bravedns/stopscroll/AndroidIdnaTest.kt
+@@ -0,0 +1,29 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [33], manifest = Config.NONE)
++class AndroidIdnaTest {
++    @Test fun android13NameprepRejectsUnassignedCharacters() {
++        // Robolectric uses host java.net.IDN. Android 13 libcore delegates to this SDK's
++        // ICU entry point with flags=0 and returns the original label on a nameprep error.
++        val convert = Class.forName("com.android.icu.text.ExtendedIDNA")
++            .getMethod("convertIDNToUnicode", String::class.java, Int::class.javaPrimitiveType)
++        for ((label, expected) in mapOf("xn--e28h" to "xn--e28h", "xn--ls8h" to "xn--ls8h",
++            "xn--caf-dma" to "café", "xn--bcher-kva" to "bücher")) {
++            val actual = try {
++                convert.invoke(null, label, 0).toString()
++            } catch (e: java.lang.reflect.InvocationTargetException) {
++                if (e.cause?.javaClass?.name != "android.icu.text.StringPrepParseException") throw e
++                label
++            }
++            assertEquals(label, expected, actual)
++        }
++    }
++}
 diff --git a/app/src/test/java/com/celzero/bravedns/stopscroll/G0CutoffTest.kt b/app/src/test/java/com/celzero/bravedns/stopscroll/G0CutoffTest.kt
 new file mode 100644
 index 0000000..253429a
@@ -1614,6 +2261,405 @@ index 0000000..bb21c7b
 +        }
 +    }
 +}
+diff --git a/app/src/test/java/com/celzero/bravedns/stopscroll/LimitEngineTest.kt b/app/src/test/java/com/celzero/bravedns/stopscroll/LimitEngineTest.kt
+new file mode 100644
+index 0000000..ee1cc51
+--- /dev/null
++++ b/app/src/test/java/com/celzero/bravedns/stopscroll/LimitEngineTest.kt
+@@ -0,0 +1,112 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import java.time.Instant
++import java.time.ZoneId
++import org.junit.Assert.*
++import org.junit.Test
++
++class LimitEngineTest {
++    @Test fun budgetVectors() {
++        val vectors = fixture("budget")
++        val zone = ZoneId.of(vectors["zone"].asString)
++        for (scenario in vectors["scenarios"].asJsonArray.map { it.asJsonObject }) {
++            var clock = ClockSample(Instant.parse(scenario["start"].asString).toEpochMilli(), 10000, 4)
++            var state = JournalState.initial(zone, clock, examplePolicy())
++            for (step in scenario["steps"].asJsonArray.map { it.asJsonObject }) {
++                val op = step["op"].asString
++                val dt = step["after_ms"]?.asLong ?: 0
++                clock = ClockSample(clock.wallMs + (step["wall_delta_ms"]?.asLong ?: dt),
++                    if (op == "reboot") 30 else clock.elapsedMs + dt, clock.bootCount + if (op == "reboot") 1 else 0)
++                if (op == "restore" || op == "reboot") state = JournalCodec.decode(JournalCodec.encode(state))
++                val engine = BudgetEngine(state)
++                val transition = when (op) {
++                    "open" -> engine.open("video", step["seconds"].asInt, clock)
++                    "close" -> engine.close("video", clock)
++                    "tick", "restore", "reboot" -> engine.tick(clock)
++                    "same" -> engine.replacePolicy(examplePolicy(), clock)
++                    "limit" -> engine.replacePolicy(examplePolicy(step["minutes"].asInt), clock)
++                    "remove" -> engine.replacePolicy(Policy.EMPTY, clock)
++                    else -> error(op)
++                }
++                state = transition.state
++                val label = scenario["name"].asString + " " + step
++                val status = BudgetEngine(state).snapshot(clock).sites["video"]
++                assertEquals(label, step["error"]?.asString, transition.error)
++                step["remaining"]?.let { assertEquals(label, it.asInt, status!!.remainingSeconds) }
++                step["reserved"]?.let { assertEquals(label, it.asInt, status!!.reservedSeconds) }
++                step["day"]?.let { assertEquals(label, it.asString, state.dayId.toString()) }
++                step["revision"]?.let { assertEquals(label, it.asLong, state.revision) }
++                step["effects"]?.let { expected ->
++                    assertEquals(label, expected.asJsonArray.map { it.asString }, transition.effects.map { it.kind.name })
++                }
++            }
++        }
++    }
++
++    @Test fun historyBoundNeverEvictsAndNewDayAdvancesRevision() {
++        var clock = ClockSample(Instant.parse("2026-07-12T12:00:00Z").toEpochMilli(), 0, 2)
++        var state = JournalState.initial(ZoneId.of("UTC"), clock, examplePolicy())
++        state = BudgetEngine(state).open("video", 100, clock).state
++        clock = clock.copy(elapsedMs = 4500)
++        state = BudgetEngine(state).close("video", clock).state
++        fun batch(first: Int, count: Int): Policy {
++            val doc = fixture("policy")["policy"].asJsonObject
++            val sites = doc["sites"].asJsonObject
++            val rule = sites.remove("video")
++            sites.remove("news")
++            repeat(count) { sites.add("g" + (first + it), rule) }
++            return PolicyCodec.decode(doc.toString())
++        }
++        repeat(10) { state = BudgetEngine(state).replacePolicy(batch(it * 100, if (it == 9) 98 else 100), clock).state }
++        assertEquals(1000, state.accounts.size)
++        val denied = BudgetEngine(state).replacePolicy(batch(2000, 1), clock)
++        assertEquals("TOO_LARGE", denied.error)
++        assertEquals(state, denied.state)
++        val restored = BudgetEngine(state).replacePolicy(examplePolicy(), clock).state
++        assertEquals(2695, BudgetEngine(restored).snapshot(clock).sites.getValue("video").remainingSeconds)
++        clock = clock.copy(wallMs = clock.wallMs + 86400000)
++        val next = BudgetEngine(restored).replacePolicy(batch(2000, 1), clock)
++        assertNull(next.error)
++        assertTrue(next.state.revision > restored.revision)
++        assertEquals(3, next.state.accounts.size)
++    }
++
++    @Test fun resetUsesActualCalendarBoundaryAcrossDstAndFractions() {
++        val zone = ZoneId.of("Europe/Belgrade")
++        for ((start, hours) in listOf("2026-03-28T03:00:00Z" to 23, "2026-10-24T04:00:00Z" to 23)) {
++            val clock = ClockSample(Instant.parse(start).toEpochMilli(), 100, 7)
++            val initial = JournalState.initial(zone, clock, examplePolicy(1440))
++            val opened = BudgetEngine(initial).open("video", 86400, clock)
++            assertEquals(hours * 3600, opened.state.accounts.getValue("video").session!!.reservedSeconds)
++        }
++        val clock = ClockSample(Instant.parse("2026-07-12T01:59:59.750Z").toEpochMilli(), 200, 4)
++        val state = BudgetEngine(JournalState.initial(zone, clock, examplePolicy())).open("video", 60, clock).state
++        val s = state.accounts.getValue("video").session!!
++        assertEquals(450L, s.deadlineMs)
++        assertEquals(1, s.reservedSeconds)
++        val snapshot = BudgetEngine(state).snapshot(clock)
++        assertFalse(snapshot.blocks("video.example.org", clock))
++        assertTrue(snapshot.blocks("video.example.org", clock.copy(elapsedMs = 450)))
++        assertTrue(snapshot.blocks("video.example.org", clock.copy(wallMs = clock.wallMs + 250)))
++        assertTrue(snapshot.blocks("video.example.org", clock.copy(bootCount = 5)))
++        assertTrue(snapshot.blocks("video.example.org", clock.copy(elapsedMs = 100)))
++    }
++
++    @Test fun replacementClosesEveryActiveGroupAndAccountsIndependently() {
++        val doc = fixture("policy")["policy"].asJsonObject
++        val sites = doc["sites"].asJsonObject
++        sites.add("second", sites["video"].deepCopy())
++        val policy = PolicyCodec.decode(doc.toString())
++        val c = ClockSample(1000000000, 0, 1)
++        val first = BudgetEngine(JournalState.initial(ZoneId.of("UTC"), c, policy)).open("video", 200, c).state
++        assertTrue(BudgetEngine(first).snapshot(c).blocks("video.example.org", c))
++        val later = c.copy(elapsedMs = 1500)
++        val both = BudgetEngine(first).open("second", 150, later).state
++        assertFalse(BudgetEngine(both).snapshot(later).blocks("video.example.org", later))
++        val closed = BudgetEngine(both).replacePolicy(Policy.EMPTY, c.copy(elapsedMs = 2200))
++        assertEquals(setOf("video", "second"), closed.effects.filter { it.kind == EffectKind.CLOSE }.map { it.site }.toSet())
++        assertEquals(3, closed.state.accounts.getValue("video").spentSeconds)
++        assertEquals(1, closed.state.accounts.getValue("second").spentSeconds)
++    }
++}
+diff --git a/app/src/test/java/com/celzero/bravedns/stopscroll/PolicyMatcherTest.kt b/app/src/test/java/com/celzero/bravedns/stopscroll/PolicyMatcherTest.kt
+new file mode 100644
+index 0000000..0df5ae2
+--- /dev/null
++++ b/app/src/test/java/com/celzero/bravedns/stopscroll/PolicyMatcherTest.kt
+@@ -0,0 +1,110 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import com.google.gson.JsonObject
++import com.google.gson.JsonParser
++import org.junit.Assert.*
++import org.junit.Test
++
++internal fun fixture(name: String): JsonObject =
++    PolicyMatcherTest::class.java.getResourceAsStream("/$name.json")!!.bufferedReader().use {
++        JsonParser.parseReader(it).asJsonObject
++    }
++
++internal fun examplePolicy(minutes: Int = 45): Policy {
++    val doc = fixture("policy")["policy"].asJsonObject
++    doc["sites"].asJsonObject["video"].asJsonObject.addProperty("budget_min", minutes)
++    return PolicyCodec.decode(doc.toString())
++}
++
++class PolicyMatcherTest {
++    private val vectors = fixture("policy")
++    private val doc = vectors["policy"].asJsonObject
++
++    @Test fun labelBoundariesAndIndependentGroups() {
++        val matcher = PolicyMatcher(PolicyCodec.decode(doc.toString()))
++        for (case in vectors["matches"].asJsonArray.map { it.asJsonObject }) {
++            val open = case["open"].asJsonArray.map { it.asString }.toSet()
++            assertEquals(case.toString(), case["blocked"].asBoolean, matcher.blocks(case["host"].asString, open))
++        }
++    }
++
++    private fun domains(values: List<String>): JsonObject = doc.deepCopy().apply {
++        val site = getAsJsonObject("sites").getAsJsonObject("news")
++        site.add("domains", com.google.gson.JsonArray().also { a -> values.forEach(a::add) })
++    }
++
++    @Test fun normalizedPolicyDomainsAndScope() {
++        for (domain in vectors["valid_domains"].asJsonArray) PolicyCodec.decode(domains(listOf(domain.asString)).toString())
++        for (domain in vectors["invalid_domains"].asJsonArray) invalid(domains(listOf(domain.asString)).toString())
++        invalid(doc.toString().replace("accounts.video.example.org", "other.example.org"))
++    }
++
++    private fun invalid(raw: String, code: String = "INVALID_REQUEST") {
++        assertEquals(raw.take(60), code, assertThrows(PolicyException::class.java) { PolicyCodec.decode(raw) }.code)
++    }
++
++    @Test fun strictJsonAndSchema() {
++        for (field in vectors["invalid_root_fields"].asJsonArray) invalid(doc.deepCopy().apply { addProperty(field.asString, 1) }.toString())
++        val raw = doc.toString()
++        invalid(raw.replace("\"schema\":1", "\"schema\":2"), "UNSUPPORTED_SCHEMA")
++        invalid(raw.replace("\"schema\":1", "\"schema\":1,\"schema\":1"))
++        invalid(raw.replace("\"reset_hour\":4", "\"reset_hour\":3"))
++        invalid(raw.replace("\"video\":{", "\"Video\":{"))
++        invalid(raw.replace("\"budget_min\":45", "\"budget_min\":\"45\""))
++        invalid(raw.replace("\"budget_min\":45", "\"budget_min\":45.0"))
++        invalid(raw.replace("\"budget_min\":45", "\"budget_min\":0"))
++        invalid(raw.replace("\"budget_min\":0", "\"budget_min\":1"))
++        invalid(raw.replace("\"budget_min\":45", "\"budget_min\":45,\"spent\":1"))
++        invalid(raw.replace("\"default_session_min\":15", "\"default_session_min\":1441"))
++        invalid(raw.replace("\"mode\":\"limited\",", ""))
++        invalid(raw + "{}")
++        invalid(raw.replace("\"schema\"", "'schema'"))
++    }
++
++    @Test fun structuredNumbersRequireIntegerTokensWithinRange() {
++        fun withBudget(value: com.google.gson.JsonElement) = doc.deepCopy().apply {
++            getAsJsonObject("sites").getAsJsonObject("video").add("budget_min", value)
++        }
++        assertEquals(45, PolicyCodec.fromJson(withBudget(JsonParser.parseString("45"))).sites.getValue("video").budgetMin)
++        val invalidTokens = listOf("45.0", "45.9", "45e0", "18446744073709551661", "0", "1441", "true", "\"45\"")
++        val invalidValues = invalidTokens.map(JsonParser::parseString) + listOf("+45", "045").map {
++            // Simulate a numeric tree built by another decoder. Strict JSON input cannot contain these tokens.
++            com.google.gson.JsonPrimitive(com.google.gson.internal.LazilyParsedNumber(it))
++        }
++        for (bad in invalidValues) {
++            val error = assertThrows("unexpectedly accepted ${bad.asString}", PolicyException::class.java) { PolicyCodec.fromJson(withBudget(bad)) }
++            assertEquals("INVALID_REQUEST", error.code)
++        }
++    }
++
++    @Test fun canonicalHashAndLimits() {
++        val policy = PolicyCodec.decode(doc.toString())
++        assertEquals(policy, PolicyCodec.decode(PolicyCodec.encode(policy)))
++        assertEquals(vectors["canonical_sha256"].asString, policy.hash)
++        val sites = doc.deepCopy()
++        val groups = sites["sites"].asJsonObject
++        groups.remove("video")
++        val news = groups.remove("news")
++        val limits = vectors["limits"].asJsonObject
++        repeat(limits["groups"].asInt) { groups.add("g$it", news) }
++        PolicyCodec.decode(sites.toString())
++        groups.add("more", news)
++        invalid(sites.toString(), "TOO_LARGE")
++        val entries = List(limits["entries"].asInt - 2) { "x$it.example" }
++        PolicyCodec.decode(domains(entries).toString())
++        invalid(domains(entries + "extra.example").toString(), "TOO_LARGE")
++        val base = List(998) { "a.example" }
++        val target = limits["canonical_bytes"].asInt
++        val padding = target - domains(base).toString().toByteArray().size
++        val exact = base.mapIndexed { index, host ->
++            val extra = padding / base.size + if (index < padding % base.size) 1 else 0
++            "x".repeat(extra - 1) + "." + host
++        }
++        assertEquals(target, PolicyCodec.encode(PolicyCodec.decode(domains(exact).toString())).toByteArray().size)
++        invalid(domains(exact.toMutableList().also { it[0] = "x" + it[0] }).toString(), "TOO_LARGE")
++        val large = domains(entries.map { "x".repeat(60) + "." + it })
++        assertTrue(large.toString().toByteArray().size > limits["canonical_bytes"].asInt)
++        invalid(large.toString(), "TOO_LARGE")
++    }
++}
+diff --git a/app/src/test/java/com/celzero/bravedns/stopscroll/StateStoreTest.kt b/app/src/test/java/com/celzero/bravedns/stopscroll/StateStoreTest.kt
+new file mode 100644
+index 0000000..af21973
+--- /dev/null
++++ b/app/src/test/java/com/celzero/bravedns/stopscroll/StateStoreTest.kt
+@@ -0,0 +1,105 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import java.io.File
++import java.io.IOException
++import java.time.ZoneId
++import java.util.concurrent.Executors
++import org.junit.Assert.*
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [33], manifest = Config.NONE)
++class StateStoreTest {
++    @get:Rule val folder = TemporaryFolder()
++    private val clock = ClockSample(1783850400000, 7000, 12)
++    private val initial get() = JournalState.initial(ZoneId.of("Europe/Belgrade"), clock, examplePolicy())
++    private val file get() = File(folder.root, "stopscroll/state.json")
++
++    @Test fun reloadAndOnlyReturnGrantAfterVerifiedSave() {
++        val store = StateStore(file)
++        assertEquals(initial, store.loadOrCreate { initial })
++        val granted = store.update { BudgetEngine(it).open("video", 600, clock) }
++        assertEquals(listOf(EffectKind.OPEN), granted.effects.map { it.kind })
++        val restart = StateStore(file).loadOrCreate { error("unexpected initialization") }
++        assertEquals(granted.state, restart)
++        assertEquals(600, BudgetEngine(restart).snapshot(clock).sites.getValue("video").reservedSeconds)
++    }
++
++    @Test fun failedWriteAndSilentRenameFailureBothKeepOldBudgetAndNoGrant() {
++        val store = StateStore(file)
++        store.loadOrCreate { initial }
++        for ((expected, fault) in listOf<Pair<String, () -> Unit>>(
++            "injected write failure" to { throw IOException("injected write failure") },
++            "Journal commit did not publish expected bytes" to {
++            // Android 13 AtomicFile.finishWrite logs a failed rename and returns normally.
++            assertTrue(File(file.path + ".new").delete())
++        })) {
++            val broken = StateStore(file, beforeFinish = fault)
++            val grants = mutableListOf<Effect>()
++            val failure = assertThrows(IOException::class.java) {
++                grants.addAll(broken.update { BudgetEngine(it).open("video", 120, clock) }.effects)
++            }
++            assertEquals(expected, failure.cause?.message)
++            assertTrue(grants.isEmpty())
++            assertEquals(initial, store.read())
++        }
++    }
++
++    @Test fun corruptionAndOrphanedFirstWriteNeverInitializeEmpty() {
++        file.parentFile!!.mkdirs()
++        file.writeText("corrupt")
++        File(file.path + ".bak").writeText("also corrupt")
++        val store = StateStore(file)
++        assertThrows(IOException::class.java) { store.loadOrCreate { error("unexpected initialization") } }
++        assertThrows(IOException::class.java) { store.update { BudgetEngine(it).open("video", 60, clock) } }
++        file.delete()
++        File(file.path + ".new").writeBytes(JournalCodec.encode(initial))
++        assertThrows(IOException::class.java) { store.loadOrCreate { error("unexpected initialization") } }
++    }
++
++    @Test fun serializesConcurrentReservations() {
++        val store = StateStore(file)
++        store.loadOrCreate { initial }
++        val pool = Executors.newFixedThreadPool(4)
++        try {
++            val results = (1..8).map { pool.submit<Transition> { store.update { BudgetEngine(it).open("video", 60, clock) } } }.map { it.get() }
++            assertEquals(1, results.count { it.error == null })
++            assertEquals(7, results.count { it.error == "SESSION_ACTIVE" })
++            assertEquals(1L, store.read().revision)
++        } finally {
++            pool.shutdownNow()
++        }
++    }
++
++    @Test fun validLegacyBackupAndCorruptedButParseablePrimary() {
++        val store = StateStore(file)
++        store.loadOrCreate { initial }
++        val good = file.readText()
++        file.writeText(good.replace("\"spent\":0", "\"spent\":5"))
++        assertThrows(IOException::class.java) { store.read() }
++        File(file.path + ".bak").writeText(good)
++        assertEquals(initial, store.read())
++    }
++
++    @Test fun retainsOnlyLast64ReceiptsAcrossRestartAndRollover() {
++        val store = StateStore(file)
++        store.loadOrCreate { initial }
++        val replies = (1..65).map {
++            MutationReceipt(java.util.UUID(0, it.toLong()).toString(), "a".repeat(64), "{\"n\":$it}")
++        }
++        store.update { state -> Transition(replies.fold(state) { s, r -> s.withReceipt(r) }, emptyList()) }
++        assertEquals(replies.drop(1), StateStore(file).read().receipts)
++        val next = store.update { BudgetEngine(it).tick(clock.copy(wallMs = clock.wallMs + 86400000)) }
++        assertEquals(replies.drop(1), next.state.receipts)
++        assertThrows(IOException::class.java) {
++            store.update { Transition(it.withReceipt(replies.first().copy(replyJson = "x".repeat(96 * 1024 + 1))), emptyList()) }
++        }
++        assertEquals(replies.drop(1), store.read().receipts)
++    }
++}
+diff --git a/app/src/test/java/com/celzero/bravedns/tunnel/TunDnsManagerTest.kt b/app/src/test/java/com/celzero/bravedns/tunnel/TunDnsManagerTest.kt
+index a5cd01e..3ed77f1 100644
+--- a/app/src/test/java/com/celzero/bravedns/tunnel/TunDnsManagerTest.kt
++++ b/app/src/test/java/com/celzero/bravedns/tunnel/TunDnsManagerTest.kt
+@@ -15,6 +15,8 @@
+  */
+ package com.celzero.bravedns.tunnel
+
++import com.celzero.bravedns.BuildConfig
++import com.celzero.bravedns.stopscroll.G0Vpn
+ import android.app.KeyguardManager
+ import android.net.ConnectivityManager
+ import com.celzero.bravedns.data.AppConfig
+@@ -971,6 +973,16 @@ class TunDnsManagerTest {
+
+     // region handleOnQuery - captive portal tests
+
++    private fun assertPinnedResolver(opts: DNSOpts) {
++        assertEquals("https://cloudflare-dns.com/dns-query", G0Vpn.resolverUrl)
++        // DNSOpts is a JNI mock: verify its setters, including the absence of a secondary
++        // transport or a blocklist bypass, instead of reading its relaxed default getters.
++        verifySequence {
++            opts.uid = "10123"
++            opts.tidcsv = "${Backend.Preferred}:${Backend.Base}"
++        }
++    }
++
+     private fun createQueryParams(
+         isCaptivePortal: Boolean,
+         uidStr: String = "10123",
+@@ -994,6 +1006,7 @@ class TunDnsManagerTest {
+         every { persistentState.getAllowedDnsRecordTypesAsEnum() } returns setOf(ResourceRecordTypes.A)
+
+         val opts = TunDnsManager.handleOnQuery(createQueryParams(isCaptivePortal = true))
++        if (BuildConfig.STOPSCROLL_G0) return@runTest assertPinnedResolver(opts)
+
+         assertTrue(opts.tidcsv.contains(Backend.System))
+         assertTrue(opts.noblock)
+@@ -1008,6 +1021,7 @@ class TunDnsManagerTest {
+         every { persistentState.getAllowedDnsRecordTypesAsEnum() } returns setOf(ResourceRecordTypes.A)
+
+         val opts = TunDnsManager.handleOnQuery(createQueryParams(isCaptivePortal = false))
++        if (BuildConfig.STOPSCROLL_G0) return@runTest assertPinnedResolver(opts)
+
+         assertFalse(opts.tidcsv.contains(Backend.System))
+         assertTrue(opts.tidcsv.contains(Backend.Preferred))
+@@ -1021,6 +1035,7 @@ class TunDnsManagerTest {
+
+         // qtype 28 (AAAA) is not in the allowed set, so even captive queries get blocked
+         val opts = TunDnsManager.handleOnQuery(createQueryParams(isCaptivePortal = true, qtype = 28L))
++        if (BuildConfig.STOPSCROLL_G0) return@runTest assertPinnedResolver(opts)
+
+         assertTrue(opts.tidcsv.contains(Backend.BlockAll))
+         assertFalse(opts.noblock)
 diff --git a/gradle/wrapper/gradle-wrapper.properties b/gradle/wrapper/gradle-wrapper.properties
 index eb84db6..906dbb9 100644
 --- a/gradle/wrapper/gradle-wrapper.properties
