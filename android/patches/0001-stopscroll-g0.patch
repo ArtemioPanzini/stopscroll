@@ -2227,66 +2227,322 @@ index 0000000..49287a1
 +        private const val REQUEST_VPN = 1
 +    }
 +}
-diff --git a/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProvider.kt b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProvider.kt
+diff --git a/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/RpcCodec.kt b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/RpcCodec.kt
 new file mode 100644
-index 0000000..84067fa
+index 0000000..ad09613
 --- /dev/null
-+++ b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProvider.kt
-@@ -0,0 +1,55 @@
++++ b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/RpcCodec.kt
+@@ -0,0 +1,159 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package com.celzero.bravedns.stopscroll
 +
-+import android.content.ContentProvider
-+import android.content.ContentValues
-+import android.database.Cursor
-+import android.net.Uri
-+import android.os.Binder
-+import android.os.Bundle
-+import android.util.Base64
-+import org.json.JSONObject
++import com.google.gson.JsonElement
++import com.google.gson.JsonNull
++import com.google.gson.JsonObject
 +import java.nio.ByteBuffer
++import java.nio.charset.CharacterCodingException
++import kotlin.io.encoding.Base64
 +
-+/** Read-only transition probe until the schema-1 transport is installed. */
-+class UsbControlProvider : ContentProvider() {
-+    override fun onCreate() = true
-+    override fun call(method: String, arg: String?, extras: Bundle?): Bundle {
-+        requireShell()
-+        require(method == "rpc")
-+        val request = decode(arg)
-+        require(request.length() == 1 && request.getString("op") == "status")
-+        val id = java.util.UUID.randomUUID().toString()
-+        val reply = G0Vpn.controller.execute(RpcRequest(id, "status", com.google.gson.JsonObject()))
-+        return Bundle().apply {
-+            putString("result_b64", Base64.encodeToString(reply.json.toString().toByteArray(), Base64.NO_WRAP))
++internal class RpcDecodeException(val code: String, val requestId: String, message: String) :
++    IllegalArgumentException(message)
++
++internal object RpcCodec {
++    const val MAX_BYTES = 96 * 1024
++    const val MAX_ENCODED_CHARS = (MAX_BYTES + 2) / 3 * 4
++    const val UNAVAILABLE_REQUEST_ID = "00000000-0000-0000-0000-000000000000"
++
++    private val uuid = Regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
++    private val errorCode = Regex("[A-Z][A-Z0-9_]{0,63}")
++
++    fun decodeRequest(arg: String?): RpcRequest {
++        var id = UNAVAILABLE_REQUEST_ID
++        try {
++            val root = strictJson(decodeText(arg)).obj()
++            val candidate = root["request_id"]
++            val hasCanonicalId = candidate != null && candidate.isJsonPrimitive &&
++                candidate.asJsonPrimitive.isString && uuid.matches(candidate.asString)
++            if (hasCanonicalId) id = candidate.asString
++            root.requireUnicodeScalars()
++            if (!hasCanonicalId) invalid("Expected canonical request UUID")
++            val schema = root["schema"]?.number(0, Long.MAX_VALUE) ?: invalid("Missing RPC schema")
++            if (schema != 1L) throw PolicyException("UNSUPPORTED_SCHEMA", "RPC schema must be 1")
++
++            val op = root["op"]?.string() ?: invalid("Missing operation")
++            val mutation = when (op) {
++                "status", "policy.get" -> false
++                "policy.replace", "session.open", "session.close" -> true
++                else -> invalid("Unknown operation")
++            }
++            val revision = if (mutation) {
++                root.fields("schema", "request_id", "op", "args", "expected_revision")
++                root["expected_revision"].number(0, Long.MAX_VALUE)
++            } else {
++                root.fields("schema", "request_id", "op", "args")
++                null
++            }
++
++            val args = root["args"].obj()
++            when (op) {
++                "status", "policy.get" -> args.fields()
++                "policy.replace" -> {
++                    args.fields("policy")
++                    PolicyCodec.fromJson(args["policy"])
++                }
++                "session.open", "session.close" -> {
++                    if (op == "session.open") {
++                        args.fields("site", "minutes")
++                        args["minutes"].takeUnless { it.isJsonNull }?.number(1, 1440)
++                    } else {
++                        args.fields("site")
++                    }
++                    if (!siteId.matches(args["site"].string())) invalid("Invalid site ID")
++                }
++            }
++            return RpcRequest(id, op, args, revision)
++        } catch (e: PolicyException) {
++            throw RpcDecodeException(e.code, id, e.message ?: e.code)
 +        }
 +    }
 +
-+    private fun decode(arg: String?): JSONObject {
-+        val encoded = requireNotNull(arg)
-+        require(encoded.length <= REQUEST_LIMIT / 3 * 4)
-+        val decoded = Base64.decode(encoded, Base64.NO_WRAP)
-+        require(decoded.size <= REQUEST_LIMIT)
-+        return JSONObject(Charsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(decoded)).toString())
++    private fun decodeText(arg: String?): String {
++        if (arg.isNullOrEmpty()) invalid("Missing Base64 request")
++        if (arg.length > MAX_ENCODED_CHARS) oversized("Encoded request exceeds the RPC limit")
++        val bytes = try {
++            Base64.decode(arg)
++        } catch (_: IllegalArgumentException) {
++            invalid("Expected canonical Base64")
++        }
++        if (bytes.size > MAX_BYTES) oversized("Request exceeds 96 KiB")
++        if (Base64.encode(bytes) != arg) invalid("Expected canonical Base64")
++        val text = try {
++            Charsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString()
++        } catch (_: CharacterCodingException) {
++            invalid("Expected UTF-8")
++        }
++        if (text.startsWith('\uFEFF')) invalid("Unexpected JSON byte order mark")
++        return text
 +    }
 +
-+    private fun requireShell(): Int = Binder.getCallingUid().also {
-+        if (it != 2_000) throw SecurityException("Stopscroll USB control requires shell UID 2000")
++    fun encodeReply(requestId: String, reply: JsonObject): String {
++        val ok = reply["ok"]?.strictBoolean() ?: invalid("Missing reply outcome")
++        val envelope = arrayOf("schema", "request_id", "ok", "revision", "applied_revision")
++        if (ok) {
++            reply.fields(*envelope, "data")
++            reply["data"].obj()
++        } else {
++            val saved = reply.has("saved")
++            if (saved) reply.fields(*envelope, "error", "saved") else reply.fields(*envelope, "error")
++            val error = reply["error"].obj()
++            error.fields("code", "message")
++            val code = error["code"].string()
++            if (!errorCode.matches(code)) invalid("Invalid reply error code")
++            error["message"].string()
++            if (saved && (code != "APPLY_FAILED" || !reply["saved"].strictBoolean())) {
++                invalid("Invalid reply saved flag")
++            }
++        }
++        reply["schema"].number(1, 1)
++        if (reply["request_id"].string() != requestId || !uuid.matches(requestId)) invalid("Invalid reply request ID")
++        reply["revision"].number(0, Long.MAX_VALUE)
++        reply["applied_revision"].takeUnless { it.isJsonNull }?.number(0, Long.MAX_VALUE)
++        reply.requireUnicodeScalars()
++        val bytes = reply.toString().toByteArray()
++        if (bytes.size > MAX_BYTES) oversized("Reply exceeds 96 KiB")
++        return Base64.encode(bytes)
 +    }
++
++    // Revision zero is an unavailable-state placeholder. Decoding failures never query the controller.
++    fun encodeFailure(requestId: String, code: String, message: String, revision: Long = 0): String =
++        encodeReply(requestId, JsonObject().apply {
++            addProperty("schema", 1)
++            addProperty("request_id", requestId)
++            addProperty("ok", false)
++            addProperty("revision", revision)
++            add("applied_revision", JsonNull.INSTANCE)
++            add("error", JsonObject().apply {
++                addProperty("code", code)
++                addProperty("message", message)
++            })
++        })
++
++    private fun JsonElement.strictBoolean(): Boolean =
++        if (isJsonPrimitive && asJsonPrimitive.isBoolean) asBoolean else invalid("Expected boolean")
++
++    private fun JsonElement.requireUnicodeScalars() {
++        when {
++            isJsonObject -> asJsonObject.entrySet().forEach { (name, value) ->
++                name.requireUnicodeScalars()
++                value.requireUnicodeScalars()
++            }
++            isJsonArray -> asJsonArray.forEach { it.requireUnicodeScalars() }
++            isJsonPrimitive && asJsonPrimitive.isString -> asString.requireUnicodeScalars()
++        }
++    }
++
++    private fun String.requireUnicodeScalars() {
++        var i = 0
++        while (i < length) {
++            val unit = this[i++]
++            when {
++                unit.isHighSurrogate() -> {
++                    if (i == length || !this[i++].isLowSurrogate()) invalid("Expected Unicode scalar strings")
++                }
++                unit.isLowSurrogate() -> invalid("Expected Unicode scalar strings")
++            }
++        }
++    }
++}
+diff --git a/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/ShellCallProvider.java b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/ShellCallProvider.java
+new file mode 100644
+index 0000000..91bf00b
+--- /dev/null
++++ b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/ShellCallProvider.java
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll;
++
++import android.content.ContentProvider;
++import android.os.Binder;
++import android.os.Bundle;
++
++/** The Binder identity check precedes even a null method received from IPC. */
++public abstract class ShellCallProvider extends ContentProvider {
++    @Override
++    public final Bundle call(String method, String arg, Bundle extras) {
++        requireShell();
++        return callFromShell(method, arg);
++    }
++
++    @Override
++    public final Bundle call(String authority, String method, String arg, Bundle extras) {
++        requireShell();
++        if (authority == null) {
++            throw new UnsupportedOperationException("Missing provider authority");
++        }
++        return callFromShell(method, arg);
++    }
++
++    protected abstract Bundle callFromShell(String method, String arg);
++
++    protected static void requireShell() {
++        if (Binder.getCallingUid() != 2000) {
++            throw new SecurityException("ADB shell required");
++        }
++    }
++}
+diff --git a/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProvider.kt b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProvider.kt
+new file mode 100644
+index 0000000..0fd7170
+--- /dev/null
++++ b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProvider.kt
+@@ -0,0 +1,108 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import android.content.ContentProviderOperation
++import android.content.ContentProviderResult
++import android.content.ContentValues
++import android.content.res.AssetFileDescriptor
++import android.database.Cursor
++import android.net.Uri
++import android.os.Bundle
++import android.os.CancellationSignal
++import android.os.ParcelFileDescriptor
++
++/** The only exposed operation is a schema-1 RPC from the Android shell UID. */
++class UsbControlProvider internal constructor(
++    private val execute: (RpcRequest) -> RpcReply
++) : ShellCallProvider() {
++    constructor() : this({ request -> G0Vpn.controller.execute(request) })
++
++    override fun onCreate() = true
++
++    override fun callFromShell(method: String?, arg: String?): Bundle {
++        if (method != "rpc") throw UnsupportedOperationException("Stopscroll supports the rpc call only")
++        val request = try {
++            RpcCodec.decodeRequest(arg)
++        } catch (e: RpcDecodeException) {
++            return result(RpcCodec.encodeFailure(e.requestId, e.code, e.message ?: e.code))
++        }
++
++        val reply = execute(request)
++        val encoded = try {
++            RpcCodec.encodeReply(request.requestId, reply.json)
++        } catch (e: PolicyException) {
++            if (e.code == "TOO_LARGE") {
++                // Size is checked after validating the envelope and its saved revision.
++                RpcCodec.encodeFailure(request.requestId, e.code, "Reply exceeds 96 KiB", reply.json["revision"].asLong)
++            } else {
++                RpcCodec.encodeFailure(request.requestId, "INVALID_RESPONSE", "Unable to encode the Stopscroll reply")
++            }
++        }
++        return result(encoded)
++    }
++
++    private fun result(encoded: String) = Bundle().apply { putString("result_b64", encoded) }
 +
 +    private fun unsupported(): Nothing {
 +        requireShell()
-+        throw UnsupportedOperationException("Stopscroll supports content call only")
++        throw UnsupportedOperationException("Stopscroll supports the rpc call only")
 +    }
 +
-+    override fun query(uri: Uri, projection: Array<out String>?, selection: String?, selectionArgs: Array<out String>?, sortOrder: String?): Cursor? = unsupported()
++    override fun query(
++        uri: Uri, projection: Array<out String>?, selection: String?,
++        selectionArgs: Array<out String>?, sortOrder: String?
++    ): Cursor? = unsupported()
++
++    override fun query(
++        uri: Uri, projection: Array<out String>?, selection: String?,
++        selectionArgs: Array<out String>?, sortOrder: String?, cancellationSignal: CancellationSignal?
++    ): Cursor? = unsupported()
++
++    override fun query(
++        uri: Uri, projection: Array<out String>?, queryArgs: Bundle?, cancellationSignal: CancellationSignal?
++    ): Cursor? = unsupported()
++
 +    override fun getType(uri: Uri): String? = unsupported()
++    override fun getTypeAnonymous(uri: Uri): String? = unsupported()
 +    override fun insert(uri: Uri, values: ContentValues?): Uri? = unsupported()
-+    override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = unsupported()
-+    override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = unsupported()
++    override fun insert(uri: Uri, values: ContentValues?, extras: Bundle?): Uri? = unsupported()
++    override fun bulkInsert(uri: Uri, values: Array<out ContentValues>): Int = unsupported()
 +
-+    companion object {
-+        private const val REQUEST_LIMIT = 96 * 1024
-+    }
++    override fun update(
++        uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?
++    ): Int = unsupported()
++
++    override fun update(uri: Uri, values: ContentValues?, extras: Bundle?): Int = unsupported()
++    override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = unsupported()
++    override fun delete(uri: Uri, extras: Bundle?): Int = unsupported()
++
++    override fun applyBatch(operations: ArrayList<ContentProviderOperation>): Array<ContentProviderResult> = unsupported()
++
++    override fun applyBatch(
++        authority: String, operations: ArrayList<ContentProviderOperation>
++    ): Array<ContentProviderResult> = unsupported()
++
++    override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor = unsupported()
++
++    override fun openFile(
++        uri: Uri, mode: String, signal: CancellationSignal?
++    ): ParcelFileDescriptor = unsupported()
++
++    override fun openAssetFile(uri: Uri, mode: String): AssetFileDescriptor = unsupported()
++
++    override fun openAssetFile(
++        uri: Uri, mode: String, signal: CancellationSignal?
++    ): AssetFileDescriptor = unsupported()
++
++    override fun openTypedAssetFile(uri: Uri, mimeTypeFilter: String, opts: Bundle?): AssetFileDescriptor =
++        unsupported()
++
++    override fun openTypedAssetFile(
++        uri: Uri, mimeTypeFilter: String, opts: Bundle?, signal: CancellationSignal?
++    ): AssetFileDescriptor = unsupported()
++
++    override fun getStreamTypes(uri: Uri, mimeTypeFilter: String): Array<String>? = unsupported()
++    override fun canonicalize(uri: Uri): Uri? = unsupported()
++    override fun uncanonicalize(uri: Uri): Uri? = unsupported()
++    override fun refresh(uri: Uri, args: Bundle?, signal: CancellationSignal?): Boolean = unsupported()
 +}
 diff --git a/app/src/stopscrollRelease/keepRules/stopscroll.keep b/app/src/stopscrollRelease/keepRules/stopscroll.keep
 new file mode 100644
@@ -3552,6 +3808,529 @@ index a5cd01e..3ed77f1 100644
 
          assertTrue(opts.tidcsv.contains(Backend.BlockAll))
          assertFalse(opts.noblock)
+diff --git a/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/RpcCodecTest.kt b/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/RpcCodecTest.kt
+new file mode 100644
+index 0000000..ebec488
+--- /dev/null
++++ b/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/RpcCodecTest.kt
+@@ -0,0 +1,263 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import com.google.gson.JsonNull
++import com.google.gson.JsonObject
++import kotlin.io.encoding.Base64
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertThrows
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class RpcCodecTest {
++    private val id = "12345678-90ab-4def-8123-456789abcdef"
++    private val policy = """
++        {"schema":1,"reset_hour":4,"default_session_min":15,"sites":{
++            "video":{"mode":"limited","budget_min":45,"domains":["video.example.org"],
++                "exceptions":["safe.video.example.org"]}
++        }}
++    """.trimIndent()
++
++    private fun request(
++        op: String = "status",
++        args: String = "{}",
++        revision: String? = null,
++        schema: String = "1",
++        requestId: String = id
++    ): String {
++        val expected = revision?.let { ""","expected_revision":$it""" }.orEmpty()
++        return """{"schema":$schema,"request_id":"$requestId","op":"$op","args":$args$expected}"""
++    }
++
++    private fun encode(raw: String) = Base64.encode(raw.toByteArray())
++    private fun decode(raw: String) = RpcCodec.decodeRequest(encode(raw))
++
++    private fun rejects(raw: String, code: String = "INVALID_REQUEST"): RpcDecodeException =
++        assertThrows(raw.take(160), RpcDecodeException::class.java) { decode(raw) }.also {
++            assertEquals(code, it.code)
++        }
++
++    @Test fun acceptsOnlyTheFiveSchemaOneOperations() {
++        for (op in listOf("status", "policy.get")) {
++            val read = decode(request(op))
++            assertEquals(id, read.requestId)
++            assertEquals(op, read.op)
++            assertEquals(0, read.args.size())
++            assertNull(read.expectedRevision)
++        }
++        val replace = decode(request("policy.replace", """{"policy":$policy}""", "0"))
++        assertEquals("policy.replace", replace.op)
++        assertEquals(0L, replace.expectedRevision)
++        assertEquals(45, PolicyCodec.fromJson(replace.args["policy"]).sites.getValue("video").budgetMin)
++        val openDefault = decode(request("session.open", """{"site":"video","minutes":null}""", "1"))
++        assertEquals("video", openDefault.args["site"].asString)
++        assertEquals(JsonNull.INSTANCE, openDefault.args["minutes"])
++        val openExplicit = decode(request("session.open", """{"minutes":1440,"site":"video"}""", "2"))
++        assertEquals(1440, openExplicit.args["minutes"].asInt)
++        val close = decode(request("session.close", """{"site":"video"}""", Long.MAX_VALUE.toString()))
++        assertEquals("session.close", close.op)
++        assertEquals(Long.MAX_VALUE, close.expectedRevision)
++    }
++
++    @Test fun rejectsBadBase64IncludingAlternativeRepresentationsOfTheSameBytes() {
++        val padded = request() + " ".repeat((1 - request().length % 3 + 3) % 3)
++        val canonical = encode(padded)
++        assertTrue(canonical.endsWith("=="))
++        val lastDataIndex = canonical.length - 3
++        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
++        val alternatePadBits = canonical.replaceRange(
++            lastDataIndex, lastDataIndex + 1, alphabet[alphabet.indexOf(canonical[lastDataIndex]) + 1].toString()
++        )
++        val withWhitespace = " " + encode(request())
++        for (encoded in listOf(null, "", "abc!", "_w==", "Zg===", "Zg=", "Zg", "$canonical\n",
++            canonical.dropLast(2), alternatePadBits, withWhitespace)) {
++            val error = assertThrows(RpcDecodeException::class.java) { RpcCodec.decodeRequest(encoded) }
++            assertEquals("INVALID_REQUEST", error.code)
++            assertEquals(RpcCodec.UNAVAILABLE_REQUEST_ID, error.requestId)
++        }
++    }
++
++    @Test fun checksByteAndEncodedBounds() {
++        val exact = request().padEnd(RpcCodec.MAX_BYTES)
++        val exactEncoded = encode(exact)
++        assertEquals(RpcCodec.MAX_ENCODED_CHARS, exactEncoded.length)
++        assertEquals(id, RpcCodec.decodeRequest(exactEncoded).requestId)
++
++        val extraByte = Base64.encode(ByteArray(RpcCodec.MAX_BYTES + 1))
++        for (encoded in listOf(extraByte, "!".repeat(RpcCodec.MAX_ENCODED_CHARS + 1))) {
++            val error = assertThrows(RpcDecodeException::class.java) { RpcCodec.decodeRequest(encoded) }
++            assertEquals("TOO_LARGE", error.code)
++        }
++    }
++
++    @Test fun rejectsNonUtf8AndUtf8SurrogateEncoding() {
++        val prefix = """{"bad":"""".toByteArray()
++        val suffix = """"}""".toByteArray()
++        for (bytes in listOf(
++            byteArrayOf(0xc0.toByte(), 0xaf.toByte()),
++            byteArrayOf(0xe2.toByte(), 0x82.toByte()),
++            byteArrayOf(0xed.toByte(), 0xa0.toByte(), 0x80.toByte())
++        )) {
++            val error = assertThrows(RpcDecodeException::class.java) {
++                RpcCodec.decodeRequest(Base64.encode(prefix + bytes + suffix))
++            }
++            assertEquals("Expected UTF-8", error.message)
++        }
++    }
++
++    @Test fun rejectsMalformedTrailingDuplicateAndDeepJson() {
++        val duplicates = listOf(
++            request().replaceFirst("}", """},"request_id":"$id""""),
++            request().replaceFirst("}", """},"\u0072equest_id":"$id""""),
++            request(args = """{"x":{"site":"video","site":"video"}}"""),
++            request("policy.replace", """{"policy":${policy.replace("\"schema\":1", "\"schema\":1,\"schema\":1")}}""", "0")
++        )
++        for (raw in duplicates) assertEquals("Repeated JSON field", rejects(raw).message)
++        val deep = "[".repeat(30) + "0" + "]".repeat(30)
++        assertEquals("JSON nesting is too deep", rejects(request(args = """{"x":$deep}""")).message)
++        for (raw in listOf("", "\uFEFF${request()}", "{", "null", "[]", "${request()} {}", request().replace("\"status\"", "'status'"),
++            request().replace("\"status\"", "\"sta\ntus\""), request().replace("\"status\"", "\"sta\u0000tus\""),
++            request().replace("\"args\":{}", "\"args\":{/*comment*/}"), request().dropLast(1) + ",}")) {
++            rejects(raw)
++        }
++    }
++
++    @Test fun rejectsLoneSurrogatesInNamesAndValuesAndAcceptsPairsAtTheUnicodeLayer() {
++        val loneHigh = rejects(request("session.close", """{"site":"\uD800"}""", "0"))
++        val loneLow = rejects(request(args = """{"\uDC00":null}"""))
++        assertEquals("Expected Unicode scalar strings", loneHigh.message)
++        assertEquals("Expected Unicode scalar strings", loneLow.message)
++        for (pair in listOf("\\uD83D\\uDE00", "😀")) {
++            val result = rejects(request("session.close", """{"site":"$pair"}""", "0"))
++            assertEquals("Invalid site ID", result.message)
++        }
++    }
++
++    @Test fun verifiesEnvelopeAndRetainsOnlyCanonicalIdsForErrors() {
++        for (raw in listOf(
++            request().replace("\"schema\":1,", ""),
++            request().replace("\"request_id\":\"$id\",", ""),
++            request().replace("\"op\":\"status\",", ""),
++            request().replace(",\"args\":{}", ""),
++            request().dropLast(1) + ""","extra":null}""",
++            request().replace("\"op\":\"status\"", "\"op\":true"),
++            request(args = "null"),
++            request(args = "[]")
++        )) rejects(raw)
++        val error = rejects(request("status", """{"extra":null}"""))
++        assertEquals(id, error.requestId)
++        for (badId in listOf("", id.uppercase(), "1-1-1-1-1", "{$id}", "$id ")) {
++            assertEquals(RpcCodec.UNAVAILABLE_REQUEST_ID, rejects(request(requestId = badId)).requestId)
++        }
++        assertEquals(RpcCodec.UNAVAILABLE_REQUEST_ID, rejects(request().replace("\"$id\"", "1")).requestId)
++        for (op in listOf("Status", "legacy.get", "set-alg", "doctor", "status\u0000", "")) {
++            rejects(request(op))
++        }
++    }
++
++    @Test fun requiresStrictIntegerSchemaAndRevisions() {
++        for (schema in listOf("0", "2", Long.MAX_VALUE.toString())) {
++            assertEquals(id, rejects(request(schema = schema), "UNSUPPORTED_SCHEMA").requestId)
++        }
++        for (schema in listOf("-1", "true", "\"1\"", "1.0", "1e0", "9223372036854775808")) {
++            rejects(request(schema = schema))
++        }
++        val closeArgs = """{"site":"video"}"""
++        for (rev in listOf(null, "-1", "true", "null", "\"1\"", "1.0", "1e0", "1E+0", "9223372036854775808")) {
++            rejects(request("session.close", closeArgs, rev))
++        }
++        rejects(request(revision = "0"))
++        rejects(request("policy.get", revision = "null"))
++    }
++
++    @Test fun validatesArgumentsBeforeControllerDispatch() {
++        for (op in listOf("status", "policy.get")) rejects(request(op, """{"extra":null}"""))
++        for (args in listOf("{}", """{"site":"Video"}""", """{"site":1}""", """{"site":"video","minutes":1}""")) {
++            rejects(request("session.close", args, "0"))
++        }
++        for (minutes in listOf("0", "1441", "-1", "true", "\"1\"", "1.0", "1e0", "9223372036854775808")) {
++            rejects(request("session.open", """{"site":"video","minutes":$minutes}""", "0"))
++        }
++        rejects(request("session.open", """{"site":"video"}""", "0"))
++        rejects(request("session.open", """{"site":"video","minutes":1,"extra":null}""", "0"))
++        rejects(request("session.open", """{"site":"bad-id","minutes":null}""", "0"))
++        rejects(request("policy.replace", "{}", "0"))
++        rejects(request("policy.replace", """{"policy":null}""", "0"))
++        rejects(request("policy.replace", """{"policy":$policy,"extra":null}""", "0"))
++        rejects(request("policy.replace", """{"policy":${policy.replace("45", "45e0")}}""", "0"))
++        rejects(request("policy.replace", """{"policy":${policy.replace("45", "45.0")}}""", "0"))
++        rejects(request("policy.replace", """{"policy":${policy.replace("safe.video.example.org", "other.example.org")}}""", "0"))
++    }
++
++    @Test fun checksCanonicalPolicyByteLimitInsideTheRequest() {
++        val domains = (0..599).joinToString(",") {
++            "\"domain$it.${"a".repeat(48)}.${"b".repeat(48)}.example.org\""
++        }
++        val bigPolicy = """
++            {"schema":1,"reset_hour":4,"default_session_min":15,"sites":{
++                "video":{"mode":"blocked","budget_min":0,"domains":[$domains],"exceptions":[]}
++            }}
++        """.trimIndent()
++        val raw = request("policy.replace", """{"policy":$bigPolicy}""", "0")
++        assertTrue(raw.toByteArray().size in (PolicyCodec.MAX_BYTES + 1)..RpcCodec.MAX_BYTES)
++        assertEquals(id, rejects(raw, "TOO_LARGE").requestId)
++    }
++
++    @Test fun validatesAndEncodesRepliesWithRealUtf8AndUnprovedAppliedRevision() {
++        val data = JsonObject().apply { addProperty("diagnostic", "😀") }
++        val reply = JsonObject().apply {
++            addProperty("schema", 1)
++            addProperty("request_id", id)
++            addProperty("ok", true)
++            addProperty("revision", 8)
++            add("applied_revision", JsonNull.INSTANCE)
++            add("data", data)
++        }
++        val encoded = RpcCodec.encodeReply(id, reply)
++        val parsed = strictJson(Base64.decode(encoded).decodeToString()).obj()
++        assertEquals("😀", parsed["data"].asJsonObject["diagnostic"].asString)
++        assertEquals(encoded, Base64.encode(Base64.decode(encoded)))
++        assertEquals(JsonNull.INSTANCE, parsed["applied_revision"])
++
++        data.addProperty("diagnostic", "\uD800")
++        assertThrows(PolicyException::class.java) { RpcCodec.encodeReply(id, reply) }
++        data.addProperty("diagnostic", "😀".repeat(RpcCodec.MAX_BYTES / 4))
++        val oversized = assertThrows(PolicyException::class.java) { RpcCodec.encodeReply(id, reply) }
++        assertEquals("TOO_LARGE", oversized.code)
++
++        val fallback = strictJson(Base64.decode(RpcCodec.encodeFailure(id, "TOO_LARGE", "Reply is too large"))
++            .decodeToString()).obj()
++        assertEquals(setOf("schema", "request_id", "ok", "revision", "applied_revision", "error"), fallback.keySet())
++        assertEquals(id, fallback["request_id"].asString)
++        assertEquals(0L, fallback["revision"].asLong)
++        assertEquals(JsonNull.INSTANCE, fallback["applied_revision"])
++        assertFalse(fallback["ok"].asBoolean)
++    }
++
++    @Test fun acceptsSavedOnlyOnAnApplyFailureAndRejectsReplyEnvelopeCoercion() {
++        val failure = strictJson(Base64.decode(RpcCodec.encodeFailure(id, "APPLY_FAILED", "Failed", 9))
++            .decodeToString()).obj()
++        failure.addProperty("saved", true)
++        val encoded = RpcCodec.encodeReply(id, failure)
++        assertEquals(failure, strictJson(Base64.decode(encoded).decodeToString()))
++        val mutations: List<(JsonObject) -> Unit> = listOf(
++            { it.addProperty("saved", false) },
++            { it.addProperty("saved", "true") },
++            { it["error"].asJsonObject.addProperty("code", "CONFLICT") },
++            { it["error"].asJsonObject.addProperty("code", "lowercase") },
++            { it["error"].asJsonObject.addProperty("extra", true) },
++            { it.addProperty("ok", "false") },
++            { it.addProperty("schema", "1") },
++            { it.addProperty("revision", 9.0) },
++            { it.remove("applied_revision") },
++            { it.add("data", JsonObject()) }
++        )
++        for (mutate in mutations) {
++            val invalid = failure.deepCopy()
++            mutate(invalid)
++            assertThrows(PolicyException::class.java) { RpcCodec.encodeReply(id, invalid) }
++        }
++    }
++}
+diff --git a/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProviderTest.kt b/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProviderTest.kt
+new file mode 100644
+index 0000000..8566f02
+--- /dev/null
++++ b/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProviderTest.kt
+@@ -0,0 +1,248 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import android.app.Application
++import android.content.ContentValues
++import android.net.Uri
++import android.os.Binder
++import android.os.Bundle
++import android.os.Process
++import com.google.gson.JsonNull
++import com.google.gson.JsonObject
++import java.io.File
++import java.lang.reflect.InvocationTargetException
++import java.time.ZoneId
++import kotlin.io.encoding.Base64
++import org.junit.After
++import org.junit.Assert.assertArrayEquals
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertThrows
++import org.junit.Assert.assertTrue
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++import org.robolectric.annotation.Config
++import org.robolectric.shadows.ShadowBinder
++import org.robolectric.shadows.ShadowContentResolver
++
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [33], manifest = Config.NONE, application = Application::class)
++class UsbControlProviderTest {
++    @get:Rule val folder = TemporaryFolder()
++    private val authority = "com.celzero.bravedns.stopscroll.usb"
++    private val uri = Uri.parse("content://$authority")
++    private val requestId = "12345678-90ab-4def-8123-456789abcdef"
++    private val reads = """{"schema":1,"request_id":"$requestId","op":"status","args":{}}"""
++    private val open = """{"schema":1,"request_id":"$requestId","op":"session.open",
++        "args":{"site":"video","minutes":5},"expected_revision":1}"""
++    private val context get() = RuntimeEnvironment.getApplication()
++    private val requests = mutableListOf<RpcRequest>()
++    private val provider = UsbControlProvider { request ->
++        requests.add(request)
++        RpcReply(success(request.requestId))
++    }
++
++    @After fun clearBinderIdentity() = ShadowBinder.reset()
++
++    private fun encode(raw: String) = Base64.encode(raw.toByteArray())
++
++    private fun decode(bundle: Bundle?): JsonObject {
++        val result = requireNotNull(bundle)
++        assertEquals(setOf("result_b64"), result.keySet())
++        val encoded = requireNotNull(result.getString("result_b64"))
++        val bytes = Base64.decode(encoded)
++        assertTrue(bytes.size <= RpcCodec.MAX_BYTES)
++        assertEquals(encoded, Base64.encode(bytes))
++        return strictJson(bytes.decodeToString()).obj()
++    }
++
++    private fun success(id: String, data: JsonObject = JsonObject()) = JsonObject().apply {
++        addProperty("schema", 1)
++        addProperty("request_id", id)
++        addProperty("ok", true)
++        addProperty("revision", 8)
++        addProperty("applied_revision", 7)
++        add("data", data)
++    }
++
++    private fun assertFailure(reply: JsonObject, code: String, id: String, revision: Long = 0) {
++        assertEquals(setOf("schema", "request_id", "ok", "revision", "applied_revision", "error"), reply.keySet())
++        assertEquals(1, reply["schema"].asInt)
++        assertEquals(id, reply["request_id"].asString)
++        assertFalse(reply["ok"].asBoolean)
++        assertEquals(revision, reply["revision"].asLong)
++        assertEquals(JsonNull.INSTANCE, reply["applied_revision"])
++        val error = reply["error"].asJsonObject
++        assertEquals(setOf("code", "message"), error.keySet())
++        assertEquals(code, error["code"].asString)
++    }
++
++    @Test fun binderUidGuardRunsBeforeMethodDecodingOrDispatch() {
++        ShadowContentResolver.registerProviderInternal(authority, provider)
++        val spoofedExtras = Bundle().apply {
++            putString("calling_package", "com.android.shell")
++            putInt("calling_uid", 2000)
++        }
++        for (uid in listOf(Process.myUid(), 0, 1000, 10_001)) {
++            ShadowBinder.setCallingUid(uid)
++            assertEquals(uid, Binder.getCallingUid())
++            assertThrows(SecurityException::class.java) {
++                context.contentResolver.call(uri, "nonexistent", "!".repeat(RpcCodec.MAX_ENCODED_CHARS + 1), spoofedExtras)
++            }
++            assertThrows(SecurityException::class.java) {
++                context.contentResolver.call(uri, "rpc", encode(reads), spoofedExtras)
++            }
++            assertThrows(SecurityException::class.java) {
++                provider.call(authority, "rpc", null, spoofedExtras)
++            }
++        }
++        assertTrue(requests.isEmpty())
++    }
++
++    @Test fun evenNullMethodsAndAuthoritiesAreDeniedByUidBeforeArgumentChecks() {
++        val legacy = provider.javaClass.getMethod(
++            "call", String::class.java, String::class.java, Bundle::class.java
++        )
++        val modern = provider.javaClass.getMethod(
++            "call", String::class.java, String::class.java, String::class.java, Bundle::class.java
++        )
++        ShadowBinder.setCallingUid(10_001)
++        val legacyError = assertThrows(InvocationTargetException::class.java) {
++            legacy.invoke(provider, null, encode(reads), null)
++        }
++        val modernError = assertThrows(InvocationTargetException::class.java) {
++            modern.invoke(provider, authority, null, encode(reads), null)
++        }
++        assertTrue(legacyError.cause is SecurityException)
++        assertTrue(modernError.cause is SecurityException)
++        val authorityError = assertThrows(InvocationTargetException::class.java) {
++            modern.invoke(provider, null, "rpc", encode(reads), null)
++        }
++        assertTrue(authorityError.cause is SecurityException)
++        ShadowBinder.setCallingUid(2000)
++        val invalidMethod = assertThrows(InvocationTargetException::class.java) {
++            modern.invoke(provider, authority, null, encode(reads), null)
++        }
++        assertTrue(invalidMethod.cause is UnsupportedOperationException)
++        val invalidAuthority = assertThrows(InvocationTargetException::class.java) {
++            modern.invoke(provider, null, "rpc", encode(reads), null)
++        }
++        assertTrue(invalidAuthority.cause is UnsupportedOperationException)
++        assertTrue(requests.isEmpty())
++    }
++
++    @Test fun validShellCallsForwardActualReplyAndPreserveRevisions() {
++        ShadowBinder.setCallingUid(2000)
++        assertEquals(2000, Binder.getCallingUid())
++        ShadowContentResolver.registerProviderInternal(authority, provider)
++        val viaResolver = context.contentResolver.call(uri, "rpc", encode(reads), Bundle())
++        assertEquals(success(requestId), decode(viaResolver))
++        val direct = provider.call(authority, "rpc", encode(open), null)
++        assertEquals(success(requestId), decode(direct))
++        assertEquals(listOf("status", "session.open"), requests.map { it.op })
++        assertEquals(1L, requests.last().expectedRevision)
++        assertEquals("video", requests.last().args["site"].asString)
++    }
++
++    @Test fun invalidShellCallsReturnOnlyBoundedErrorsAndNeverDispatch() {
++        ShadowBinder.setCallingUid(2000)
++        assertThrows(UnsupportedOperationException::class.java) {
++            provider.call(authority, "status", "!".repeat(RpcCodec.MAX_ENCODED_CHARS + 1), null)
++        }
++        assertFailure(decode(provider.call("rpc", "!!!", null)), "INVALID_REQUEST", RpcCodec.UNAVAILABLE_REQUEST_ID)
++        assertFailure(decode(provider.call("rpc", encode(reads.replace("\"schema\":1", "\"schema\":2")), null)),
++            "UNSUPPORTED_SCHEMA", requestId)
++        assertFailure(decode(provider.call("rpc", encode(reads.replace("\"status\"", "\"legacy.get\"")), null)),
++            "INVALID_REQUEST", requestId)
++        assertFailure(decode(provider.call("rpc", encode(open.replace("\"minutes\":5", "\"minutes\":5e0")), null)),
++            "INVALID_REQUEST", RpcCodec.UNAVAILABLE_REQUEST_ID)
++        assertFailure(decode(provider.call("rpc", "A".repeat(RpcCodec.MAX_ENCODED_CHARS + 1), null)),
++            "TOO_LARGE", RpcCodec.UNAVAILABLE_REQUEST_ID)
++        assertTrue(requests.isEmpty())
++    }
++
++    @Test fun ordinaryContentProviderMethodsAreDeniedForShellAndApps() {
++        val operations: List<() -> Unit> = listOf(
++            { provider.query(uri, null, null, null, null) },
++            { provider.query(uri, null, null, null, null, null) },
++            { provider.query(uri, null, null, null) },
++            { provider.getType(uri) },
++            { provider.getTypeAnonymous(uri) },
++            { provider.insert(uri, ContentValues()) },
++            { provider.insert(uri, ContentValues(), Bundle()) },
++            { provider.bulkInsert(uri, emptyArray()) },
++            { provider.update(uri, null, null, null) },
++            { provider.update(uri, null, Bundle()) },
++            { provider.delete(uri, null, null) },
++            { provider.delete(uri, Bundle()) },
++            { provider.applyBatch(arrayListOf()) },
++            { provider.applyBatch(authority, arrayListOf()) },
++            { provider.openFile(uri, "r") },
++            { provider.openFile(uri, "r", null) },
++            { provider.openAssetFile(uri, "r") },
++            { provider.openAssetFile(uri, "r", null) },
++            { provider.openTypedAssetFile(uri, "*/*", null) },
++            { provider.openTypedAssetFile(uri, "*/*", null, null) },
++            { provider.getStreamTypes(uri, "*/*") },
++            { provider.canonicalize(uri) },
++            { provider.uncanonicalize(uri) },
++            { provider.refresh(uri, null, null) }
++        )
++        ShadowBinder.setCallingUid(2000)
++        operations.forEach { assertThrows(UnsupportedOperationException::class.java) { it() } }
++        ShadowBinder.setCallingUid(10_001)
++        operations.forEach { assertThrows(SecurityException::class.java) { it() } }
++        assertTrue(requests.isEmpty())
++    }
++
++    @Test fun preDispatchFailuresLeaveRealJournalUntouchedAndStaleRevisionCannotReserve() {
++        ShadowBinder.setCallingUid(2000)
++        val file = File(folder.root, "stopscroll/state.json")
++        val clock = ClockSample(1783850400000, 7000, 12)
++        val initial = JournalState.initial(ZoneId.of("Europe/Belgrade"), clock, examplePolicy())
++        val store = StateStore(file)
++        val timers = TestTimers()
++        val controller = StopscrollController(store, { initial }, { clock }, EngineAdapter({ clock }, timers), timers) {
++            PlatformProtection(false, false, false, false)
++        }
++        controller.reconcile()
++        val original = store.read()
++        val bytes = file.readBytes()
++        val provider = UsbControlProvider { request ->
++            requests.add(request)
++            controller.execute(request)
++        }
++        assertFailure(decode(provider.call("rpc", encode(open.replace("\"video\"", "\"bad-id\"")), null)),
++            "INVALID_REQUEST", requestId)
++        assertTrue(requests.isEmpty())
++        assertArrayEquals(bytes, file.readBytes())
++
++        val stale = decode(provider.call("rpc", encode(open), null))
++        assertFailure(stale, "CONFLICT", requestId, original.revision)
++        val saved = store.read()
++        assertEquals(original.revision, saved.revision)
++        assertEquals(original.policy.hash, saved.policy.hash)
++        assertEquals(original.accounts, saved.accounts)
++        assertNull(saved.accounts.getValue("video").session)
++        assertEquals(1, requests.size)
++    }
++
++    @Test fun oversizedOrInvalidControllerRepliesNeverBecomeAcknowledgements() {
++        ShadowBinder.setCallingUid(2000)
++        val oversized = UsbControlProvider { request ->
++            RpcReply(success(request.requestId, JsonObject().apply {
++                addProperty("diagnostic", "😀".repeat(RpcCodec.MAX_BYTES / 4))
++            }))
++        }
++        assertFailure(decode(oversized.call("rpc", encode(reads), null)), "TOO_LARGE", requestId, 8)
++        val wrongId = UsbControlProvider {
++            RpcReply(success("9a000000-0000-0000-0000-000000000000"))
++        }
++        assertFailure(decode(wrongId.call("rpc", encode(reads), null)), "INVALID_RESPONSE", requestId)
++    }
++}
 diff --git a/gradle/wrapper/gradle-wrapper.properties b/gradle/wrapper/gradle-wrapper.properties
 index eb84db6..906dbb9 100644
 --- a/gradle/wrapper/gradle-wrapper.properties
