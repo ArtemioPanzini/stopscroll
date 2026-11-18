@@ -464,7 +464,12 @@ def _tool_output(runner, *arguments):
 def inspect_installed_release(transport, *, receipt_path=None, tool_finder=_sdk_tool, runner=subprocess.run):
     """Compare the installed base APK to the local Task 5 release receipt."""
     expected = _read_release_receipt(receipt_path if receipt_path is not None else _receipt_path())
-    apksigner, apkanalyzer = (tool_finder(tool) for tool in ('apksigner', 'apkanalyzer'))
+    tools = tuple(tool_finder(tool) for tool in ('apksigner', 'apkanalyzer'))
+    return inspect_installed_apk(transport, tools=tools, runner=runner, expected=expected)
+
+
+def inspect_installed_apk(transport, *, tools, runner=subprocess.run, expected=None):
+    """Read and verify the installed base APK on an already bound transport."""
     output = transport.shell('pm', 'path', '--user', '0', PACKAGE)
     paths = re.findall(rb'^package:(/data/app/[A-Za-z0-9_~+=./-]+/base\.apk)\r?$', output, re.MULTILINE)
     if len(paths) != 1 or b'..' in paths[0].split(b'/'):
@@ -472,24 +477,31 @@ def inspect_installed_release(transport, *, receipt_path=None, tool_finder=_sdk_
     with tempfile.TemporaryDirectory(prefix='stopscroll-apk-') as directory:
         apk = Path(directory) / 'base.apk'
         transport.pull(paths[0].decode('utf-8'), apk)
-        with apk.open('rb') as stream:
-            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-        if digest != expected['apk_sha256']:
-            raise OSError('Установленный APK отличается от проверенного выпуска по полю apk_sha256')
-        signers = _tool_output(runner, apksigner, 'verify', '--print-certs', str(apk))
-        certificates = re.findall(rb'^Signer #[0-9]+ certificate SHA-256 digest: ([0-9a-fA-F]{64})\r?$',
-                                  signers, re.MULTILINE)
-        if len(certificates) != 1:
-            raise OSError('Не подтверждён единственный подписант APK')
-        package = _tool_output(runner, apkanalyzer, 'manifest', 'application-id', str(apk)).strip()
-        version = _tool_output(runner, apkanalyzer, 'manifest', 'version-code', str(apk)).strip()
+        return inspect_release_apk(apk, tools=tools, runner=runner, expected=expected)
+
+
+def inspect_release_apk(apk, *, tools, runner=subprocess.run, expected=None):
+    """Verify the signer and manifest of a local immutable APK snapshot."""
+    apksigner, apkanalyzer = tools
+    with _open_regular_file(apk) as stream:
+        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    if expected is not None and digest != expected['apk_sha256']:
+        raise OSError('APK отличается от проверенного выпуска по полю apk_sha256')
+    signers = _tool_output(runner, apksigner, 'verify', '--print-certs', str(apk))
+    certificates = re.findall(rb'^Signer #[0-9]+ certificate SHA-256 digest: ([0-9a-fA-F]{64})\r?$',
+                              signers, re.MULTILINE)
+    if len(certificates) != 1:
+        raise OSError('Не подтверждён единственный подписант APK')
+    package = _tool_output(runner, apkanalyzer, 'manifest', 'application-id', str(apk)).strip()
+    version = _tool_output(runner, apkanalyzer, 'manifest', 'version-code', str(apk)).strip()
     if not re.fullmatch(rb'[0-9]{1,20}', version):
         raise OSError('Некорректный versionCode в установленном APK')
     actual = {'schema': 1, 'package': package.decode('utf-8'), 'version_code': int(version),
               'certificate_sha256': certificates[0].decode('ascii').lower(), 'apk_sha256': digest}
-    mismatches = [key for key, value in actual.items() if expected[key] != value]
-    if mismatches:
-        raise OSError(f"Установленный APK отличается от проверенного выпуска по полям {', '.join(mismatches)}")
+    if expected is not None:
+        mismatches = [key for key, value in actual.items() if expected[key] != value]
+        if mismatches:
+            raise OSError(f"APK отличается от проверенного выпуска по полям {', '.join(mismatches)}")
     return actual
 
 

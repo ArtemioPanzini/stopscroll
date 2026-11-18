@@ -21,6 +21,9 @@ state.json
 state.json.bak
 telegram.json
 desktop.json
+android-release.json
+phone-policy.json
+*.android-policy.json
 /owner-uid
 /local/
 /private/
@@ -50,9 +53,12 @@ venv/
 /telegram/out/
 /android/rethink-app/
 /android/out/
-/android/**/*.apk
+*.apk
+*.aar
 /android/**/*.jks
 /android/**/*.keystore
+/android/exports/
+/android/reports/
 CMakeFiles/
 CMakeCache.txt
 compile_commands.json
@@ -81,6 +87,7 @@ compile_commands.json
 /telegram/STATUS.md
 /telegram/publication-task-1-report.md
 /docs/superpowers/
+/.superpowers/
 .idea/
 .vscode/
 *.swp

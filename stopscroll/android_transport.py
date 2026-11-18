@@ -187,10 +187,11 @@ class AndroidTransport:
         self._runner = runner
         self._timeout = timeout
 
-    def _run(self, *arguments: str, input: bytes = b'', stdout=subprocess.PIPE) -> bytes:
+    def _run(self, *arguments: str, input: bytes = b'', stdout=subprocess.PIPE, stdin=None) -> bytes:
+        feed = {'input': input} if stdin is None else {'stdin': stdin}
         try:
-            result = self._runner(['adb', *arguments], input=input, stdout=stdout,
-                                  stderr=subprocess.DEVNULL, timeout=self._timeout)
+            result = self._runner(['adb', *arguments], stdout=stdout, stderr=subprocess.DEVNULL,
+                                  timeout=self._timeout, **feed)
         except FileNotFoundError:
             raise AndroidTransportError('Команда adb не найдена') from None
         except subprocess.TimeoutExpired:
@@ -292,6 +293,12 @@ class BoundAndroidTransport:
 
     def shell(self, *arguments: str) -> bytes:
         return self._execute(arguments)
+
+    def stream_to_shell(self, stream, *arguments: str) -> bytes:
+        """Guard and execute the command on one raw shell with binary stdin."""
+        script = '{\n' + self._guard + '} </dev/null\n' + _exec_line(arguments)
+        command = shlex.join(('sh', '-c', script))
+        return self._run('-s', self._usb_path, 'shell', '-T', '-e', 'none', command, stdin=stream)
 
     def pull(self, source: str, destination) -> None:
         with os.fdopen(os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as stream:
