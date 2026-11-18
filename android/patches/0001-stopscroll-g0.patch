@@ -162,8 +162,33 @@ index 6cd5717..3c568f8 100644
              scheduleJobs()
          }
      }
+diff --git a/app/src/main/java/com/celzero/bravedns/data/AppConfig.kt b/app/src/main/java/com/celzero/bravedns/data/AppConfig.kt
+index e1a4bd5..07df8b3 100644
+--- a/app/src/main/java/com/celzero/bravedns/data/AppConfig.kt
++++ b/app/src/main/java/com/celzero/bravedns/data/AppConfig.kt
+@@ -15,6 +15,7 @@
+  */
+ package com.celzero.bravedns.data
+
++import com.celzero.bravedns.BuildConfig
+ import com.celzero.bravedns.util.Logger
+ import com.celzero.bravedns.util.Logger.LOG_TAG_VPN
+ import android.content.Context
+@@ -678,9 +679,9 @@ internal constructor(
+         ptMode: ProtoTranslationMode
+     ): TunnelOptions {
+         return TunnelOptions(
+-            getDnsMode(),
+-            determineFirewallMode(),
+-            getTunProxyMode(),
++            if (BuildConfig.STOPSCROLL_G0) TunDnsMode.DNS_PORT else getDnsMode(),
++            if (BuildConfig.STOPSCROLL_G0) TunFirewallMode.FILTER_ANDROID9_ABOVE else determineFirewallMode(),
++            if (BuildConfig.STOPSCROLL_G0) TunProxyMode.NONE else getTunProxyMode(),
+             ptMode,
+             bridge,
+             getDefaultDns(),
 diff --git a/app/src/main/java/com/celzero/bravedns/net/go/GoVpnAdapter.kt b/app/src/main/java/com/celzero/bravedns/net/go/GoVpnAdapter.kt
-index 143661a..b54aa7a 100644
+index 143661a..19ce323 100644
 --- a/app/src/main/java/com/celzero/bravedns/net/go/GoVpnAdapter.kt
 +++ b/app/src/main/java/com/celzero/bravedns/net/go/GoVpnAdapter.kt
 @@ -77,6 +77,10 @@ import com.celzero.bravedns.util.Utilities.isPlayStoreFlavour
@@ -187,7 +212,7 @@ index 143661a..b54aa7a 100644
      private var context: Context
      private var externalScope: CoroutineScope
 
-@@ -130,6 +135,7 @@ class GoVpnAdapter : KoinComponent {
+@@ -130,10 +135,17 @@ class GoVpnAdapter : KoinComponent {
          mtu: Int,
          nwMtu: Int,
          opts: TunnelOptions) {
@@ -195,18 +220,29 @@ index 143661a..b54aa7a 100644
          this.context = context
          this.externalScope = externalScope
          val defaultDns = newDefaultTransport(appConfig.getDefaultDns())
-@@ -247,6 +253,20 @@ class GoVpnAdapter : KoinComponent {
+         Logger.i(LOG_TAG_VPN, "$TAG connect tunnel with new params")
++        // The frozen native library starts with BlockModeNone. Install filtering before
++        // connect() hands the descriptor to a running stack, including initial callbacks.
++        if (BuildConfig.STOPSCROLL_G0) {
++            requireNotNull(g0Tunnel)
++            Settings.setTunMode(Settings.DNSModePort, Settings.BlockModeFilter, opts.ptMode.id)
++        }
+         tunnel =
+             Intra.connect(
+                 tunFd,
+@@ -247,6 +259,21 @@ class GoVpnAdapter : KoinComponent {
              return
          }
 
 +        if (BuildConfig.STOPSCROLL_G0) {
 +            try {
 +                val identity = requireNotNull(g0Tunnel)
-+                G0Vpn.cutoff.installPreferred(identity, G0Vpn::durableRevision) {
++                val ready = G0Vpn.cutoff.installPreferred(identity) {
 +                    Intra.addDoHTransport(tunnel, Backend.Preferred, G0Vpn.resolverUrl, G0Vpn.resolverIps)
 +                    check(tunnel.resolver?.get(Backend.Preferred)?.id() == Backend.Preferred)
-+                    G0Vpn.cutoff.withAlgLock { g0SetAlg(persistentState.enableDnsAlg) }
++                    requireNotNull(tunnel.resolver).translate(false, false)
 +                }
++                if (ready) G0Vpn.reconcileAsync()
 +            } catch (e: Exception) {
 +                Logger.e(LOG_TAG_VPN, "$TAG unable to add Stopscroll DoH", e)
 +            }
@@ -216,7 +252,7 @@ index 143661a..b54aa7a 100644
          // TODO: #321 As of now there is no block free transport for dns types other than Rethink.
          // introduce block free transport for other dns types when there is a UI to configure the
          // block free transport
-@@ -1983,7 +2003,24 @@ class GoVpnAdapter : KoinComponent {
+@@ -1983,7 +2010,36 @@ class GoVpnAdapter : KoinComponent {
          }
      }
 
@@ -226,12 +262,24 @@ index 143661a..b54aa7a 100644
 +        check(tunnel.isConnected)
 +    }
 +
-+    internal fun g0SetAlg(enabled: Boolean) {
-+        check(tunnel.isConnected)
-+        requireNotNull(tunnel.resolver).translate(enabled, false)
++    internal fun g0RefreshResolver(): String {
++        val resolver = requireNotNull(tunnel.resolver)
++        resolver.refresh()
++        // Refresh also starts asynchronous cache maintenance. Stopscroll uses uncached Preferred
++        // and makes its DNS and flow decisions before upstream. No cache flush is assumed.
++        val id = requireNotNull(resolver.get(Backend.Preferred)?.id())
++        check(id == Backend.Preferred && tunnel.isConnected)
++        return id
 +    }
 +
-+    internal fun g0DnsInfo() = if (tunnel.isConnected) tunnel.stat()?.rdnsinfo() else null
++    internal fun g0Disconnect() {
++        // Unlink disposes the native endpoint that owns the dup. Disconnect then cancels
++        // the captured stack and its handlers; the Java service FD alone cannot stop it.
++        try { tunnel.unlink() } finally { tunnel.disconnect() }
++        // Disconnect cancels native contexts asynchronously. The caller bounds this wait and
++        // tears down the process if the native stack cannot confirm it is disconnected.
++        while (tunnel.isConnected) Thread.sleep(10)
++    }
 +
      private fun newDefaultTransport(url: String): DefaultDNS? {
 +        if (BuildConfig.STOPSCROLL_G0) {
@@ -241,7 +289,7 @@ index 143661a..b54aa7a 100644
          val fallbackDns = getDefaultFallbackDns()
          try {
              // when the url is empty, set the default transport to 9.9.9.9, 2620:fe::fe or
-@@ -2043,6 +2080,7 @@ class GoVpnAdapter : KoinComponent {
+@@ -2043,6 +2099,7 @@ class GoVpnAdapter : KoinComponent {
              Logger.e(LOG_TAG_VPN, "$TAG no tunnel, skip add default dns")
              return false
          }
@@ -249,7 +297,7 @@ index 143661a..b54aa7a 100644
          var type = Backend.DNS53
          val fallbackUrl = getDefaultFallbackDns()
 
-@@ -2312,6 +2350,7 @@ class GoVpnAdapter : KoinComponent {
+@@ -2312,6 +2369,7 @@ class GoVpnAdapter : KoinComponent {
      }
 
      suspend fun setDnsAlg() {
@@ -257,7 +305,7 @@ index 143661a..b54aa7a 100644
          // set translate to false for dns mode (regardless of setting in dns screen),
          // since apps cannot understand alg ips
          if (appConfig.getBraveMode().isDnsMode()) {
-@@ -2670,15 +2709,16 @@ class GoVpnAdapter : KoinComponent {
+@@ -2670,15 +2728,16 @@ class GoVpnAdapter : KoinComponent {
              return
          }
          try {
@@ -278,7 +326,7 @@ index 143661a..b54aa7a 100644
          } catch (e: Exception) {
              Logger.e(LOG_TAG_VPN, "$TAG err set dial strategy: ${e.message}", e)
 diff --git a/app/src/main/java/com/celzero/bravedns/service/BraveVPNService.kt b/app/src/main/java/com/celzero/bravedns/service/BraveVPNService.kt
-index a0c06b4..19e17ac 100644
+index a0c06b4..3d22ca3 100644
 --- a/app/src/main/java/com/celzero/bravedns/service/BraveVPNService.kt
 +++ b/app/src/main/java/com/celzero/bravedns/service/BraveVPNService.kt
 @@ -127,6 +127,9 @@ import com.celzero.bravedns.util.Utilities.isPlayStoreFlavour
@@ -309,16 +357,7 @@ index a0c06b4..19e17ac 100644
              }
 
              PersistentState.PRIVATE_IPS -> {
-@@ -1956,6 +1961,8 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
-         }
-     }
-
-+    internal fun g0Protected() = isAtleastQ() && isAlwaysOn && isLockdownEnabled
-+
-     private suspend fun updateDnsAlg() {
-         vpnAdapter?.setDnsAlg()
-     }
-@@ -1980,6 +1987,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -1980,6 +1985,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
                  return@withContext
              }
 
@@ -326,7 +365,7 @@ index a0c06b4..19e17ac 100644
              vpnAdapter?.closeTun()
              vpnAdapter = null
              Logger.i(LOG_TAG_VPN, "stop vpn adapter")
-@@ -2281,9 +2289,13 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -2281,9 +2287,13 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
                      val ifaceAddresses = getAddresses()
                      Logger.i(LOG_TAG_VPN, "vpn-adapter doesn't exists, create one, fd: $fd, lockdown: $lockdown, protos: $protos, ifaddr: $ifaceAddresses, opts: $opts, mtu: $mtu, nwMtu: $nwMtu")
                      GoVpnAdapter.setLogLevel(persistentState.goLoggerLevel.toInt(), includeFileTrace = persistentState.includeFileTrace)
@@ -342,7 +381,7 @@ index a0c06b4..19e17ac 100644
                      io("rpnCheck") { checkForPlusSubscription() }
                      return@withContext ok
                  } else {
-@@ -3034,7 +3046,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -3034,7 +3044,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
          networkLifecycleObserver.stop()
          GlobalProxyHandler.stop()
          wgProxyPingController.stopAll()
@@ -351,7 +390,7 @@ index a0c06b4..19e17ac 100644
          // stop the inapp billing handler if it exists
          //InAppBillingHandler.endConnection()
          try {
-@@ -3180,7 +3192,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -3180,7 +3190,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
                  )
 
              // val mtu = mtu() // get mtu from the underlyingnetworks
@@ -360,7 +399,36 @@ index a0c06b4..19e17ac 100644
 
              // set the PendingIntent to an activity for users to configure the vpn connection.
              // if it is not set, the button to configure will not be shown in system-managed dialogs
-@@ -3664,10 +3676,11 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -3192,8 +3202,8 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+             val noRoutes = !has4 && !has6
+
+             builderRoutes = Pair(has4, has6)
+-            val dnsMode = appConfig.getBraveMode().isDnsActive()
+-            val firewallMode = appConfig.getBraveMode().isFirewallActive()
++            val dnsMode = BuildConfig.STOPSCROLL_G0 || appConfig.getBraveMode().isDnsActive()
++            val firewallMode = BuildConfig.STOPSCROLL_G0 || appConfig.getBraveMode().isFirewallActive()
+
+             // setup the gateway addr
+             if (has4 || noRoutes) {
+@@ -3400,7 +3410,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+
+     private fun addRoute6(b: Builder): Builder {
+         // TODO: as of now, vpn lockdown mode is not handled, check if this is required
+-        if (persistentState.privateIps) {
++        if (!BuildConfig.STOPSCROLL_G0 && persistentState.privateIps) {
+             Logger.i(LOG_TAG_VPN, "addRoute6: privateIps is true, adding routes")
+             // exclude LAN traffic, add only unicast routes
+             // add only unicast routes
+@@ -3434,7 +3444,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+
+     private fun addRoute4(b: Builder): Builder {
+         // TODO: as of now, vpn lockdown mode is not handled, check if this is required
+-        if (persistentState.privateIps) {
++        if (!BuildConfig.STOPSCROLL_G0 && persistentState.privateIps) {
+             Logger.i(LOG_TAG_VPN, "addRoute4: privateIps is true, adding routes")
+             // https://developer.android.com/reference/android/net/VpnService.Builder.html#addRoute(java.lang.String,%20int)
+             // Adds a route to the VPN's routing table. The VPN will forward all traffic to the
+@@ -3664,10 +3674,11 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
          withContext(CoroutineName(s) + Dispatchers.Main) { f() }
 
      override fun onQuery(origin: String, uidGostr: String, fqdn: String, qtype: Long): DNSOpts {
@@ -373,7 +441,7 @@ index a0c06b4..19e17ac 100644
      }
 
      private fun isCaptivePortal(): Boolean {
-@@ -3858,17 +3871,19 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -3858,17 +3869,19 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
          probableDomains: String?,
          blocklists: String?,
          isAlg: Boolean
@@ -400,35 +468,6 @@ index a0c06b4..19e17ac 100644
 
      // no need of go2kt here as it is called from go and performs db operations with no return value
      // requires go2kt if there any calls to go functions
-diff --git a/app/src/main/java/com/celzero/bravedns/service/TunFlowManager.kt b/app/src/main/java/com/celzero/bravedns/service/TunFlowManager.kt
-index 76bf7fc..2f98179 100644
---- a/app/src/main/java/com/celzero/bravedns/service/TunFlowManager.kt
-+++ b/app/src/main/java/com/celzero/bravedns/service/TunFlowManager.kt
-@@ -56,6 +56,8 @@ import com.celzero.bravedns.util.Utilities.isAtleastO
- import com.celzero.bravedns.util.Utilities.isAtleastQ
- import com.celzero.bravedns.util.Utilities.isPlayStoreFlavour
- import com.celzero.bravedns.util.Utilities.isUnspecifiedIp
-+import com.celzero.bravedns.BuildConfig
-+import com.celzero.bravedns.stopscroll.G0Vpn
- import com.celzero.firestack.backend.Backend
- import com.celzero.firestack.intra.FlowSummary
- import com.celzero.firestack.intra.Mark
-@@ -426,6 +428,15 @@ object TunFlowManager : KoinComponent {
-                 connType
-             )
-
-+        if (BuildConfig.STOPSCROLL_G0) {
-+            val blocked = d?.split(',')?.any(G0Vpn.policy::blocks) == true
-+            G0Vpn.watch?.takeIf { it.uid == uid }?.record(protocol, blocked)
-+            if (blocked) {
-+                cm.isBlocked = true
-+                return persistAndConstructFlowResponse(ctx, cm, Backend.Block, connId, uid)
-+            }
-+        }
-+
-         val trapVpnDns = isDns(dstPort) && isVpnDns(dstIp)
-         val trapVpnPrivateDns = isVpnDns(dstIp) && isPrivateDns(dstPort)
-
 diff --git a/app/src/main/java/com/celzero/bravedns/service/VpnController.kt b/app/src/main/java/com/celzero/bravedns/service/VpnController.kt
 index d032e94..66ac0dc 100644
 --- a/app/src/main/java/com/celzero/bravedns/service/VpnController.kt
@@ -462,213 +501,254 @@ index d032e94..66ac0dc 100644
          rvpn = null
          states = null
          vpnStartElapsedTime = SystemClock.elapsedRealtime()
-diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/G0Cutoff.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Cutoff.kt
+diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/EngineAdapter.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/EngineAdapter.kt
 new file mode 100644
-index 0000000..7ff4e50
+index 0000000..123c9bc
 --- /dev/null
-+++ b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Cutoff.kt
-@@ -0,0 +1,203 @@
++++ b/app/src/main/java/com/celzero/bravedns/stopscroll/EngineAdapter.kt
+@@ -0,0 +1,244 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package com.celzero.bravedns.stopscroll
 +
-+import java.util.concurrent.CountDownLatch
++import java.util.concurrent.Callable
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit.MILLISECONDS
++import java.util.concurrent.TimeoutException
 +
-+/** Each Target is the bridge of one native adapter, including during native callbacks. */
-+internal class G0Cutoff<T : G0Cutoff.Target>(private val now: () -> Long) {
-+    interface Target {
-+        val owner: Any
-+        fun sweep()
-+        fun protectedNow(): Boolean
-+    }
-+
-+    enum class Preferred { PENDING, INSTALLING, READY, FAILED }
-+
-+    data class State<T>(
-+        val target: T? = null,
-+        val generation: Long = 0,
-+        val preferred: Preferred = Preferred.PENDING,
-+        val appliedRevision: Long? = null,
-+        val changing: Boolean = false,
-+        val algUncertain: Boolean = false,
-+        val due: Long? = null,
-+        val trigger: Long? = null,
-+        val cutoff: Long? = null,
-+        val closeMs: Long? = null,
-+        val error: String? = null
-+    )
-+
-+    class Claim<T>(val target: T?, val generation: Long) {
-+        internal val settled = CountDownLatch(1)
-+    }
-+
-+    private val writes = Any()
-+    private val alg = Any()
-+    private var active: Claim<T>? = null
-+    private var service: Any? = null
-+    @Volatile var state = State<T>()
-+        private set
-+
-+    @Synchronized fun register(owner: Any) {
-+        service = owner
-+        changeTarget(null)
-+    }
-+
-+    @Synchronized fun unregister(owner: Any) {
-+        if (service !== owner) return
-+        service = null
-+        changeTarget(null)
-+    }
-+
-+    @Synchronized fun attach(target: T) {
-+        if (service === target.owner) changeTarget(target)
-+    }
-+
-+    @Synchronized fun detach(target: T) {
-+        if (state.target === target) changeTarget(null)
-+    }
-+
-+    private fun changeTarget(target: T?) {
-+        state = state.copy(target = target, preferred = Preferred.PENDING, appliedRevision = null, algUncertain = false)
-+    }
-+
-+    fun receipt(target: T): State<T>? = state.takeIf { it.target === target && it.appliedRevision != null }
-+
-+    fun permits(target: T, receipt: State<T>?): Boolean =
-+        receipt != null && receipt.target === target && state === receipt
-+
-+    // Platform and native probes can block. Revalidate their subject after returning.
-+    fun protectedTarget(target: T? = state.target): T? =
-+        target?.takeIf { it.protectedNow() && state.target === it }
-+
-+    fun protectedReceipt(target: T, sample: State<T>): Boolean =
-+        receipt(target) === sample && target.protectedNow() && permits(target, sample)
-+
-+    // This lock serializes ALG changes, activation on a replacement, and ALG status reads.
-+    // Neither deadline claims nor native sweeps ever acquire it.
-+    fun <R> withAlgLock(action: () -> R): R = synchronized(alg, action)
-+
-+    fun updateAlg(target: T, before: State<T>, enabled: Boolean, read: () -> Boolean,
-+                  apply: (Boolean) -> Unit, store: (Boolean) -> Unit): Boolean = synchronized(alg) {
-+        if (!protectedReceipt(target, before)) return false
-+        val previous = read()
-+        var storing = false
-+        try {
-+            apply(enabled)
-+            if (protectedReceipt(target, before)) {
-+                // The final guard authorizes commit. A replacement reads the committed value
-+                // under this same ALG lock before it can obtain an activation receipt.
-+                storing = true
-+                store(enabled)
-+                return true
-+            }
-+        } catch (_: Exception) {
-+            // An exception after the native write also requires reconciliation.
-+        }
-+        try {
-+            apply(previous)
-+            if (storing) store(previous)
-+        } catch (_: Exception) {
-+            synchronized(this) {
-+                if (state.target === target) state = state.copy(algUncertain = true,
-+                    appliedRevision = null, error = "Native ALG mode is unconfirmed")
-+            }
-+        }
-+        false
-+    }
-+
-+    @Synchronized fun begin(target: T?, due: Long? = null): Claim<T> {
-+        val trigger = now()
-+        state = state.copy(generation = state.generation + 1, appliedRevision = null,
-+            changing = true, due = due ?: trigger, trigger = trigger, cutoff = null, closeMs = null, error = null)
-+        active?.settled?.countDown()
-+        return Claim(target, state.generation).also { active = it }
-+    }
-+
-+    // Sweep before disk and platform calls so an existing stream is revoked immediately.
-+    fun complete(claim: Claim<T>, save: () -> Long?): Boolean {
-+        if (state.generation != claim.generation) return false
-+        val target = claim.target
-+        val started = now()
-+        val swept = target != null && try { target.sweep(); true } catch (_: Exception) { false }
-+        val completed = now()
-+        // Only persistence is serialized. A deadline can close admission and sweep while an
-+        // older writer or its protection probe is stalled. Its save is ordered after that writer.
-+        val revision = synchronized(writes) {
-+            if (state.generation != claim.generation || !state.changing) return false
-+            try { save() } catch (_: Exception) { null }
-+        }
-+        val protected = swept && try { target.protectedNow() } catch (_: Exception) { false }
-+        synchronized(this) {
-+            val s = state
-+            if (s.generation != claim.generation || !s.changing) return false
-+            val error = when {
-+                revision == null -> "Policy save failed"
-+                !protected || target !== s.target -> "Native cutoff unconfirmed or VPN protection changed"
-+                s.algUncertain -> "Native ALG mode is unconfirmed"
-+                s.preferred != Preferred.READY -> "Preferred DNS is ${s.preferred.name.lowercase()}"
-+                else -> null
-+            }
-+            state = s.copy(changing = false, appliedRevision = revision.takeIf { error == null },
-+                cutoff = completed.takeIf { swept }, closeMs = completed - started,
-+                error = error ?: if (completed - (s.due ?: completed) > 2_000L) "Cutoff exceeded 2000 ms" else null)
-+            active = null
-+            claim.settled.countDown()
-+            return state.error == null
-+        }
-+    }
-+
-+    /** Installation is idempotent for the fixed resolver and never occupies the cutoff monitor. */
-+    fun installPreferred(target: T, savedRevision: () -> Long?, install: () -> Unit) {
-+        synchronized(this) {
-+            if (state.target !== target || state.preferred in listOf(Preferred.READY, Preferred.INSTALLING)) return
-+            state = state.copy(preferred = Preferred.INSTALLING, appliedRevision = null)
-+        }
-+        try {
-+            install()
-+        } catch (e: Exception) {
-+            synchronized(this) {
-+                if (state.target === target) state = state.copy(preferred = Preferred.FAILED, appliedRevision = null)
-+            }
-+            throw e
-+        }
-+        synchronized(this) {
-+            if (state.target !== target || state.preferred != Preferred.INSTALLING) return
-+            state = state.copy(preferred = Preferred.READY)
-+        }
-+        while (true) {
-+            val previous = synchronized(this) {
-+                if (state.target !== target || receipt(target) != null) return
-+                val claim = active
-+                if (claim?.target === target) return // that transition owns the acknowledgement
-+                if (claim == null) begin(target) else claim
-+            }
-+            if (previous.target === target) {
-+                complete(previous, savedRevision)
-+                return
-+            }
-+            // Another adapter's transition may still own a policy save. Never transfer its
-+            // acknowledgement. Activate against this adapter once that write has settled.
-+            previous.settled.await()
-+        }
-+    }
++internal data class PlatformProtection(val tunnel: Boolean, val alwaysOn: Boolean, val lockdown: Boolean, val exempt: Boolean) {
++    val protected get() = tunnel && alwaysOn && lockdown && exempt
 +}
 +
-+/** A replaced alarm may already be running when coroutine cancellation arrives. */
-+internal class G0Deadlines<T : G0Cutoff.Target, D : Any>(private val gate: G0Cutoff<T>) {
-+    var pending: D? = null
++internal interface EngineTarget {
++    val owner: Any
++    fun sweep()
++    fun refreshResolver(): String
++    fun platform(): PlatformProtection
++    /** Dispose the captured native engine, including its duplicate TUN descriptor. */
++    fun disconnect()
++}
++
++internal interface SessionTimers {
++    fun deadline(elapsedMs: Long, action: () -> Unit): () -> Unit
++    fun tick(elapsedMs: Long, action: () -> Unit): () -> Unit
++    fun warn(site: String)
++}
++
++internal data class NativeReceipt(val target: EngineTarget, val snapshot: PolicySnapshot,
++                                 val cutoffMs: Long, val resolverId: String)
++internal data class AppliedResult(val receipt: NativeReceipt?, val error: String?)
++internal enum class Preferred { PENDING, INSTALLING, READY, FAILED }
++
++/** The short monitor owns the exact native identity, receipt and alarm. Never run JNI, disk,
++ * platform probes, timer setup/cancellation, or controller reconciliation under this monitor. */
++internal class EngineAdapter(
++    private val clock: () -> ClockSample,
++    private val timers: SessionTimers,
++    private val nativeTimeoutMs: Long = 900,
++    private val fatalDisconnect: () -> Unit = { error("Native tunnel could not be stopped") }
++) {
++    private val native = Executors.newCachedThreadPool { r -> Thread(r, "Stopscroll native").apply { isDaemon = true } }
++    private var service: Any? = null
++    private var generation = 0L
++    private var retired = false
++    @Volatile var target: EngineTarget? = null
++        private set
++    @Volatile var preferred = Preferred.PENDING
++        private set
++    @Volatile var applied: NativeReceipt? = null
++        private set
++    @Volatile var error: String? = null
++        private set
++    @Volatile var lastDue: Long? = null
++        private set
++    @Volatile var lastCutoff: Long? = null
 +        private set
 +
-+    fun arm(before: G0Cutoff.State<T>, next: D): D? = synchronized(gate) {
-+        if (gate.state !== before || before.appliedRevision == null) return@synchronized next
-+        pending.also { pending = next }
++    // A receipt can be superseded during a slow save. Keep its alarm armed until a confirmed sweep.
++    private class Alarm(val due: Long) { var cancel: () -> Unit = {} }
++    private var alarm: Alarm? = null
++    var onDue: () -> Unit = {}
++
++    fun receipt(identity: EngineTarget) = applied?.takeIf { it.target === identity }
++    fun permits(identity: EngineTarget, sample: NativeReceipt) = receipt(identity) === sample
++
++    fun <R> admitted(identity: EngineTarget, domains: List<String>, upstream: () -> R?): R? {
++        val receipt = receipt(identity) ?: return null
++        val now = clock()
++        if (!receipt.snapshot.validAt(now) || domains.any { receipt.snapshot.blocks(it.trim(), now) }) return null
++        val result = upstream() ?: return null
++        return result.takeIf { permits(identity, receipt) && receipt.snapshot.validAt(clock()) }
 +    }
 +
-+    fun clear(): D? = synchronized(gate) { pending.also { pending = null } }
++    @Synchronized fun invalidate(reason: String? = null) {
++        generation++
++        applied = null
++        error = reason
++    }
 +
-+    fun claim(expected: D, due: Long): G0Cutoff.Claim<T>? = synchronized(gate) {
-+        if (pending !== expected) return@synchronized null
-+        pending = null
-+        gate.begin(gate.state.target, due)
++    private fun changeTarget(next: EngineTarget?) {
++        invalidate()
++        target = next
++        retired = false
++        preferred = Preferred.PENDING
++    }
++    private fun replaceTarget(change: () -> EngineTarget?) {
++        val retired = synchronized(this) {
++            val old = target
++            val next = change()
++            if (old === next) return
++            changeTarget(next)
++            old
++        }
++        retired?.let(::sweep)
++    }
++
++    fun register(owner: Any) = replaceTarget { service = owner; null }
++    fun attach(identity: EngineTarget) = replaceTarget { if (service === identity.owner) identity else target }
++    fun detach(identity: EngineTarget) = replaceTarget { target.takeUnless { it === identity } }
++    fun unregister(owner: Any) = replaceTarget {
++        if (service === owner) { service = null; null } else target
++    }
++
++    fun installPreferred(identity: EngineTarget, install: () -> Unit): Boolean {
++        synchronized(this) {
++            if (target !== identity || retired || preferred == Preferred.INSTALLING || preferred == Preferred.READY) return false
++            preferred = Preferred.INSTALLING
++        }
++        val installed = try {
++            bounded(install, timeoutMs = 10000)
++            true
++        } catch (_: TimeoutException) {
++            quarantine(identity, "Preferred resolver installation timed out")
++            return false
++        } catch (_: Exception) { false }
++        synchronized(this) {
++            if (target !== identity || retired) return false
++            preferred = if (installed) Preferred.READY else Preferred.FAILED
++            if (!installed) invalidate("Preferred resolver installation failed")
++        }
++        return installed
++    }
++
++    private fun <T> bounded(block: () -> T, timeoutMs: Long = nativeTimeoutMs): T {
++        val work = native.submit(Callable(block))
++        try { return work.get(timeoutMs, MILLISECONDS) }
++        finally { work.cancel(true) }
++    }
++
++    private fun sweep(identity: EngineTarget): Boolean {
++        try {
++            bounded(identity::sweep)
++            return true
++        } catch (_: Exception) {
++            quarantine(identity, "Native flow cutoff failed")
++            return false
++        }
++    }
++
++    private fun quarantine(identity: EngineTarget, reason: String) {
++        // Interrupting a JNI worker cannot prove that it stopped. Dispose the captured native
++        // endpoint. Its delayed result can never obtain a receipt, even if the service is reused.
++        synchronized(this) {
++            if (target === identity) {
++                if (retired) return
++                retired = true
++                preferred = Preferred.FAILED
++                invalidate(reason)
++            }
++        }
++        try { bounded(identity::disconnect) } catch (_: Exception) { fatalDisconnect() }
++    }
++
++    fun failClosed(reason: String, expected: NativeReceipt? = null) {
++        val identity = synchronized(this) {
++            if (expected != null && applied !== expected) return
++            invalidate(reason)
++            target
++        }
++        identity?.let(::sweep)
++    }
++
++    private fun expire(expected: Alarm) {
++        val identity = synchronized(this) {
++            if (alarm !== expected) return
++            alarm = null
++            lastDue = expected.due
++            invalidate()
++            target
++        }
++        if (identity != null && sweep(identity)) lastCutoff = clock().elapsedMs
++        onDue()
++    }
++
++    fun confirm(receipt: NativeReceipt): Boolean {
++        if (applied !== receipt) return false
++        val protected = try { bounded(receipt.target::platform).protected } catch (_: Exception) { false }
++        return protected && applied === receipt && receipt.snapshot.validAt(clock())
++    }
++
++    fun apply(snapshot: PolicySnapshot): AppliedResult {
++        val receipt = activate(snapshot)
++        val reason = if (receipt != null) null else error ?: "No current protected VPN receipt"
++        return AppliedResult(receipt, reason)
++    }
++
++    private fun activate(snapshot: PolicySnapshot): NativeReceipt? {
++        val identity: EngineTarget
++        val ticket: Long
++        synchronized(this) {
++            applied?.let { if (it.snapshot.revision == snapshot.revision) return it }
++            identity = target ?: return null
++            if (preferred != Preferred.READY) return null
++            invalidate()
++            ticket = generation
++        }
++        if (!sweep(identity)) return null
++        val swept = clock().elapsedMs
++        synchronized(this) {
++            alarm?.takeIf { it.due <= swept }?.let {
++                lastDue = it.due
++                lastCutoff = swept
++            }
++        }
++        val resolverId: String
++        val problem = try {
++            resolverId = bounded(identity::refreshResolver)
++            if (bounded(identity::platform).protected) null else "VPN protection is incomplete"
++        } catch (_: TimeoutException) {
++            quarantine(identity, "Native resolver or protection probe timed out")
++            return null
++        } catch (_: Exception) {
++            synchronized(this) { if (generation == ticket) invalidate("Native resolver or VPN protection is unconfirmed") }
++            return null
++        }
++        if (problem != null) {
++            synchronized(this) { if (generation == ticket) invalidate(problem) }
++            return null
++        }
++        val sampled = clock()
++        val due = snapshot.cutoffAt(sampled)
++        val next = due?.let { Alarm(it) }
++        // Install while closed. Even a delayed timer setup can never publish an expired grant.
++        if (next != null) try {
++            next.cancel = timers.deadline(next.due) { expire(next) }
++        } catch (_: Exception) {
++            synchronized(this) { if (generation == ticket) invalidate("Cannot arm the protected session deadline") }
++            return null
++        }
++        var previous: Alarm? = null
++        val result = synchronized(this) {
++            val now = clock()
++            if (generation != ticket || target !== identity || !snapshot.validAt(now) ||
++                (next != null && now.elapsedMs >= next.due)) null
++            else {
++                previous = alarm
++                alarm = next
++                NativeReceipt(identity, snapshot, swept, resolverId).also { applied = it }
++            }
++        }
++        if (result == null) next?.cancel?.invoke() else previous?.cancel?.invoke()
++        return result
 +    }
 +}
 diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/G0Dial.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Dial.kt
@@ -685,60 +765,9 @@ index 0000000..e03e46b
 +/** The G0 cutoff is verified for the default TCP writer and its normal retries. */
 +internal fun effectiveDialStrategy(g0: Boolean, mode: Int, retry: Int): Pair<Int, Int> =
 +    if (g0) Settings.SplitAuto to Settings.RetryAfterSplit else mode to retry
-diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/G0Domains.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Domains.kt
-new file mode 100644
-index 0000000..df935ec
---- /dev/null
-+++ b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Domains.kt
-@@ -0,0 +1,45 @@
-+// SPDX-License-Identifier: Apache-2.0
-+package com.celzero.bravedns.stopscroll
-+
-+import java.util.Locale
-+
-+/** The disposable G0 domain list, shared by DNS and connection callbacks. */
-+internal class G0Domains private constructor(
-+    val domains: Set<String>,
-+    val exceptions: Set<String>
-+) {
-+    fun blocks(host: String): Boolean {
-+        val name = canonical(host)
-+        return matches(domains, name) && !matches(exceptions, name)
-+    }
-+
-+    private fun matches(entries: Set<String>, name: String): Boolean {
-+        var candidate = name
-+        while (candidate.isNotEmpty()) {
-+            if (candidate in entries) return true
-+            candidate = candidate.substringAfter('.', "")
-+        }
-+        return false
-+    }
-+
-+    companion object {
-+        private val label = Regex("[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
-+
-+        val EMPTY = create(emptyList(), emptyList())
-+
-+        fun create(domains: List<String>, exceptions: List<String>): G0Domains {
-+            val entries = domains + exceptions
-+            require(entries.size <= 1_000) { "Too many domain entries" }
-+            require(entries.sumOf { it.length + 1 } <= 64 * 1024) { "Domain policy too large" }
-+            return G0Domains(domains.map(::validate).toSet(), exceptions.map(::validate).toSet())
-+        }
-+
-+        private fun canonical(host: String) = host.removeSuffix(".").lowercase(Locale.ROOT)
-+
-+        private fun validate(host: String): String {
-+            val name = canonical(host)
-+            require(name.length in 1..253 && name.split('.').all(label::matches)) { "Invalid domain" }
-+            return name
-+        }
-+    }
-+}
 diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/G0Tunnel.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Tunnel.kt
 new file mode 100644
-index 0000000..32752de
+index 0000000..7821a14
 --- /dev/null
 +++ b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Tunnel.kt
 @@ -0,0 +1,50 @@
@@ -753,7 +782,7 @@ index 0000000..32752de
 +import com.celzero.firestack.intra.Mark
 +
 +/** A native callback retains this bridge even if its service later publishes another adapter. */
-+internal class G0Tunnel(override val owner: BraveVPNService) : Bridge by owner, G0Cutoff.Target {
++internal class G0Tunnel(override val owner: BraveVPNService) : Bridge by owner, EngineTarget {
 +    lateinit var adapter: GoVpnAdapter
 +        private set
 +
@@ -763,20 +792,23 @@ index 0000000..32752de
 +    }
 +
 +    override fun sweep() = adapter.g0Sweep()
-+    override fun protectedNow() = adapter.hasTunnel() && owner.g0Protected()
++    override fun refreshResolver() = adapter.g0RefreshResolver()
++    override fun disconnect() = adapter.g0Disconnect()
++    override fun platform() = PlatformProtection(adapter.hasTunnel(), owner.isAlwaysOn,
++        owner.isLockdownEnabled, G0Vpn.exempt())
 +
 +    override fun flow(protocol: Int, uid: Int, src: String?, dst: String?, realIps: String?,
 +                      domains: String?, probable: String?, blocklists: String?, isAlg: Boolean): Mark {
-+        val receipt = G0Vpn.cutoff.receipt(this) ?: return blocked(uid)
-+        val result = owner.flow(protocol, uid, src, dst, realIps, domains, probable, blocklists, isAlg)
-+        return if (G0Vpn.cutoff.permits(this, receipt) && !result.pidcsv.isNullOrBlank()) result else blocked(uid)
++        return G0Vpn.cutoff.admitted(this, domains.orEmpty().split(',')) {
++            owner.flow(protocol, uid, src, dst, realIps, domains, probable, blocklists, isAlg)
++                .takeUnless { it.pidcsv.isNullOrBlank() }
++        } ?: blocked(uid)
 +    }
 +
-+    override fun inflow(protocol: Int, uid: Int, src: String?, dst: String?): Mark {
-+        val receipt = G0Vpn.cutoff.receipt(this) ?: return blocked(uid)
-+        val result = owner.inflow(protocol, uid, src, dst)
-+        return if (G0Vpn.cutoff.permits(this, receipt) && !result.pidcsv.isNullOrBlank()) result else blocked(uid)
-+    }
++    override fun inflow(protocol: Int, uid: Int, src: String?, dst: String?): Mark =
++        G0Vpn.cutoff.admitted(this, emptyList()) {
++            owner.inflow(protocol, uid, src, dst).takeUnless { it.pidcsv.isNullOrBlank() }
++        } ?: blocked(uid)
 +
 +    private fun blocked(flowUid: Int) = Mark().apply {
 +        uid = flowUid.toString()
@@ -784,110 +816,167 @@ index 0000000..32752de
 +    }
 +
 +    override fun onQuery(origin: String, uidGostr: String, fqdn: String, qtype: Long): DNSOpts {
-+        val receipt = G0Vpn.cutoff.receipt(this)
-+        if (receipt != null) {
-+            val result = owner.onQuery(origin, uidGostr, fqdn, qtype)
-+            if (G0Vpn.cutoff.permits(this, receipt) && !result.tidcsv.isNullOrBlank()) return result
-+        }
-+        return DNSOpts().apply { uid = uidGostr; tidcsv = "${Backend.BlockAll}:${Backend.Base}" }
++        return G0Vpn.cutoff.admitted(this, listOf(fqdn)) {
++            owner.onQuery(origin, uidGostr, fqdn, qtype).takeUnless { it.tidcsv.isNullOrBlank() }
++        } ?: DNSOpts().apply { uid = uidGostr; tidcsv = "${Backend.BlockAll}:${Backend.Base}" }
 +    }
 +}
 diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/G0Vpn.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Vpn.kt
 new file mode 100644
-index 0000000..509f94f
+index 0000000..3cd0e06
 --- /dev/null
 +++ b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Vpn.kt
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,144 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package com.celzero.bravedns.stopscroll
 +
++import android.app.Notification
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.content.BroadcastReceiver
 +import android.content.Context
++import android.content.Intent
++import android.content.IntentFilter
++import android.os.PowerManager
++import android.os.Process
 +import android.os.SystemClock
++import android.provider.Settings
 +import com.celzero.bravedns.data.AppConfig
 +import com.celzero.bravedns.service.PersistentState
-+import org.json.JSONArray
-+import org.json.JSONObject
-+import java.util.concurrent.atomic.AtomicLong
++import com.celzero.bravedns.service.VpnController
++import com.google.gson.JsonObject
++import java.io.File
++import java.time.ZoneId
++import java.util.concurrent.Executors
++import java.util.concurrent.ScheduledThreadPoolExecutor
++import java.util.concurrent.TimeUnit.MILLISECONDS
++import java.util.concurrent.atomic.AtomicBoolean
 +
-+/** Temporary diagnostic state for the signed G0 build. */
++internal fun legacyPolicy(raw: String?): Policy {
++    if (raw == null) return Policy.EMPTY
++    val legacy = strictJson(raw).obj()
++    legacy.fields("revision", "domains", "exceptions")
++    legacy["revision"].number(0, Long.MAX_VALUE)
++    val domains = legacy["domains"].array()
++    val exceptions = legacy["exceptions"].array()
++    if (domains.isEmpty && exceptions.isEmpty) return Policy.EMPTY
++    val policy = PolicyCodec.toJson(Policy.EMPTY)
++    policy["sites"].asJsonObject.add("legacy", JsonObject().apply {
++        addProperty("mode", "blocked"); addProperty("budget_min", 0)
++        add("domains", domains); add("exceptions", exceptions)
++    })
++    return PolicyCodec.fromJson(policy)
++}
++
 +internal object G0Vpn {
 +    const val resolverUrl = "https://cloudflare-dns.com/dns-query"
 +    const val resolverIps = "1.1.1.1,1.0.0.1,2606:4700:4700::1111,2606:4700:4700::1001"
-+
-+    data class Saved(val revision: Long, val policy: G0Domains)
-+
-+    @Volatile var saved = Saved(0L, G0Domains.EMPTY)
++    private lateinit var context: Context
++    // Boot count does not change during one process. Avoid Binder or disk in native callbacks.
++    private var bootCount = -1
++    fun clock() = ClockSample(System.currentTimeMillis(), SystemClock.elapsedRealtime(), bootCount)
++    private val workers = Executors.newSingleThreadExecutor()
++    lateinit var controller: StopscrollController
 +        private set
-+    val cutoff = G0Cutoff<G0Tunnel>(SystemClock::elapsedRealtime)
-+    val policy get() = saved.policy
-+    @Volatile var saveFailed = false
-+        private set
-+    @Volatile var watch: FlowWatch? = null
++    private val timers = AndroidTimers { context }
++    // Service identity can register before journal recovery. The empty gate denies admission.
++    val cutoff = EngineAdapter(::clock, timers, fatalDisconnect = {
++        // A blocked JNI sweep and a failed native disconnect leave no proven descriptor
++        // owner to close in Java. Process death closes all FDs, including Firestack's dup.
++        Process.killProcess(Process.myPid())
++        throw IllegalStateException("Unresponsive VPN engine")
++    })
 +
-+    class FlowWatch(val uid: Int) {
-+        val tcp = AtomicLong()
-+        val udp = AtomicLong()
-+        val blocked = AtomicLong()
-+
-+        fun record(protocol: Int, blockedFlow: Boolean) {
-+            when (protocol) {
-+                6 -> tcp.incrementAndGet()
-+                17 -> udp.incrementAndGet()
++    fun restore(app: Context) {
++        context = app.applicationContext
++        bootCount = Settings.Global.getInt(app.contentResolver, Settings.Global.BOOT_COUNT, -1)
++        controller = StopscrollController(StateStore(File(app.filesDir, "stopscroll/state.json")), {
++            val prefs = app.getSharedPreferences("stopscroll-g0", Context.MODE_PRIVATE)
++            val raw = prefs.getString("policy", null)
++            val legacyFile = File(app.applicationInfo.dataDir, "shared_prefs/stopscroll-g0.xml")
++            // SharedPreferences may swallow a malformed XML document and report empty values.
++            check(raw != null || (!legacyFile.exists() && !File(legacyFile.path + ".bak").exists())) {
++                "Existing G0 policy cannot be read"
 +            }
-+            if (blockedFlow) blocked.incrementAndGet()
++            JournalState.initial(ZoneId.systemDefault(), clock(), legacyPolicy(raw))
++        }, ::clock, cutoff, timers) {
++            PlatformProtection(false, VpnController.isAlwaysOn(app), VpnController.isVpnLockdown(), exempt())
 +        }
++        cutoff.onDue = ::reconcileAsync
++        // A trusted calendar adjustment can move the daily boundary before the armed elapsed
++        // deadline. Revoke an expired snapshot before any serialized disk or status work.
++        app.registerReceiver(object : BroadcastReceiver() {
++            override fun onReceive(context: Context, intent: Intent) {
++                val receipt = cutoff.applied
++                if (receipt?.snapshot?.sites?.values?.any { it.session != null } == true)
++                    cutoff.failClosed("Calendar change requires a new session deadline", receipt)
++                reconcileAsync()
++            }
++        }, IntentFilter(Intent.ACTION_TIME_CHANGED))
++        reconcileAsync()
 +    }
++
++    fun reconcileAsync() { workers.execute { controller.reconcile() } }
++    fun exempt() = context.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(context.packageName)
 +
 +    fun configure(state: PersistentState) {
 +        state.braveMode = AppConfig.BraveMode.DNS_FIREWALL.mode
 +        state.logsEnabled = false
 +        state.blocklistEnabled = false
 +        state.allowBypass = false
++        state.enableDnsAlg = false
++        state.enableDnsCache = false
 +        state.splitDns = false
 +        state.useSystemDnsOnCaptivePortal = false
 +        state.useSystemDnsForUndelegatedDomains = false
 +        state.defaultDnsUrl = resolverUrl
 +        state.dnsType = AppConfig.DnsType.DOH.type
 +    }
++}
 +
-+    fun restore(context: Context) {
-+        val text = preferences(context).getString("policy", null) ?: return
-+        val json = JSONObject(text)
-+        val policy = G0Domains.create(strings(json.getJSONArray("domains")), strings(json.getJSONArray("exceptions")))
-+        saved = Saved(json.optLong("revision", 0L), policy)
-+    }
++private class AndroidTimers(private val app: () -> Context) : SessionTimers {
++    // Keep slow journal ticks entirely off the cutoff executor.
++    private val cutoffs = ScheduledThreadPoolExecutor(1).apply { removeOnCancelPolicy = true }
++    private val ticks = ScheduledThreadPoolExecutor(1).apply { removeOnCancelPolicy = true }
++    private fun delayTo(due: Long) = (due - SystemClock.elapsedRealtime()).coerceAtLeast(0)
 +
-+    fun durableRevision(): Long? = saved.revision.takeUnless { saveFailed }
-+
-+    fun replace(context: Context, next: G0Domains) {
-+        val revision = saved.revision + 1
-+        val json = JSONObject()
-+            .put("revision", revision)
-+            .put("domains", JSONArray(next.domains))
-+            .put("exceptions", JSONArray(next.exceptions))
-+        saveFailed = true
-+        check(preferences(context).edit().putString("policy", json.toString()).commit()) {
-+            "Unable to save G0 domains"
++    override fun deadline(elapsedMs: Long, action: () -> Unit): () -> Unit {
++        val power = app().getSystemService(PowerManager::class.java)
++        val wake = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Stopscroll:SessionDeadline")
++        wake.setReferenceCounted(false)
++        wake.acquire(delayTo(elapsedMs) + 2000)
++        val released = AtomicBoolean()
++        fun release() {
++            if (released.compareAndSet(false, true) && wake.isHeld) wake.release()
 +        }
-+        saved = Saved(revision, next)
-+        saveFailed = false
++        val future = try {
++            cutoffs.schedule({ try { action() } finally { release() } }, delayTo(elapsedMs), MILLISECONDS)
++        } catch (e: Exception) { release(); throw e }
++        return { future.cancel(false); release() }
 +    }
 +
-+    fun strings(array: JSONArray): List<String> {
-+        require(array.length() <= 1_000) { "Too many domain entries" }
-+        return List(array.length()) { index ->
-+            requireNotNull(array.get(index) as? String) { "Domain entry must be a string" }
-+        }
++    override fun tick(elapsedMs: Long, action: () -> Unit): () -> Unit {
++        val future = ticks.schedule(action, delayTo(elapsedMs), MILLISECONDS)
++        return { future.cancel(false) }
 +    }
 +
-+    private fun preferences(context: Context) = context.getSharedPreferences("stopscroll-g0", Context.MODE_PRIVATE)
++    override fun warn(site: String) {
++        val context = app()
++        val manager = context.getSystemService(NotificationManager::class.java)
++        val channel = "stopscroll_session"
++        manager.createNotificationChannel(NotificationChannel(channel, "Stopscroll sessions", NotificationManager.IMPORTANCE_DEFAULT))
++        val notification = Notification.Builder(context, channel).setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
++            .setContentTitle("Stopscroll").setContentText("Session for $site ends in two minutes")
++            .setTimeoutAfter(120000).setAutoCancel(true).build()
++        manager.notify(site, 1, notification)
++    }
 +}
 diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/LimitEngine.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/LimitEngine.kt
 new file mode 100644
-index 0000000..ea352ce
+index 0000000..f7e8a27
 --- /dev/null
 +++ b/app/src/main/java/com/celzero/bravedns/stopscroll/LimitEngine.kt
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,194 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package com.celzero.bravedns.stopscroll
 +
@@ -945,13 +1034,25 @@ index 0000000..ea352ce
 +}
 +internal data class PolicySnapshot(
 +    val policy: Policy, val revision: Long, val timezone: ZoneId, val dayId: LocalDate,
-+    val bootCount: Int, val sites: ImmutableMap<String, SiteBudget>
++    val bootCount: Int, val sites: ImmutableMap<String, SiteBudget>, val admissionOpen: Boolean = true
 +) {
 +    private val matcher = PolicyMatcher(policy)
 +    private val nextReset = dayId.plusDays(1).resetMs(timezone)
 +
++    private val active = sites.values.mapNotNull { it.session }
++    private val firstDeadline = active.minOfOrNull { it.deadlineMs }
++    private val lastStart = active.maxOfOrNull { it.startMs } ?: 0L
++
++    fun resetElapsed(clock: ClockSample) = clock.elapsedMs + (nextReset - clock.wallMs).coerceAtLeast(0)
++
++    fun cutoffAt(clock: ClockSample): Long? = firstDeadline?.let { minOf(it, resetElapsed(clock)) }
++
++    fun validAt(clock: ClockSample) = bootCount == clock.bootCount && clock.wallMs < nextReset &&
++        clock.elapsedMs >= lastStart && (firstDeadline == null || clock.elapsedMs < firstDeadline)
++
 +    /** Even a previously published snapshot cannot grant past its deadline. */
 +    fun blocks(host: String, clock: ClockSample): Boolean {
++        if (!admissionOpen) return true
 +        return matcher.blocks(host) { id ->
 +            val s = sites[id]?.session
 +            s != null && clock.bootCount == bootCount && clock.wallMs < nextReset &&
@@ -1105,10 +1206,10 @@ index 0000000..c7ea905
 +}
 diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/PolicyCodec.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/PolicyCodec.kt
 new file mode 100644
-index 0000000..01fe395
+index 0000000..6d69575
 --- /dev/null
 +++ b/app/src/main/java/com/celzero/bravedns/stopscroll/PolicyCodec.kt
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,149 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package com.celzero.bravedns.stopscroll
 +
@@ -1154,6 +1255,7 @@ index 0000000..01fe395
 +            }
 +            JsonToken.STRING -> JsonPrimitive(reader.nextString())
 +            JsonToken.NUMBER -> JsonPrimitive(jsonLong(reader.nextString()))
++            JsonToken.NULL -> { reader.nextNull(); com.google.gson.JsonNull.INSTANCE }
 +            JsonToken.BOOLEAN -> JsonPrimitive(reader.nextBoolean())
 +            else -> invalid("Unexpected JSON token")
 +        }
@@ -1290,10 +1392,10 @@ index 0000000..29de335
 +}
 diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/StateStore.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/StateStore.kt
 new file mode 100644
-index 0000000..74aca4f
+index 0000000..26904f0
 --- /dev/null
 +++ b/app/src/main/java/com/celzero/bravedns/stopscroll/StateStore.kt
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,208 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package com.celzero.bravedns.stopscroll
 +
@@ -1426,13 +1528,20 @@ index 0000000..74aca4f
 +    private companion object { val journalLock = Any() }
 +
 +    fun loadOrCreate(initial: () -> JournalState): JournalState = synchronized(journalLock) {
-+        if (listOf(file, File(file.path + ".bak"), File(file.path + ".new")).any { it.exists() }) {
++        // Keep the installation marker outside the journal directory. A missing initialized
++        // journal must not recreate a fresh empty policy or a full daily budget.
++        val marker = File(requireNotNull(directory.parentFile), ".stopscroll-journal-initialized")
++        val result = if (marker.exists() || listOf(file, File(file.path + ".bak"), File(file.path + ".new")).any { it.exists() }) {
 +            read()
 +        } else {
 +            val state = initial()
 +            save(state)
 +            state
 +        }
++        if (!marker.exists()) marker.createNewFile()
++        java.io.FileInputStream(marker).use { it.fd.sync() }
++        syncDirectory(requireNotNull(marker.parentFile))
++        result
 +    }
 +
 +    private fun readBytes(): ByteArray = atomic.openRead().use { stream ->
@@ -1495,25 +1604,306 @@ index 0000000..74aca4f
 +        }
 +    }
 +}
+diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/StopscrollController.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/StopscrollController.kt
+new file mode 100644
+index 0000000..f8c5c9c
+--- /dev/null
++++ b/app/src/main/java/com/celzero/bravedns/stopscroll/StopscrollController.kt
+@@ -0,0 +1,275 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import com.google.gson.JsonNull
++import com.google.gson.JsonObject
++import java.util.UUID
++
++/** The provider validates raw bytes / envelope before constructing this request. The UI shares
++ * the exact same typed boundary. Freeze the validated arguments before entering the writer. */
++internal data class RpcRequest(val requestId: String, val op: String, val args: JsonObject, val expectedRevision: Long? = null)
++
++internal class RpcReply(val json: JsonObject) {
++    val ok get() = json["ok"].asBoolean
++}
++
++private data class Command(val id: String, val op: String, val expected: Long?, val site: String?,
++                           val minutes: Int?, val policy: Policy?, val hash: String) {
++    companion object {
++        fun parse(q: RpcRequest): Command {
++            if (UUID.fromString(q.requestId).toString() != q.requestId) invalid("Expected canonical UUID")
++            val args = q.args.deepCopy()
++            var site: String? = null
++            var minutes: Int? = null
++            var policy: Policy? = null
++            when (q.op) {
++                "policy.get", "status" -> args.fields()
++                "policy.replace" -> { args.fields("policy"); policy = PolicyCodec.fromJson(args["policy"]) }
++                "session.close", "session.open" -> {
++                    if (q.op == "session.open") {
++                        args.fields("site", "minutes")
++                        minutes = args["minutes"].takeUnless { it.isJsonNull }?.number(1, 1440)?.toInt()
++                    } else args.fields("site")
++                    site = args["site"].string()
++                    if (!siteId.matches(site)) invalid("Invalid site ID")
++                }
++                else -> invalid("Unknown operation")
++            }
++            val mutation = q.op !in listOf("policy.get", "status")
++            if (mutation != (q.expectedRevision != null) || (q.expectedRevision ?: 0) < 0) invalid("Invalid expected revision")
++            // Fixed-order, length-unambiguous canonical tuple of every semantic request field.
++            val tuple = com.google.gson.JsonArray().apply {
++                add(1); add(q.requestId); add(q.op); add(q.expectedRevision); add(site); add(minutes); add(policy?.hash)
++            }
++            return Command(q.requestId, q.op, q.expectedRevision, site, minutes, policy, sha256(tuple.toString().toByteArray()))
++        }
++    }
++}
++
++internal class StopscrollController(
++    private val store: StateStore,
++    private val initial: () -> JournalState,
++    private val clock: () -> ClockSample,
++    private val engine: EngineAdapter,
++    private val timers: SessionTimers,
++    private val platform: () -> PlatformProtection
++) {
++    private var initialized = false
++    private var nextTick: Long? = null
++    private var cancelTick: () -> Unit = {}
++    @Volatile private var saved: PolicySnapshot? = null
++
++    fun snapshot(): PolicySnapshot {
++        val snapshot = checkNotNull(saved) { "No trustworthy Stopscroll journal" }
++        return if (engine.applied?.snapshot?.revision == snapshot.revision) snapshot
++            else snapshot.copy(admissionOpen = false)
++    }
++
++    private fun reply(id: String, revision: Long, applied: Long?, data: JsonObject? = null,
++                      error: String? = null, message: String? = null, persisted: Boolean = false) = RpcReply(JsonObject().apply {
++        addProperty("schema", 1)
++        addProperty("request_id", id)
++        addProperty("ok", error == null)
++        addProperty("revision", revision)
++        addProperty("applied_revision", applied)
++        if (error == null) add("data", requireNotNull(data)) else {
++            add("error", JsonObject().apply { addProperty("code", error); addProperty("message", message ?: error) })
++            if (persisted) addProperty("saved", true)
++        }
++    })
++
++    private fun failure(id: String, state: JournalState, message: String) =
++        reply(id, state.revision, null, error = "APPLY_FAILED", message = message, persisted = true)
++
++    private fun init() {
++        if (!initialized) { store.loadOrCreate(initial); initialized = true }
++    }
++
++    // Exactly one committed pending marker exists during a synchronous mutation. An unresolved
++    // open is settled before *any* recovered grant may be activated. Recovery never reruns it.
++    private fun recover(state: JournalState, now: ClockSample): JournalState {
++        val r = state.receipts.lastOrNull() ?: return state
++        val pending = strictJson(r.replyJson).obj()
++        if (!pending.has("pending_open")) return state
++        val site = pending["pending_open"]
++        val next = if (site.isJsonNull) state else BudgetEngine(state).close(site.string(), now).state
++        val outcome = failure(r.requestId, next, "Native acknowledgement was interrupted")
++        return next.withReceipt(r.copy(replyJson = outcome.json.toString()))
++    }
++
++    private fun update(op: (JournalState) -> Transition): Transition = store.update { previous ->
++        op(previous).also {
++            if (it.state.revision != previous.revision) engine.invalidate()
++        }
++    }
++
++    private fun tick(now: ClockSample) = update { previous -> BudgetEngine(recover(previous, now)).tick(now) }
++
++    private fun publish(state: JournalState, now: ClockSample): Pair<PolicySnapshot, NativeReceipt?> {
++        val snap = BudgetEngine(state).snapshot(now)
++        saved = snap
++        val warning = snap.sites.values.mapNotNull { it.session }.filter { !it.warned && it.deadlineMs - it.startMs > 120000 }
++            .minOfOrNull { it.deadlineMs - 120000 }
++        // A budget timer also settles inactive/degraded engines that have no native receipt.
++        val due = listOfNotNull(warning, snap.cutoffAt(now), snap.resetElapsed(now)).min()
++        if (due != nextTick) {
++            val old = cancelTick
++            cancelTick = timers.tick(due) { reconcile() }
++            nextTick = due
++            old()
++        }
++        return snap to engine.apply(snap).receipt
++    }
++
++    private fun warnings(t: Transition) {
++        t.effects.filter { it.kind == EffectKind.WARN }.forEach { effect ->
++            try { timers.warn(requireNotNull(effect.site)) } catch (_: Exception) { /* Optional notification permission. */ }
++        }
++    }
++
++    private fun storageFault() {
++        saved = null
++        engine.failClosed("Unable to verify durable Stopscroll state")
++    }
++
++    @Synchronized fun reconcile() {
++        try {
++            init()
++            val now = clock()
++            val change = tick(now)
++            publish(change.state, now)
++            warnings(change)
++        } catch (_: Exception) { storageFault() }
++    }
++
++    @Synchronized fun execute(request: RpcRequest): RpcReply {
++        val command = try { Command.parse(request) } catch (e: IllegalArgumentException) {
++            return reply(request.requestId, saved?.revision ?: 0, engine.applied?.snapshot?.revision,
++                error = (e as? PolicyException)?.code ?: "INVALID_REQUEST", message = e.message)
++        }
++        return try {
++            init()
++            val now = clock()
++            val change = tick(now)
++            warnings(change)
++            val state = change.state
++            if (command.expected == null) read(command, state, now)
++            else mutate(command, state, now)
++        } catch (_: Exception) {
++            val revision = saved?.revision ?: 0
++            storageFault()
++            reply(command.id, revision, null, error = "STORAGE_ERROR", message = "Unable to verify durable Stopscroll state")
++        }
++    }
++
++    private fun read(q: Command, state: JournalState, now: ClockSample): RpcReply {
++        val (snap, receipt) = publish(state, now)
++        if (q.op == "policy.get") return reply(q.id, state.revision, engine.applied?.snapshot?.revision, JsonObject().apply {
++            add("policy", PolicyCodec.toJson(state.policy))
++            addProperty("policy_hash", state.policy.hash)
++        })
++        val live = engine.target
++        val observed = try { live?.platform() ?: platform() } catch (_: Exception) { PlatformProtection(false, false, false, false) }
++        val same = live === engine.target
++        if (same && receipt != null && !observed.protected && engine.applied === receipt)
++            engine.failClosed("VPN protection is incomplete", receipt)
++        val confirmed = receipt != null && same && observed.protected && engine.applied === receipt && snap.validAt(clock())
++        val protection = when {
++            !same || !observed.lockdown || !observed.alwaysOn -> "unprotected"
++            live == null && !observed.tunnel -> "stopped"
++            confirmed -> "active"
++            else -> "degraded"
++        }
++        return reply(q.id, state.revision, receipt?.snapshot?.revision?.takeIf { confirmed }, JsonObject().apply {
++            addProperty("policy_hash", state.policy.hash)
++            addProperty("timezone", snap.timezone.id)
++            addProperty("day_id", snap.dayId.toString())
++            addProperty("reset_hour", 4)
++            addProperty("default_session_min", state.policy.defaultSessionMin)
++            add("clock", JsonObject().apply {
++                addProperty("wall_ms", now.wallMs); addProperty("elapsed_ms", now.elapsedMs); addProperty("boot_count", now.bootCount)
++            })
++            add("protection", JsonObject().apply {
++                addProperty("state", protection)
++                addProperty("tunnel", same && observed.tunnel)
++                addProperty("always_on", observed.alwaysOn)
++                addProperty("lockdown", observed.lockdown)
++                addProperty("ignoring_battery_optimizations", observed.exempt)
++                addProperty("preferred_state", engine.preferred.name.lowercase())
++                addProperty("reason", if (confirmed) null else engine.error ?: "No current protected VPN receipt")
++            })
++            addProperty("last_transition_due_elapsed_ms", engine.lastDue)
++            addProperty("last_cutoff_elapsed_ms", engine.lastCutoff)
++            add("sites", JsonObject().apply {
++                for ((id, budget) in snap.sites) add(id, JsonObject().apply {
++                    val rule = state.policy.sites.getValue(id)
++                    addProperty("mode", if (rule.limited) "limited" else "blocked")
++                    addProperty("budget_min", rule.budgetMin)
++                    addProperty("remaining_sec", budget.remainingSeconds)
++                    addProperty("reserved_sec", budget.reservedSeconds)
++                    add("session", budget.session?.let { s -> JsonObject().apply {
++                        addProperty("start_elapsed_ms", s.startMs); addProperty("deadline_elapsed_ms", s.deadlineMs)
++                    } } ?: JsonNull.INSTANCE)
++                })
++            })
++        })
++    }
++
++    private fun mutate(q: Command, before: JournalState, now: ClockSample): RpcReply {
++        before.receipts.firstOrNull { it.requestId == q.id }?.let { cached ->
++            publish(before, now)
++            if (q.hash != cached.requestHash) return reply(q.id, before.revision, engine.applied?.snapshot?.revision,
++                error = "CONFLICT", message = "Request ID already used for a different command")
++            return RpcReply(strictJson(cached.replyJson).obj())
++        }
++        val budget = BudgetEngine(before)
++        val change = if (q.expected != before.revision) Transition(before, emptyList(), "CONFLICT")
++        else when (q.op) {
++            "policy.replace" -> budget.replacePolicy(requireNotNull(q.policy), now)
++            "session.open" -> budget.open(requireNotNull(q.site), (q.minutes ?: before.policy.defaultSessionMin) * 60, now)
++            else -> budget.close(requireNotNull(q.site), now)
++        }
++        val state = change.state
++        val receipt = MutationReceipt(q.id, q.hash, "")
++        if (change.error != null) {
++            val (_, ack) = publish(state, now)
++            val result = reply(q.id, state.revision, ack?.snapshot?.revision, error = change.error)
++            store.update { Transition(it.withReceipt(receipt.copy(replyJson = result.json.toString())), emptyList()) }
++            return result
++        }
++        val opening = q.site.takeIf { q.op == "session.open" }
++        val pending = JsonObject().apply { addProperty("pending_open", opening) }
++        update { change.copy(state = state.withReceipt(receipt.copy(replyJson = pending.toString()))) }
++        val (snap, ack) = publish(state, now)
++        warnings(change)
++        fun failed(): RpcReply {
++            val reason = engine.error ?: "No current protected VPN receipt"
++            engine.failClosed(reason)
++            val settled = update { current ->
++                val close = if (opening == null) Transition(current, emptyList()) else BudgetEngine(current).close(opening, clock())
++                val result = failure(q.id, close.state, reason)
++                close.copy(state = close.state.withReceipt(receipt.copy(replyJson = result.json.toString())))
++            }.state
++            saved = BudgetEngine(settled).snapshot(clock())
++            return failure(q.id, settled, reason)
++        }
++        if (ack == null || !engine.confirm(ack)) return failed()
++        val data = JsonObject().apply {
++            if (q.op == "policy.replace") {
++                addProperty("changed", before.policy != state.policy); addProperty("policy_hash", state.policy.hash)
++            } else {
++                val site = requireNotNull(q.site)
++                val b = snap.sites.getValue(site)
++                addProperty("site", site); addProperty("remaining_sec", b.remainingSeconds)
++                if (opening == null) addProperty("closed", before.accounts[site]?.session != null)
++                else {
++                    val session = requireNotNull(b.session)
++                    addProperty("granted_sec", session.reservedSeconds); addProperty("deadline_elapsed_ms", session.deadlineMs)
++                }
++            }
++        }
++        val result = reply(q.id, state.revision, ack.snapshot.revision, data)
++        store.update { Transition(it.withReceipt(receipt.copy(replyJson = result.json.toString())), emptyList()) }
++        return if (engine.applied === ack && snap.validAt(clock())) result else failed()
++    }
++}
 diff --git a/app/src/main/java/com/celzero/bravedns/tunnel/TunDnsManager.kt b/app/src/main/java/com/celzero/bravedns/tunnel/TunDnsManager.kt
-index 2c71613..33f0c0d 100644
+index 2c71613..1480128 100644
 --- a/app/src/main/java/com/celzero/bravedns/tunnel/TunDnsManager.kt
 +++ b/app/src/main/java/com/celzero/bravedns/tunnel/TunDnsManager.kt
-@@ -34,6 +34,8 @@ import com.celzero.bravedns.util.Logger
+@@ -34,6 +34,7 @@ import com.celzero.bravedns.util.Logger
  import com.celzero.bravedns.util.Logger.LOG_TAG_VPN
  import com.celzero.bravedns.util.ResourceRecordTypes
  import com.celzero.bravedns.util.Utilities.isAtleastR
 +import com.celzero.bravedns.BuildConfig
-+import com.celzero.bravedns.stopscroll.G0Vpn
  import com.celzero.firestack.backend.Backend
  import com.celzero.firestack.backend.DNSOpts
  import com.celzero.firestack.backend.DNSSummary
-@@ -152,6 +154,13 @@ object TunDnsManager: KoinComponent {
+@@ -152,6 +153,14 @@ object TunDnsManager: KoinComponent {
 
          val uid = getUid(uidStr)
          val rinr = persistentState.routeRethinkInRethink
 +        if (BuildConfig.STOPSCROLL_G0) {
-+            val transport = if (G0Vpn.policy.blocks(d.fqdn)) Backend.BlockAll else appendDnsCacheIfNeeded(Backend.Preferred)
++            // Stopscroll checks the captured receipt in G0Tunnel before delegating here.
++            val transport = Backend.Preferred
 +            return dnsOptsFactory().apply {
 +                this.uid = uid.toString()
 +                tidcsv = "$transport:${Backend.Base}"
@@ -1624,233 +2014,36 @@ index 0000000..49287a1
 +}
 diff --git a/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProvider.kt b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProvider.kt
 new file mode 100644
-index 0000000..55fb609
+index 0000000..84067fa
 --- /dev/null
 +++ b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProvider.kt
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,55 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package com.celzero.bravedns.stopscroll
 +
 +import android.content.ContentProvider
 +import android.content.ContentValues
-+import android.content.Context
-+import android.content.Intent
 +import android.database.Cursor
 +import android.net.Uri
 +import android.os.Binder
 +import android.os.Bundle
-+import android.os.PowerManager
-+import android.os.SystemClock
 +import android.util.Base64
-+import com.celzero.bravedns.service.PersistentState
-+import com.celzero.bravedns.service.VpnController
-+import kotlinx.coroutines.CoroutineScope
-+import kotlinx.coroutines.Dispatchers
-+import kotlinx.coroutines.CoroutineStart
-+import kotlinx.coroutines.Job
-+import kotlinx.coroutines.SupervisorJob
-+import kotlinx.coroutines.delay
-+import kotlinx.coroutines.launch
-+import org.json.JSONArray
 +import org.json.JSONObject
-+import org.koin.core.component.KoinComponent
-+import org.koin.core.component.inject
 +import java.nio.ByteBuffer
-+import java.util.concurrent.atomic.AtomicBoolean
 +
-+/** G0 acceptance hooks, reachable only through the Android shell UID. */
-+class UsbControlProvider : ContentProvider(), KoinComponent {
-+    private val persistentState by inject<PersistentState>()
-+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-+    private val gate = G0Vpn.cutoff
-+    private val deadlines = G0Deadlines<G0Tunnel, Deadline>(gate)
-+
-+    private class Deadline(val due: Long, val lock: PowerManager.WakeLock) {
-+        lateinit var job: Job
-+        private val released = AtomicBoolean()
-+        fun release() {
-+            if (released.compareAndSet(false, true) && lock.isHeld) lock.release()
-+        }
-+        fun cancel() {
-+            job.cancel()
-+            release()
-+        }
-+    }
-+
++/** Read-only transition probe until the schema-1 transport is installed. */
++class UsbControlProvider : ContentProvider() {
 +    override fun onCreate() = true
-+
 +    override fun call(method: String, arg: String?, extras: Bundle?): Bundle {
-+        val uid = requireShell()
-+        require(method == "rpc") { "Expected rpc method" }
-+        val reply = try {
-+            dispatch(requireNotNull(context), decode(arg))
-+        } catch (_: Exception) {
-+            JSONObject().put("ok", false).put("error", "G0 request failed")
-+        }.put("uid", uid)
++        requireShell()
++        require(method == "rpc")
++        val request = decode(arg)
++        require(request.length() == 1 && request.getString("op") == "status")
++        val id = java.util.UUID.randomUUID().toString()
++        val reply = G0Vpn.controller.execute(RpcRequest(id, "status", com.google.gson.JsonObject()))
 +        return Bundle().apply {
-+            putString("result_b64", Base64.encodeToString(reply.toString().toByteArray(Charsets.UTF_8), Base64.NO_WRAP))
++            putString("result_b64", Base64.encodeToString(reply.json.toString().toByteArray(), Base64.NO_WRAP))
 +        }
-+    }
-+
-+    private fun dispatch(app: Context, request: JSONObject): JSONObject {
-+        val op = request.get("op") as? String
-+        when (op) {
-+            "status" -> Unit
-+            "enable" -> app.startActivity(Intent(app, G0VpnActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-+            "watchUid" -> {
-+                val uid = number(request, "uid")
-+                require(uid == -1L || uid in 10_000L..99_999L)
-+                G0Vpn.watch = if (uid < 0) null else G0Vpn.FlowWatch(uid.toInt())
-+            }
-+            "blockDomains", "closeAll", "setAlg", "timedBlock" -> {
-+                val before = gate.state
-+                val live = gate.protectedTarget() ?: return refused(app)
-+                if (before.target !== live) return refused(app)
-+                when (op) {
-+                    "timedBlock" -> {
-+                        val duration = number(request, "duration_ms")
-+                        require(duration in 1L..120_000L)
-+                        if (!scheduleBlock(app, policy(request), duration, before)) return refused(app)
-+                    }
-+                    "setAlg" -> {
-+                        val enabled = request.get("enabled") as? Boolean ?: error("Expected boolean")
-+                        if (!setAlg(live, before, enabled)) return refused(app)
-+                    }
-+                    else -> {
-+                        val next = if (op == "blockDomains") policy(request) else null
-+                        val (oldTimer, claim) = synchronized(gate) {
-+                            if (gate.state !== before || before.changing) null to null
-+                            else {
-+                                val old = if (next != null) deadlines.clear() else null
-+                                old to gate.begin(live)
-+                            }
-+                        }
-+                        if (claim == null) return refused(app)
-+                        val applied = try { transition(app, claim, next) } finally { oldTimer?.cancel() }
-+                        if (!applied) return status(app).put("ok", false)
-+                    }
-+                }
-+            }
-+            else -> throw IllegalArgumentException("Unknown G0 operation")
-+        }
-+        return status(app)
-+    }
-+
-+    private fun refused(app: Context) = status(app).put("ok", false)
-+        .put("error", "Active Always-on VPN with lockdown and a current tunnel are required")
-+
-+    private fun setAlg(live: G0Tunnel, before: G0Cutoff.State<G0Tunnel>, enabled: Boolean): Boolean =
-+        gate.updateAlg(live, before, enabled, { persistentState.enableDnsAlg }, live.adapter::g0SetAlg) {
-+            persistentState.enableDnsAlg = it
-+        }
-+
-+    private fun transition(app: Context, claim: G0Cutoff.Claim<G0Tunnel>, policy: G0Domains?): Boolean =
-+        gate.complete(claim) {
-+            if (policy != null) G0Vpn.replace(app, policy)
-+            G0Vpn.durableRevision()
-+        }
-+
-+    private fun scheduleBlock(app: Context, policy: G0Domains, duration: Long,
-+                              before: G0Cutoff.State<G0Tunnel>): Boolean {
-+        val power = app.getSystemService(PowerManager::class.java)
-+        val lock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Stopscroll:G0Deadline")
-+        lock.setReferenceCounted(false)
-+        lock.acquire(duration + 2_000L)
-+        val next = Deadline(SystemClock.elapsedRealtime() + duration, lock)
-+        next.job = scope.launch(start = CoroutineStart.LAZY) {
-+            try {
-+                delay((next.due - SystemClock.elapsedRealtime()).coerceAtLeast(0L))
-+                val claim = deadlines.claim(next, next.due) ?: return@launch
-+                transition(app, claim, policy)
-+            } finally {
-+                next.release()
-+            }
-+        }
-+        val old = deadlines.arm(before, next)
-+        if (old === next) {
-+            next.cancel()
-+            return false
-+        }
-+        next.job.start()
-+        old?.cancel()
-+        return true
-+    }
-+
-+    private fun status(app: Context): JSONObject {
-+        // Slow Android/native calls finish before taking the receipt snapshot. A replacement
-+        // during any query cannot inherit the sampled adapter's platform protection or stats.
-+        val live = gate.state.target
-+        val response = JSONObject()
-+            .put("always_on", VpnController.isAlwaysOn(app))
-+            .put("lockdown", VpnController.isVpnLockdown())
-+            .put("mode", "dns_firewall")
-+            .put("resolver", G0Vpn.resolverUrl)
-+            .put("bootstrap", G0Vpn.resolverIps)
-+            .put("dns_cache", persistentState.enableDnsCache)
-+            .put("logs_enabled", persistentState.logsEnabled)
-+            .put("ignoring_battery_optimizations", app.getSystemService(PowerManager::class.java)
-+                .isIgnoringBatteryOptimizations(app.packageName))
-+        val info = try { live?.adapter?.g0DnsInfo() } catch (_: Exception) { null }
-+        val active = live?.adapter?.hasTunnel() == true
-+        val platform = active && live != null && gate.protectedTarget(live) === live
-+        val currentTimer = synchronized(gate) { deadlines.pending }
-+        val held = currentTimer?.lock?.isHeld == true
-+        val (configuredAlg, snapshot) = gate.withAlgLock {
-+            val configured = persistentState.enableDnsAlg
-+            configured to synchronized(gate) { Triple(gate.state, deadlines.pending, G0Vpn.saved) }
-+        }
-+        val (s, deadline, saved) = snapshot
-+        val same = live != null && s.target === live
-+        val protected = same && platform && s.appliedRevision != null
-+        val error = s.error ?: when {
-+            s.target != null && s.preferred != G0Cutoff.Preferred.READY -> "Preferred DNS is ${s.preferred.name.lowercase()}"
-+            s.target != null && !protected -> "No protected native receipt"
-+            else -> null
-+        }
-+        response.put("ok", error == null)
-+            .put("tunnel", same && active)
-+            .put("protected", protected)
-+            .put("dns_alg", if (s.algUncertain) JSONObject.NULL else configuredAlg)
-+            .put("dns_alg_confirmed", same && s.preferred == G0Cutoff.Preferred.READY && !s.algUncertain)
-+            .put("saved_revision", saved.revision)
-+            .put("applied_revision", s.appliedRevision?.takeIf { protected } ?: JSONObject.NULL)
-+            .put("cutoff_generation", s.generation)
-+            .put("admission_closed", s.appliedRevision == null)
-+            .put("preferred_state", s.preferred.name.lowercase())
-+            .put("last_transition_due_elapsed_ms", s.due ?: JSONObject.NULL)
-+            .put("last_transition_trigger_elapsed_ms", s.trigger ?: JSONObject.NULL)
-+            .put("last_cutoff_elapsed_ms", s.cutoff ?: JSONObject.NULL)
-+            .put("domains", JSONArray(saved.policy.domains))
-+            .put("exceptions", JSONArray(saved.policy.exceptions))
-+            .put("deadline_elapsed_ms", deadline?.due ?: 0L)
-+            .put("now_elapsed_ms", SystemClock.elapsedRealtime())
-+            .put("wake_lock_held", deadline === currentTimer && held)
-+            .put("last_close_call_ms", s.closeMs ?: JSONObject.NULL)
-+            .put("error", error ?: JSONObject.NULL)
-+        if (same && info != null) {
-+            response.put("native_preferred_dns", info.dnsPreferred)
-+                .put("native_default_dns", info.dnsDefault)
-+                .put("native_fallback", info.defaultDNSAsFallback)
-+        }
-+        G0Vpn.watch?.let {
-+            response.put("watched_uid", it.uid)
-+                .put("watched_tcp", it.tcp.get())
-+                .put("watched_udp", it.udp.get())
-+                .put("watched_blocked", it.blocked.get())
-+        }
-+        return response
-+    }
-+
-+    private fun policy(request: JSONObject): G0Domains {
-+        val domains = G0Vpn.strings(request.getJSONArray("domains"))
-+        val exceptions = if (request.has("exceptions")) G0Vpn.strings(request.getJSONArray("exceptions")) else emptyList()
-+        return G0Domains.create(domains, exceptions)
-+    }
-+
-+    private fun number(request: JSONObject, key: String): Long = when (val value = request.get(key)) {
-+        is Int -> value.toLong()
-+        is Long -> value
-+        else -> throw IllegalArgumentException("Expected integer")
 +    }
 +
 +    private fun decode(arg: String?): JSONObject {
@@ -1948,266 +2141,467 @@ index 0000000..c05e17a
 +        }
 +    }
 +}
-diff --git a/app/src/test/java/com/celzero/bravedns/stopscroll/G0CutoffTest.kt b/app/src/test/java/com/celzero/bravedns/stopscroll/G0CutoffTest.kt
+diff --git a/app/src/test/java/com/celzero/bravedns/stopscroll/ControllerTest.kt b/app/src/test/java/com/celzero/bravedns/stopscroll/ControllerTest.kt
 new file mode 100644
-index 0000000..253429a
+index 0000000..7be2675
 --- /dev/null
-+++ b/app/src/test/java/com/celzero/bravedns/stopscroll/G0CutoffTest.kt
-@@ -0,0 +1,256 @@
++++ b/app/src/test/java/com/celzero/bravedns/stopscroll/ControllerTest.kt
+@@ -0,0 +1,310 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package com.celzero.bravedns.stopscroll
 +
++import com.google.gson.JsonObject
++import java.io.File
++import java.time.ZoneId
++import java.util.UUID
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit.SECONDS
++import org.junit.Assert.*
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [33], manifest = Config.NONE)
++class ControllerTest {
++    @get:Rule val folder = TemporaryFolder()
++    private val file get() = File(folder.root, "stopscroll/state.json")
++    private var clock = ClockSample(1783850400000, 7000, 12)
++    private val initial get() = JournalState.initial(ZoneId.of("Europe/Belgrade"), clock, examplePolicy())
++    private val target = TestTunnel()
++    private val timers = TestTimers()
++    private val engine = EngineAdapter({ clock }, timers)
++    private val store by lazy { StateStore(file) }
++    private fun controller(source: StateStore = store) =
++        StopscrollController(source, { initial }, { clock }, engine, timers, { target.platform() })
++    private fun attach() {
++        engine.register(target.owner)
++        engine.attach(target)
++        engine.installPreferred(target) {}
++    }
++    private fun request(op: String, revision: Long? = null, minutes: Int = 5) =
++        RpcRequest(UUID.randomUUID().toString(), op, JsonObject().apply {
++            if (op.startsWith("session.")) addProperty("site", "video")
++            if (op == "session.open") addProperty("minutes", minutes)
++        }, revision)
++    private fun RpcReply.code() = json["error"].asJsonObject["code"].asString
++
++    @Test fun reservePrecedesGrantAndRestartReplaysOriginalReply() {
++        attach()
++        val c = controller()
++        c.reconcile()
++        target.refresh = {
++            assertEquals(300, store.read().accounts.getValue("video").session!!.reservedSeconds)
++            assertNull(engine.receipt(target))
++        }
++        val open = request("session.open", 0)
++        val reply = c.execute(open)
++        assertTrue(reply.json.toString(), reply.ok)
++        assertFalse(engine.receipt(target)!!.snapshot.blocks("video.example.org", clock))
++        target.refresh = {}
++        val close = c.execute(request("session.close", 1))
++        assertTrue(close.ok)
++        val replay = controller().execute(open)
++        assertEquals(reply.json, replay.json)
++        assertNull(store.read().accounts["video"]!!.session)
++        assertEquals("CONFLICT", c.execute(open.copy(expectedRevision = 2)).code())
++    }
++
++    @Test fun concurrentUiAndUsbAreOneBudgetAndOneRevision() {
++        attach()
++        val c = controller()
++        val pool = Executors.newFixedThreadPool(2)
++        try {
++            val replies = (1..2).map { pool.submit<RpcReply> { c.execute(request("session.open", 0)) } }
++                .map { it.get(10, SECONDS) }
++            assertEquals(1, replies.count { it.ok })
++            assertEquals("CONFLICT", replies.single { !it.ok }.code())
++            assertEquals(1L, store.read().revision)
++        } finally { pool.shutdownNow() }
++    }
++
++    @Test fun cutoffSweepsWithoutWaitingForTheWriterAndStaleAlarmCannotSweepAgain() {
++        attach()
++        val entered = CountDownLatch(1)
++        val resume = CountDownLatch(1)
++        var stall = false
++        val c = controller(StateStore(file, beforeFinish = {
++            if (stall) {
++                entered.countDown()
++                check(resume.await(10, SECONDS))
++            }
++        }))
++        assertTrue(c.execute(request("session.open", 0)).ok)
++        val alarm = timers.cutoff!!
++        stall = true
++        val pool = Executors.newFixedThreadPool(2)
++        try {
++            val write = pool.submit<RpcReply> { c.execute(request("session.open", 1)) }
++            assertTrue(entered.await(10, SECONDS))
++            val swept = CountDownLatch(1)
++            target.close = { swept.countDown() }
++            clock = clock.copy(elapsedMs = clock.elapsedMs + 300000)
++            val expiry = pool.submit { alarm() }
++            assertTrue(swept.await(2, SECONDS))
++            assertNull(engine.receipt(target))
++            resume.countDown()
++            write.get(10, SECONDS)
++            expiry.get(10, SECONDS)
++            assertTrue(c.execute(request("session.open", 2)).ok)
++            val before = engine.receipt(target)
++            alarm()
++            assertSame(before, engine.receipt(target))
++        } finally { resume.countDown(); pool.shutdownNow() }
++    }
++
++    @Test fun warningAndRepeatedStatusDoNotResetTransport() {
++        attach()
++        val c = controller()
++        assertTrue(c.execute(request("session.open", 0)).ok)
++        val count = target.sweeps
++        clock = clock.copy(elapsedMs = clock.elapsedMs + 180000)
++        repeat(5) { assertTrue(c.execute(request("status")).ok) }
++        assertEquals(count, target.sweeps)
++        assertEquals(1L, store.read().revision)
++        assertTrue(store.read().accounts["video"]!!.session!!.warned)
++        assertEquals(listOf("video"), timers.warnings)
++    }
++
++    @Test fun storageErrorAfterNativeGrantClosesForwardingAndPendingReplaySettlesOnce() {
++        attach()
++        store.loadOrCreate { initial }
++        val open = request("session.open", 0)
++        var writes = 0
++        var authorizedBeforeCrash = false
++        val fault = StateStore(file, beforeFinish = {
++            if (++writes == 2) {
++                authorizedBeforeCrash = engine.receipt(target) != null
++                throw java.io.IOException("lost final receipt")
++            }
++        })
++        val result = controller(fault).execute(open)
++        assertEquals("STORAGE_ERROR", result.code())
++        assertTrue(authorizedBeforeCrash)
++        assertNull(engine.receipt(target))
++        assertEquals(1L, store.read().revision)
++        assertNotNull(store.read().accounts["video"]!!.session)
++        clock = clock.copy(elapsedMs = clock.elapsedMs + 1500)
++        val after = controller()
++        val replay = after.execute(open)
++        assertEquals("APPLY_FAILED", replay.code())
++        assertTrue(replay.json["saved"].asBoolean)
++        assertEquals(replay.json, after.execute(open).json)
++        assertNull(store.read().accounts["video"]!!.session)
++        assertEquals(2, store.read().accounts["video"]!!.spentSeconds)
++        assertTrue(engine.receipt(target)!!.snapshot.blocks("video.example.org", clock))
++    }
++
++    @Test fun preNativeCrashConsumesPendingMutationWithoutApplyingItsGrant() {
++        attach()
++        val open = request("session.open", 0)
++        val crash = object : SessionTimers by timers {
++            override fun tick(elapsedMs: Long, action: () -> Unit): () -> Unit =
++                throw AssertionError("simulated process loss after committed reservation")
++        }
++        val c = StopscrollController(store, { initial }, { clock }, engine, crash, { target.platform() })
++        assertThrows(AssertionError::class.java) { c.execute(open) }
++        assertEquals(0, target.sweeps)
++        assertNotNull(store.read().accounts["video"]!!.session)
++        val replay = controller().execute(open)
++        assertEquals("APPLY_FAILED", replay.code())
++        assertNull(store.read().accounts["video"]!!.session)
++        assertTrue(engine.receipt(target)!!.snapshot.blocks("video.example.org", clock))
++    }
++
++    @Test fun missingProductJournalNeverReinitializesAndAdmitsNothing() {
++        attach()
++        val c = controller()
++        assertTrue(c.execute(request("session.open", 0)).ok)
++        assertTrue(file.delete())
++        val failed = controller().execute(request("status"))
++        assertEquals("STORAGE_ERROR", failed.code())
++        assertNull(engine.receipt(target))
++        assertFalse(file.exists())
++    }
++
++    @Test fun adapterFailureDistinguishesSavedPolicyAndSettlesFailedOpen() {
++        attach()
++        val c = controller()
++        c.reconcile()
++        target.refresh = { error("injected native resolver error") }
++        val open = request("session.open", 0)
++        val failed = c.execute(open)
++        assertEquals("APPLY_FAILED", failed.code())
++        assertTrue(failed.json["saved"].asBoolean)
++        assertTrue(failed.json["applied_revision"].isJsonNull)
++        assertNull(engine.receipt(target))
++        assertTrue(c.snapshot().blocks("ordinary.example", clock))
++        assertNull(store.read().accounts["video"]!!.session)
++        val replacement = examplePolicy(20)
++        val replace = RpcRequest(UUID.randomUUID().toString(), "policy.replace",
++            JsonObject().apply { add("policy", PolicyCodec.toJson(replacement)) }, 2)
++        val result = c.execute(replace)
++        assertEquals("APPLY_FAILED", result.code())
++        assertEquals(replacement, store.read().policy)
++        val status = c.execute(request("status"))
++        assertTrue(status.ok)
++        assertEquals("degraded", status.json["data"].obj()["protection"].obj()["state"].string())
++        target.refresh = {}
++        assertEquals("active", c.execute(request("status")).json["data"].obj()["protection"].obj()["state"].string())
++        assertEquals(result.json, c.execute(replace).json)
++        assertEquals(3L, engine.receipt(target)?.snapshot?.revision)
++    }
++
++    @Test fun persistsOnlyLast64OutcomesIncludingConflictsAcrossRestart() {
++        attach()
++        val c = controller()
++        val queries = (1..65).map { request("session.close", 9) }
++        val results = queries.map { c.execute(it) }
++        assertTrue(results.all { it.code() == "CONFLICT" })
++        val history = store.read().receipts
++        assertEquals(queries.drop(1).map { it.requestId }, history.map { it.requestId })
++        val recovered = controller()
++        assertEquals(results[1].json, recovered.execute(queries[1]).json)
++        assertEquals("CONFLICT", recovered.execute(queries[1].copy(expectedRevision = 0)).code())
++        assertEquals(history, store.read().receipts)
++    }
++
++    @Test fun legacyMigrationKeepsScopedRulesAndRejectsCorruption() {
++        assertEquals(Policy.EMPTY, legacyPolicy(null))
++        val raw = """{"revision":7,"domains":["video.example.org"],"exceptions":["accounts.video.example.org"]}"""
++        val legacy = legacyPolicy(raw)
++        val first = JournalState.initial(ZoneId.of("UTC"), clock, legacy)
++        val c = StopscrollController(store, { first }, { clock }, engine, timers, { target.platform() })
++        attach()
++        c.reconcile()
++        assertTrue(c.snapshot().blocks("x.video.example.org", clock))
++        assertFalse(c.snapshot().blocks("accounts.video.example.org", clock))
++        assertEquals(setOf("legacy"), store.read().policy.sites.keys)
++        assertTrue(controller().execute(request("status")).ok)
++        assertEquals(legacy, store.read().policy)
++        assertThrows(IllegalArgumentException::class.java) { legacyPolicy(raw.replace("accounts.video.", "outside.")) }
++        assertThrows(IllegalArgumentException::class.java) { legacyPolicy("{broken") }
++    }
++
++    @Test fun savedProhibitionClosesAdmissionWhileTheNativeSweepIsStillRunning() {
++        attach()
++        val c = controller()
++        assertTrue(c.execute(request("session.open", 0)).ok)
++        val started = CountDownLatch(1)
++        val resume = CountDownLatch(1)
++        val pool = Executors.newSingleThreadExecutor()
++        target.close = { started.countDown(); check(resume.await(4, SECONDS)) }
++        try {
++            val close = pool.submit<RpcReply> { c.execute(request("session.close", 1)) }
++            assertTrue(started.await(3, SECONDS))
++            assertNull(engine.admitted(target, listOf("video.example.org")) { "stale permit" })
++            assertNull(store.read().accounts["video"]!!.session)
++            assertNull(engine.receipt(target))
++            resume.countDown()
++            assertTrue(close.get(3, SECONDS).ok)
++            assertTrue(engine.receipt(target)!!.snapshot.blocks("video.example.org", clock))
++        } finally { resume.countDown(); pool.shutdownNow() }
++    }
++
++    @Test fun blockedStatusProbeCannotDelayClaimOrCapturedSweep() {
++        attach()
++        val c = controller()
++        assertTrue(c.execute(request("session.open", 0)).ok)
++        val alarm = timers.cutoff!!
++        val probe = CountDownLatch(1)
++        val resume = CountDownLatch(1)
++        target.probe = {
++            probe.countDown()
++            check(resume.await(5, SECONDS))
++            PlatformProtection(true, true, true, true)
++        }
++        val pool = Executors.newSingleThreadExecutor()
++        try {
++            val status = pool.submit<RpcReply> { c.execute(request("status")) }
++            assertTrue(probe.await(3, SECONDS))
++            val count = target.sweeps
++            clock = clock.copy(elapsedMs = clock.elapsedMs + 300000)
++            alarm()
++            assertEquals(count + 1, target.sweeps)
++            assertNull(engine.receipt(target))
++            resume.countDown()
++            val reply = status.get(3, SECONDS)
++            assertTrue(reply.json["applied_revision"].isJsonNull)
++            assertEquals("degraded", reply.json["data"].obj()["protection"].obj()["state"].string())
++        } finally { resume.countDown(); pool.shutdownNow() }
++    }
++
++    @Test fun cutoffDuringFinalReceiptWriteCannotReturnOrReplaySuccessfulGrant() {
++        attach()
++        store.loadOrCreate { initial }
++        var writes = 0
++        val stalled = StateStore(file, beforeFinish = {
++            if (++writes == 2) {
++                assertNotNull(engine.receipt(target))
++                clock = clock.copy(elapsedMs = clock.elapsedMs + 300000)
++                timers.cutoff!!()
++            }
++        })
++        val c = controller(stalled)
++        val open = request("session.open", 0)
++        val failed = c.execute(open)
++        assertEquals("APPLY_FAILED", failed.code())
++        assertNull(engine.receipt(target))
++        val recovered = controller().execute(open)
++        assertEquals(failed.json, recovered.json)
++        assertNull(store.read().accounts["video"]!!.session)
++        assertEquals(300, store.read().accounts["video"]!!.spentSeconds)
++    }
++}
+diff --git a/app/src/test/java/com/celzero/bravedns/stopscroll/EngineAdapterTest.kt b/app/src/test/java/com/celzero/bravedns/stopscroll/EngineAdapterTest.kt
+new file mode 100644
+index 0000000..d5da782
+--- /dev/null
++++ b/app/src/test/java/com/celzero/bravedns/stopscroll/EngineAdapterTest.kt
+@@ -0,0 +1,141 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import java.time.ZoneId
 +import java.util.concurrent.CountDownLatch
 +import java.util.concurrent.FutureTask
 +import java.util.concurrent.TimeUnit.SECONDS
-+import java.util.concurrent.atomic.AtomicLong
 +import kotlin.concurrent.thread
 +import org.junit.Assert.*
 +import org.junit.Test
 +
-+class G0CutoffTest {
-+    private class Adapter(override val owner: Any = Any()) : G0Cutoff.Target {
-+        var close: () -> Unit = {}
-+        var probe: () -> Boolean = { true }
-+        override fun sweep() = close()
-+        override fun protectedNow() = probe()
++internal class TestTunnel(override val owner: Any = Any()) : EngineTarget {
++    var close: () -> Unit = {}
++    var refresh: () -> Unit = {}
++    var probe: () -> PlatformProtection = { PlatformProtection(true, true, true, true) }
++    var disconnected = false
++    var sweeps = 0
++    override fun sweep() { sweeps++; close() }
++    override fun refreshResolver(): String { refresh(); return "Preferred" }
++    override fun platform() = probe()
++    override fun disconnect() { disconnected = true }
++}
++
++internal class TestTimers : SessionTimers {
++    var cutoff: (() -> Unit)? = null
++    val warnings = mutableListOf<String>()
++    override fun deadline(elapsedMs: Long, action: () -> Unit): () -> Unit {
++        cutoff = action
++        return {}
++    }
++    override fun tick(elapsedMs: Long, action: () -> Unit): () -> Unit = {}
++    override fun warn(site: String) { warnings.add(site) }
++}
++
++class EngineAdapterTest {
++    private var now = ClockSample(1783850400000, 7000, 12)
++    private val timers = TestTimers()
++    private val engine = EngineAdapter({ now }, timers, 200)
++    private val target = TestTunnel()
++    private val state = JournalState.initial(ZoneId.of("UTC"), now, examplePolicy())
++    private val closed = BudgetEngine(state).snapshot(now)
++    private val open = BudgetEngine(BudgetEngine(state).open("video", 60, now).state).snapshot(now)
++    private fun attach(t: TestTunnel = target) {
++        engine.register(t.owner)
++        engine.attach(t)
++        assertTrue(engine.installPreferred(t) {})
 +    }
 +
-+    private val time = AtomicLong(100)
-+    private val gate = G0Cutoff<Adapter>(time::get)
-+    private val first = Adapter()
-+    private fun attach(target: Adapter = first) {
-+        gate.register(target.owner)
-+        gate.attach(target)
-+    }
-+
-+    private fun activate() {
++    @Test fun bridgeReplacementAndInFlightApplyCannotTransferReceipts() {
 +        attach()
-+        gate.installPreferred(first, { 8L }) {}
-+        assertEquals(8L, gate.receipt(first)?.appliedRevision)
-+    }
-+
-+    private fun <T> worker(action: () -> T) = FutureTask(action).also { task ->
-+        thread(isDaemon = true) { task.run() }
-+    }
-+
-+    private fun await(latch: CountDownLatch) = assertTrue("worker timed out", latch.await(4, SECONDS))
-+
-+    @Test fun aNewProcessAndRestoredPolicyNeedANativeActivation() {
-+        assertNull(gate.state.appliedRevision)
-+        attach()
-+        val savedRevision = 8L
-+        assertNull(gate.receipt(first))
-+        var sweeps = 0
-+        first.close = { sweeps++ }
-+        gate.installPreferred(first, { savedRevision }) {}
-+        assertEquals(1, sweeps)
-+        assertEquals(savedRevision, gate.receipt(first)?.appliedRevision)
-+    }
-+
-+    @Test fun activationAndReceiptsBelongToOneServiceAndAdapter() {
-+        activate()
-+        val oldReceipt = gate.receipt(first)
-+        val claim = gate.begin(first)
-+        val oldSweep = CountDownLatch(1)
-+        val resume = CountDownLatch(1)
-+        first.close = { oldSweep.countDown(); await(resume) }
-+        val saving = worker { gate.complete(claim) { 9L } }
-+        await(oldSweep)
-+        val second = Adapter()
-+        attach(second)
-+        gate.unregister(first.owner)
-+        gate.attach(first)
-+        assertNull(gate.receipt(second))
-+        assertFalse(gate.permits(first, oldReceipt))
-+        val installed = CountDownLatch(1)
-+        var newSweeps = 0
-+        second.close = { newSweeps++ }
-+        val activating = worker { gate.installPreferred(second, { 9L }) { installed.countDown() } }
-+        await(installed)
-+        resume.countDown()
-+        assertFalse(saving.get(4, SECONDS))
-+        activating.get(4, SECONDS)
-+        assertEquals(1, newSweeps)
-+        assertEquals(9L, gate.receipt(second)?.appliedRevision)
-+        val third = Adapter(second.owner)
-+        gate.attach(third)
-+        gate.detach(second)
-+        assertSame(third, gate.state.target)
-+        assertNull(gate.receipt(third))
-+    }
-+
-+    @Test fun preferredInstallMustSucceedAndStayOnTheSameAdapter() {
-+        attach()
++        val old = engine.apply(closed).receipt!!
 +        val started = CountDownLatch(1)
 +        val resume = CountDownLatch(1)
-+        val setup = worker {
-+            assertThrows(IllegalStateException::class.java) {
-+                gate.installPreferred(first, { 7L }) {
-+                    started.countDown()
-+                    await(resume)
-+                    error("install failed")
-+                }
-+            }
-+        }
-+        await(started)
-+        assertEquals(G0Cutoff.Preferred.INSTALLING, gate.state.preferred)
-+        assertFalse(gate.complete(gate.begin(first, 90L)) { 7L })
-+        assertNull(gate.receipt(first))
++        target.refresh = { started.countDown(); resume.await(3, SECONDS) }
++        val task = FutureTask { engine.apply(open).receipt }
++        thread { task.run() }
++        assertTrue(started.await(3, SECONDS))
++        val second = TestTunnel()
++        attach(second)
++        engine.unregister(target.owner)
++        engine.detach(target)
 +        resume.countDown()
-+        setup.get(4, SECONDS)
-+        assertEquals(G0Cutoff.Preferred.FAILED, gate.state.preferred)
-+        assertFalse(gate.complete(gate.begin(first)) { 7L })
-+        gate.installPreferred(first, { 7L }) {}
-+        assertEquals(7L, gate.receipt(first)?.appliedRevision)
++        assertNull(task.get(3, SECONDS))
++        assertFalse(engine.permits(target, old))
++        assertSame(second, engine.apply(closed).receipt?.target)
 +    }
 +
-+    @Test fun slowStatusOrAlgProtectionProbeCannotHoldUpADeadline() {
-+        activate()
-+        val sampled = gate.state
-+        val blocked = CountDownLatch(2)
-+        val resume = CountDownLatch(1)
-+        first.probe = { blocked.countDown(); await(resume); true }
-+        val status = worker { gate.protectedTarget() }
-+        val alg = worker { gate.protectedReceipt(first, sampled) }
-+        await(blocked)
-+        val swept = CountDownLatch(1)
-+        first.close = { time.set(132); swept.countDown() }
-+        time.set(117)
-+        val revoke = worker { gate.complete(gate.begin(first, 110L)) { 9L } }
-+        await(swept)
-+        assertNull(gate.receipt(first))
-+        resume.countDown()
-+        assertSame(first, status.get(4, SECONDS))
-+        assertFalse(alg.get(4, SECONDS))
-+        assertTrue(revoke.get(4, SECONDS))
-+        assertEquals(110L, gate.state.due)
-+        assertEquals(117L, gate.state.trigger)
-+        assertEquals(132L, gate.state.cutoff)
-+        assertEquals(15L, gate.state.closeMs)
-+        assertFalse(gate.permits(first, sampled))
++    @Test fun resolverFailureClosesAccessAndOnlySuccessfulRecoveryGetsNewReceipt() {
++        attach()
++        val original = engine.apply(open).receipt!!
++        target.refresh = { error("resolver refused refresh") }
++        assertNull(engine.apply(closed).receipt)
++        assertNull(engine.receipt(target))
++        assertFalse(engine.permits(target, original))
++        assertEquals(2, target.sweeps)
++        target.refresh = {}
++        assertEquals(0L, engine.apply(closed).receipt?.snapshot?.revision)
 +    }
 +
-+    @Test fun deadlineSweepsWhileOldSaveIsBlockedAndItsPolicyWins() {
-+        activate()
-+        val oldSaving = CountDownLatch(1)
-+        val finish = CountDownLatch(1)
-+        val saved = AtomicLong(8)
-+        val old = worker {
-+            gate.complete(gate.begin(first)) {
-+                oldSaving.countDown()
-+                await(finish)
-+                saved.incrementAndGet()
-+            }
++    @Test fun timedOutSweepDisposesCapturedNativeTunnel() {
++        attach()
++        assertNotNull(engine.apply(open).receipt)
++        val hanging = CountDownLatch(1)
++        target.close = { hanging.await(3, SECONDS) }
++        try { assertNull(engine.apply(closed).receipt) } finally { hanging.countDown() }
++        assertTrue(target.disconnected)
++        assertNull(engine.receipt(target))
++        assertEquals(Preferred.FAILED, engine.preferred)
++        assertFalse(engine.installPreferred(target) {})
++        val replacement = TestTunnel(target.owner)
++        engine.attach(replacement)
++        assertTrue(engine.installPreferred(replacement) {})
++        assertSame(replacement, engine.apply(closed).receipt?.target)
++    }
++
++    @Test fun failedPreferredAndMissingProtectionNeverActivate() {
++        engine.register(target.owner)
++        engine.attach(target)
++        assertFalse(engine.installPreferred(target) { error("installation failed") })
++        assertNull(engine.apply(open).receipt)
++        assertTrue(engine.installPreferred(target) {})
++        target.probe = { PlatformProtection(true, false, false, true) }
++        assertNull(engine.apply(open).receipt)
++        target.probe = { PlatformProtection(true, true, true, false) }
++        assertNull(engine.apply(open).receipt)
++    }
++
++    @Test fun guardedCallbacksCheckAllDomainsBeforeUpstreamAndRevalidateItsAnswer() {
++        attach()
++        assertNotNull(engine.apply(closed).receipt)
++        fun admit(vararg domains: String): String? = engine.admitted(target, domains.toList()) { "upstream" }
++        assertNull(engine.admitted(target, listOf("video.example.org")) { error("must not delegate") })
++        assertEquals("upstream", admit("accounts.video.example.org"))
++        val ack = engine.apply(open).receipt!!
++        assertEquals("Preferred", ack.resolverId)
++        assertEquals("upstream", admit("video.example.org"))
++        assertNull(admit("video.example.org", "live.video.example.org"))
++        assertNull(admit("pay.accounts.video.example.org"))
++        assertNull(engine.admitted(target, listOf("video.example.org")) {
++            now = now.copy(elapsedMs = open.sites.getValue("video").session!!.deadlineMs)
++            "stale response"
++        })
++        // A delayed alarm cannot authorize a callback after monotonic expiry.
++        assertNull(admit("video.example.org"))
++    }
++
++    @Test fun lostNativeDisconnectEscalatesAndCannotRearmTheRetiredEngine() {
++        val e = EngineAdapter({ now }, timers, 100, fatalDisconnect = { throw AssertionError("kernel FD teardown") })
++        val t = object : EngineTarget by target {
++            override fun sweep() = error("native cutoff failed")
++            override fun disconnect() = error("native detach failed")
 +        }
-+        await(oldSaving)
-+        val swept = CountDownLatch(1)
-+        first.close = { swept.countDown() }
-+        val latest = worker { gate.complete(gate.begin(first, 99L)) { saved.addAndGet(10) } }
-+        await(swept)
-+        assertNull(gate.receipt(first))
-+        finish.countDown()
-+        assertFalse(old.get(4, SECONDS))
-+        assertTrue(latest.get(4, SECONDS))
-+        assertEquals(19L, saved.get())
-+        assertEquals(19L, gate.state.appliedRevision)
-+    }
-+
-+    @Test fun replacedOrCancelledDeadlineCannotConsumeTheNewGrant() {
-+        activate()
-+        val deadlines = G0Deadlines<Adapter, Any>(gate)
-+        val firstAlarm = Any()
-+        val nextAlarm = Any()
-+        val receipt = gate.state
-+        assertNull(deadlines.arm(receipt, firstAlarm))
-+        assertSame(firstAlarm, deadlines.arm(receipt, nextAlarm))
-+        assertNull(deadlines.claim(firstAlarm, 100))
-+        assertTrue(gate.permits(first, receipt))
-+        val claim = requireNotNull(deadlines.claim(nextAlarm, 101))
-+        assertNull(deadlines.claim(nextAlarm, 101))
-+        assertNull(gate.receipt(first))
-+        assertTrue(gate.complete(claim) { 9L })
-+        assertSame(firstAlarm, deadlines.arm(receipt, firstAlarm))
-+        assertNull(deadlines.arm(gate.state, firstAlarm))
-+        assertSame(firstAlarm, deadlines.clear())
-+        assertNull(deadlines.claim(firstAlarm, 102))
-+    }
-+
-+    @Test fun invalidationAfterNativeAlgMutationRestoresTheReportedMode() {
-+        activate()
-+        var effective = false
-+        var reported = false
-+        val before = gate.state
-+        val result = gate.updateAlg(first, before, true, { reported }, { enabled ->
-+            effective = enabled
-+            if (enabled) {
-+                assertTrue(gate.complete(gate.begin(first, 99L)) { 9L })
-+            }
-+        }, { reported = it })
-+        assertFalse(result)
-+        assertFalse(reported)
-+        assertEquals(reported, effective)
-+        assertEquals(9L, gate.receipt(first)?.appliedRevision)
-+    }
-+
-+    @Test fun rollbackFailureClosesTheCurrentAdapterUntilAReplacementIsInitialized() {
-+        activate()
-+        val changed = CountDownLatch(1)
-+        val finish = CountDownLatch(1)
-+        var effective = false
-+        var reported = false
-+        val before = gate.state
-+        val updating = worker {
-+            gate.updateAlg(first, before, true, { reported }, { enabled ->
-+                if (!enabled) error("resolver no longer accepts a rollback")
-+                effective = true
-+                changed.countDown()
-+                await(finish)
-+            }, { reported = it })
-+        }
-+        await(changed)
-+        // The timer must be able to sweep and publish while the ALG caller is still blocked.
-+        assertTrue(gate.complete(gate.begin(first, 99L)) { 9L })
-+        finish.countDown()
-+        assertFalse(updating.get(4, SECONDS))
-+        assertTrue(effective)
-+        assertFalse(reported)
-+        assertTrue(gate.state.algUncertain)
-+        assertNull(gate.receipt(first))
-+        assertFalse(gate.complete(gate.begin(first)) { 9L })
-+        val next = Adapter()
-+        attach(next)
-+        gate.installPreferred(next, { 9L }) { gate.withAlgLock { effective = reported } }
-+        assertFalse(effective)
-+        assertFalse(gate.state.algUncertain)
-+        assertEquals(9L, gate.receipt(next)?.appliedRevision)
-+    }
-+
-+    @Test fun authorizedAlgCommitAndInitializationUseTheSameCommittedMode() {
-+        activate()
-+        var effective = false
-+        var reported = false
-+        assertTrue(gate.updateAlg(first, gate.state, true, { reported }, { effective = it }, { reported = it }))
-+        assertTrue(reported && effective)
-+        assertTrue(gate.withAlgLock { reported })
-+    }
-+
-+    @Test fun staleSaveSweepFailureOrMissingProtectionCannotOpenAdmission() {
-+        activate()
-+        val old = gate.begin(first)
-+        val current = gate.begin(first)
-+        assertFalse(gate.complete(old) { fail("stale save"); 8L })
-+        first.close = { error("native failure") }
-+        assertFalse(gate.complete(current) { 9L })
-+        assertNull(gate.state.cutoff)
-+        assertNull(gate.receipt(first))
-+        first.close = {}
-+        assertFalse(gate.complete(gate.begin(first)) { null })
-+        assertNull(gate.receipt(first))
-+        first.probe = { false }
-+        assertNull(gate.protectedTarget())
-+        assertFalse(gate.complete(gate.begin(first)) { 9L })
-+        assertNull(gate.receipt(first))
++        e.register(t.owner)
++        e.attach(t)
++        assertTrue(e.installPreferred(t) {})
++        val fatal = assertThrows(AssertionError::class.java) { e.apply(open) }
++        assertEquals("kernel FD teardown", fatal.message)
++        assertFalse(e.installPreferred(t) {})
++        assertNull(e.receipt(t))
 +    }
 +}
 diff --git a/app/src/test/java/com/celzero/bravedns/stopscroll/G0DialTest.kt b/app/src/test/java/com/celzero/bravedns/stopscroll/G0DialTest.kt
@@ -2229,46 +2623,6 @@ index 0000000..0ac7441
 +        val oldRetry = Settings.RetryWithSplit
 +        assertEquals(Settings.SplitAuto to Settings.RetryAfterSplit, effectiveDialStrategy(true, oldMode, oldRetry))
 +        assertEquals(oldMode to oldRetry, effectiveDialStrategy(false, oldMode, oldRetry))
-+    }
-+}
-diff --git a/app/src/test/java/com/celzero/bravedns/stopscroll/G0DomainsTest.kt b/app/src/test/java/com/celzero/bravedns/stopscroll/G0DomainsTest.kt
-new file mode 100644
-index 0000000..bb21c7b
---- /dev/null
-+++ b/app/src/test/java/com/celzero/bravedns/stopscroll/G0DomainsTest.kt
-@@ -0,0 +1,34 @@
-+package com.celzero.bravedns.stopscroll
-+
-+import org.junit.Assert.assertFalse
-+import org.junit.Assert.assertThrows
-+import org.junit.Assert.assertTrue
-+import org.junit.Test
-+
-+class G0DomainsTest {
-+    @Test
-+    fun `matches DNS labels and honors exceptions for entire subtrees`() {
-+        val policy = G0Domains.create(listOf("YouTube.COM."), listOf("accounts.youtube.com"))
-+
-+        assertTrue(policy.blocks("YOUTUBE.COM."))
-+        assertTrue(policy.blocks("www.youtube.com"))
-+        assertFalse(policy.blocks("notyoutube.com"))
-+        assertFalse(policy.blocks("youtube.com.example"))
-+        assertFalse(policy.blocks("accounts.youtube.com."))
-+        assertFalse(policy.blocks("login.accounts.youtube.com"))
-+        assertFalse(policy.blocks("accounts.google.com"))
-+    }
-+
-+    @Test
-+    fun `rejects invalid or oversized inputs before replacing anything`() {
-+        for (bad in listOf("", "*.example.com", "a..example", "a.test..", "https://test", "-a.test")) {
-+            assertThrows(IllegalArgumentException::class.java) { G0Domains.create(listOf(bad), emptyList()) }
-+        }
-+        assertThrows(IllegalArgumentException::class.java) {
-+            G0Domains.create(List(1_001) { "domain$it.example" }, emptyList())
-+        }
-+        assertThrows(IllegalArgumentException::class.java) {
-+            G0Domains.create(List(700) { "${"a".repeat(60)}.${"b".repeat(60)}.$it.example" }, emptyList())
-+        }
 +    }
 +}
 diff --git a/app/src/test/java/com/celzero/bravedns/stopscroll/LimitEngineTest.kt b/app/src/test/java/com/celzero/bravedns/stopscroll/LimitEngineTest.kt
