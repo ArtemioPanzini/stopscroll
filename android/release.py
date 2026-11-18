@@ -102,7 +102,7 @@ def install_release(apk, receipt_path, transport, *, tools, runner=subprocess.ru
             with candidate.open('rb') as stream:
                 size = os.fstat(stream.fileno()).st_size
                 result = bound.stream_to_shell(
-                    stream, 'pm', 'install', '--user', '0', '-r', '--pkg', PACKAGE, '-S', str(size), '-',
+                    stream, 'pm', 'install', '--user', '0', '-r', '--pkg', PACKAGE, '-S', str(size),
                 )
             if result.strip() != b'Success':
                 raise OSError('Android Package Manager did not confirm installation.')

@@ -287,7 +287,7 @@ class InstallerTests(unittest.TestCase):
         destination.write_bytes(self.installed_bytes)
 
     def stream(self, source, *args):
-        self.assertEqual(args, ('pm', 'install', '--user', '0', '-r', '--pkg', PACKAGE, '-S', str(len(APK)), '-'))
+        self.assertEqual(args, ('pm', 'install', '--user', '0', '-r', '--pkg', PACKAGE, '-S', str(len(APK))))
         self.installs.append(source.read())
         if self.ok_output == b'Success\n':
             self.installed_bytes = self.installs[-1]
