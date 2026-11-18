@@ -74,10 +74,8 @@ sudo journalctl -u stopscrolld.service -u stopscroll-dns.service
 USB; после отключения кабеля фильтр работает самостоятельно. [Сборка, установка,
 проверки и ограничения](android/README.md).
 
-Блокировка отдельных Telegram-каналов на Android — отдельная задача. Для её
-исследования подготовлен [промпт новой сессии](docs/prompts/telegram-android-research.md)
-с контекстом Desktop, существующего VPN, вариантами реализации и требованиями к
-сравнению архитектур.
+Блокировка отдельных Telegram-каналов на Android пока не реализована;
+дальнейшие задачи перечислены в [FOLLOW_UPS.md](FOLLOW_UPS.md).
 
 ## Выбранные Telegram-каналы
 

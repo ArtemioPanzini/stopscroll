@@ -5,24 +5,11 @@ limits. The phone has its own budgets, timezone and 04:00 reset. Once configured
 use the Stopscroll screen to open and close sessions. Elapsed time in a session
 counts while the phone sleeps. USB is only needed for manual administration.
 
-Release `30000071` was installed and manually tested on Android 13 with Wi-Fi
-IPv4. A separate app confirmed allowed HTTPS, scoped exceptions, denial of
-provider access, TCP/UDP closure, early-close refunds, and replay without a second
-reservation or refund. Minute deadlines cut native traffic 17 ms after the due
-time while awake, 42 ms in forced Doze, and 11 ms with Wi-Fi disabled. These are
-measurements from this device, rather than latency guarantees for other phones.
-The Doze sample was taken after the deadline without intervening ADB commands;
-notification permission was denied. With the cable unplugged, the owner also
-confirmed that X and YouTube were blocked while an ordinary website loaded.
-Wi-Fi recovery, an upgrade with an active
-session, reboot accounting, and concurrent phone-screen/USB changes passed.
-Chrome HTTP/3 requests received fresh responses while a session was open and
-received no HTTP responses after close, immediately and on a later attempt,
-without clearing browser data or bypassing service workers.
-
-Mobile data, roaming and real IPv6 remain outside the verified scope. The 04:00
-rollover and DST cases have host-test coverage; the physical run did not change
-the phone clock or wait through those transitions.
+Release `30000071` was manually tested on Android 13 with Wi-Fi IPv4.
+Mobile data, roaming and real IPv6 remain outside the verified scope. See the
+[verification matrix](../docs/android-vpn-verification.md) for measured results
+and limitations, and the [architecture](../docs/android-vpn-design.md) for policy,
+budget and filtering semantics.
 
 ## Build from source
 

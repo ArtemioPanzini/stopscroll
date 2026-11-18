@@ -87,6 +87,7 @@ compile_commands.json
 /telegram/STATUS.md
 /telegram/publication-task-1-report.md
 /docs/superpowers/
+/docs/prompts/
 /.superpowers/
 .idea/
 .vscode/

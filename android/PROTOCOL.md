@@ -8,7 +8,8 @@ Policy schema, canonical bytes and time semantics are defined in the
 
 Request fields: `schema: 1`, canonical lowercase UUID `request_id`, `op`, `args`;
 mutations additionally require nonnegative integer `expected_revision`.
-Exactly five operations and their argument fields from design section 7.
+Exactly five operations; their argument fields are listed in the
+[USB protocol and CLI section](../docs/android-vpn-design.md#6-usb-протокол-и-cli).
 
 Reply fields: `schema: 1`, echoed `request_id`, boolean `ok`, nonnegative integer
 `revision`, `applied_revision` (nonnegative integer or null), and exactly one of
@@ -105,7 +106,7 @@ these boundaries and document any outcome that remains indeterminate.
 The controller is the only durable writer. Deadline admission revocation and the
 captured adapter's sweep must not wait on blocking controller diagnostics or
 initialization. Keep the short admission claim independent of the serial durable
-transaction, as established by G0. Physical acceptance must test the completed APK from a separate application UID,
-including live traffic, sleep and reboot. Host tests and self-reported status do
+transaction. Physical acceptance must test the completed APK from a separate
+application UID, including live traffic, sleep and reboot. Host tests and self-reported status do
 not establish those results. USB commands are manual; there is no connection
 watcher or background synchronization.
