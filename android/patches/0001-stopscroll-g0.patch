@@ -1,5 +1,5 @@
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index 0a2469d..f20c3af 100644
+index 0a2469d..47bb82d 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
 @@ -23,6 +23,7 @@ plugins {
@@ -19,7 +19,15 @@ index 0a2469d..f20c3af 100644
 
  // Pass -PwebsiteDegoogled=true when building the fdroid flavor with our own keys.
  // Official F-Droid builds omit this flag and will be labeled as "fdroid".
-@@ -168,9 +169,16 @@ android {
+@@ -132,6 +133,7 @@ fun getVersionCode(): Int {
+ }
+
+ val appVersionCode = getVersionCode()
++val stopscrollBaseVersionCode = 71
+
+ try {
+     if (keystorePropertiesFile.exists()) {
+@@ -168,9 +170,16 @@ android {
          testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
          // Defaults to false; the fdroid flavor overrides it via -PwebsiteDegoogled=true.
          buildConfigField("boolean", "IS_WEBSITE_DEGOOGLD_BUILD", "false")
@@ -36,7 +44,7 @@ index 0a2469d..f20c3af 100644
          create("config") {
              keyAlias = keystoreProperties.getProperty("keyAlias", "")
              keyPassword = keystoreProperties.getProperty("keyPassword", "")
-@@ -258,6 +266,14 @@ android {
+@@ -258,6 +267,15 @@ android {
                  applicationIdSuffix = ".izzy"
              }
          }
@@ -44,6 +52,7 @@ index 0a2469d..f20c3af 100644
 +            initWith(getByName("release"))
 +            optimization { enable = true }
 +            applicationIdSuffix = ".stopscroll"
++            buildConfigField("int", "BASE_VERSION_CODE", stopscrollBaseVersionCode.toString())
 +            isDebuggable = false
 +            signingConfig = signingConfigs.getByName("stopscroll")
 +            buildConfigField("boolean", "STOPSCROLL_G0", "true")
@@ -51,7 +60,7 @@ index 0a2469d..f20c3af 100644
          create("leakCanary") {
              matchingFallbacks += listOf("debug")
              initWith(getByName("debug"))
-@@ -360,6 +376,7 @@ android {
+@@ -360,6 +378,7 @@ android {
      }
      sourceSets {
          getByName("main").res.directories.add("src/full/res")
@@ -59,7 +68,7 @@ index 0a2469d..f20c3af 100644
          getByName("full").res.directories.clear()
      }
      lint {
-@@ -395,7 +412,53 @@ kotlin {
+@@ -395,16 +414,63 @@ kotlin {
      }
  }
 
@@ -112,8 +121,28 @@ index 0a2469d..f20c3af 100644
 +    }
      onVariants(selector().all()) { variant ->
          variant.outputs.forEach { output ->
++            val baseVersion = if (variant.buildType == "stopscrollRelease") stopscrollBaseVersionCode else output.versionCode.get()
              val abi =
-@@ -508,7 +571,13 @@ dependencies {
+                 output.filters.find { it.filterType == FilterConfiguration.FilterType.ABI }?.identifier
+             if (abi != null) {
+                 // ABI-specific output: assign the correct per-ABI version code
+                 // e.g. for arm64-v8a: 3 * 10000000 + versionCode
+                 val multiplier = abiVersionCodes[abi] ?: 0
+-                val v = multiplier * 10000000 + (output.versionCode.get())
++                val v = multiplier * 10000000 + baseVersion
+                 output.versionCode.set(v)
+             } else {
+                 // universal APK: preserve existing production behaviour (arm64-v8a multiplier)
+@@ -412,7 +478,7 @@ androidComponents {
+                 // when splits are disabled (e.g. alpha builds), firstAbi is null; fall back to
+                 // the arm64-v8a multiplier (3) so versionCode arithmetic still works
+                 val multiplier = abiVersionCodes.getValue("arm64-v8a")
+-                val v = multiplier * 10000000 + (output.versionCode.get())
++                val v = multiplier * 10000000 + baseVersion
+                 output.versionCode.set(v)
+             }
+         }
+@@ -508,7 +574,13 @@ dependencies {
      // add ":debug" suffix to the dependency to include debug symbols
      download(firestackDependency())
      "websiteImplementation"(firestackDependency())
@@ -187,6 +216,42 @@ index e1a4bd5..07df8b3 100644
              ptMode,
              bridge,
              getDefaultDns(),
+diff --git a/app/src/main/java/com/celzero/bravedns/database/RefreshDatabase.kt b/app/src/main/java/com/celzero/bravedns/database/RefreshDatabase.kt
+index fd5bfc4..7a21596 100644
+--- a/app/src/main/java/com/celzero/bravedns/database/RefreshDatabase.kt
++++ b/app/src/main/java/com/celzero/bravedns/database/RefreshDatabase.kt
+@@ -20,6 +20,7 @@ import com.celzero.bravedns.util.Logger.LOG_TAG_APP_DB
+ import com.celzero.bravedns.util.Logger.LOG_TAG_VPN
+ import android.app.NotificationChannel
+ import android.app.NotificationManager
++import com.celzero.bravedns.BuildConfig
+ import android.app.PendingIntent
+ import android.content.Context
+ import android.content.Intent
+@@ -701,6 +702,7 @@ internal constructor(
+     }
+
+     private suspend fun maybeSendNewAppNotification(apps: Set<FirewallManager.AppInfoTuple>) {
++        if (BuildConfig.STOPSCROLL_G0) return
+         // need not notify if "block newly installed apps" is off: insertApp() & insertUnkownApp()
+         if (!persistentState.getBlockNewlyInstalledApp()) return
+
+@@ -882,6 +884,7 @@ internal constructor(
+     }
+
+     private suspend fun notifyEmptyFirewallRulesIfNeeded() {
++        if (BuildConfig.STOPSCROLL_G0) return
+         val trackedApps = FirewallManager.getAllApps()
+         if (trackedApps.isNotEmpty()) {
+             return
+@@ -936,6 +939,7 @@ internal constructor(
+     }
+
+     private fun showDatabaseCorruptionNotification() {
++        if (BuildConfig.STOPSCROLL_G0) return
+         val notificationManager =
+             ctx.getSystemService(VpnService.NOTIFICATION_SERVICE) as NotificationManager
+
 diff --git a/app/src/main/java/com/celzero/bravedns/net/go/GoVpnAdapter.kt b/app/src/main/java/com/celzero/bravedns/net/go/GoVpnAdapter.kt
 index 143661a..0a74aac 100644
 --- a/app/src/main/java/com/celzero/bravedns/net/go/GoVpnAdapter.kt
@@ -325,7 +390,7 @@ index 143661a..0a74aac 100644
          } catch (e: Exception) {
              Logger.e(LOG_TAG_VPN, "$TAG err set dial strategy: ${e.message}", e)
 diff --git a/app/src/main/java/com/celzero/bravedns/service/BraveVPNService.kt b/app/src/main/java/com/celzero/bravedns/service/BraveVPNService.kt
-index a0c06b4..ea39d9a 100644
+index a0c06b4..cb12387 100644
 --- a/app/src/main/java/com/celzero/bravedns/service/BraveVPNService.kt
 +++ b/app/src/main/java/com/celzero/bravedns/service/BraveVPNService.kt
 @@ -127,6 +127,10 @@ import com.celzero.bravedns.util.Utilities.isPlayStoreFlavour
@@ -339,7 +404,24 @@ index a0c06b4..ea39d9a 100644
  import com.celzero.firestack.backend.Backend
  import com.celzero.firestack.backend.Client
  import com.celzero.firestack.backend.DNSOpts
-@@ -604,6 +608,8 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -153,6 +157,8 @@ import kotlinx.coroutines.CoroutineDispatcher
+ import kotlinx.coroutines.CoroutineName
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.FlowPreview
++import com.celzero.bravedns.stopscroll.StopscrollNotifications
++import kotlinx.coroutines.Job
+ import kotlinx.coroutines.MainScope
+ import kotlinx.coroutines.cancel
+ import kotlinx.coroutines.currentCoroutineContext
+@@ -185,6 +191,7 @@ import kotlin.time.Duration.Companion.milliseconds
+ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, NetworkLifecycleObserver.Listener, Bridge, OnSharedPreferenceChangeListener {
+
+     private val vpnScope = MainScope()
++    private var stopscrollNotice: Job? = null
+
+     // used mostly for service to adapter creation and updates
+     private val serializer: CoroutineDispatcher = Daemons.make("vpnser")
+@@ -604,6 +611,8 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
              logd("builder: set metered: ${persistentState.setVpnBuilderToMetered}")
          }
 
@@ -348,7 +430,49 @@ index a0c06b4..ea39d9a 100644
          if (!vpnLockdown && persistentState.allowBypass) {
              builder.allowBypass()
              logd("builder: allow bypass: true")
-@@ -1637,7 +1643,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -868,6 +877,10 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+     }
+
+     private fun updateNotificationBuilder(): Notification {
++        if (BuildConfig.STOPSCROLL_G0) {
++            ensureNotificationChannelExists()
++            return StopscrollNotifications.service(this, MAIN_CHANNEL_ID, G0Vpn.controller.ending.value)
++        }
+         val pendingIntent =
+             Utilities.getActivityPendingIntent(
+                 this,
+@@ -1186,15 +1199,26 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+             }
+         }
+
++        if (BuildConfig.STOPSCROLL_G0 && stopscrollNotice == null) {
++            stopscrollNotice = vpnScope.launch {
++                G0Vpn.controller.ending.collect {
++                    // Notification permission can be denied without affecting the VPN or its deadlines.
++                    try { notificationManager.notify(SERVICE_ID, updateNotificationBuilder()) }
++                    catch (_: SecurityException) {}
++                }
++            }
++        }
++
+         ui {
+             // this should always be set before ConnectionMonitor is init-d
+             // see restartVpn and updateTun which expect this to be the case
+             persistentState.setVpnEnabled(true)
+
+-            // periodic health-check that re-adds proxies missing from the tunnel
+-            GlobalProxyHandler.start(vpnScope)
+-
+-            startOrbotAsyncIfNeeded()
++            if (!BuildConfig.STOPSCROLL_G0) {
++                // Periodic health-check for upstream proxy configurations.
++                GlobalProxyHandler.start(vpnScope)
++                startOrbotAsyncIfNeeded()
++            }
+
+             val isNewVpn = connectionMonitor.onVpnStart(this)
+
+@@ -1637,7 +1661,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
              }
 
              PersistentState.DNS_ALG -> {
@@ -357,7 +481,7 @@ index a0c06b4..ea39d9a 100644
              }
 
              PersistentState.PRIVATE_IPS -> {
-@@ -1980,6 +1986,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -1980,6 +2004,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
                  return@withContext
              }
 
@@ -365,7 +489,7 @@ index a0c06b4..ea39d9a 100644
              vpnAdapter?.closeTun()
              vpnAdapter = null
              Logger.i(LOG_TAG_VPN, "stop vpn adapter")
-@@ -2159,6 +2166,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -2159,6 +2184,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
                          vpnAdapter?.unlink()
                      }
                  }
@@ -373,7 +497,7 @@ index a0c06b4..ea39d9a 100644
                  val tunFd = establishVpn(nws, mtu)
                  if (tunFd == null) {
                      io("noTunRestart1") {
-@@ -2169,17 +2177,15 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -2169,17 +2195,15 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
                      return@withContext
                  }
 
@@ -400,7 +524,7 @@ index a0c06b4..ea39d9a 100644
                  if (!ok) {
                      io("noTunnelRestart2") {
                          Logger.i(LOG_TAG_VPN, "----------------------RESTART-ERR2----------------------")
-@@ -2253,37 +2259,32 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -2253,38 +2277,33 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
 
      private suspend fun makeOrUpdateVpnAdapter(
          ctx: Context,
@@ -445,11 +569,13 @@ index a0c06b4..ea39d9a 100644
 +                    bridge?.attach(created)
                      Logger.d(LOG_TAG_VPN, "vpn-adapter created with ifaddr: $ifaceAddresses, protos: $protos")
 -                    io("tunInit") { vpnAdapter?.initResolverProxiesPcap(opts) }
+-                    io("rpnCheck") { checkForPlusSubscription() }
 +                    io("tunInit") { created.initResolverProxiesPcap(nativeOpts) }
-                     io("rpnCheck") { checkForPlusSubscription() }
++                    if (!BuildConfig.STOPSCROLL_G0) io("rpnCheck") { checkForPlusSubscription() }
                      return@withContext ok
                  } else {
-@@ -2328,12 +2329,6 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+                     Logger.i(LOG_TAG_VPN, "vpn-adapter exists, fd: $fd, policy: ${restartPolicy.name}, lockdown: $lockdown, protos: $protos, mtu: $mtu, nwMtu: $nwMtu")
+@@ -2328,12 +2347,6 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
              } catch (e: Exception) {
                  Logger.e(LOG_TAG_VPN, "err new vpn-adapter: ${e.message}", e)
                  return@withContext noTun
@@ -462,7 +588,15 @@ index a0c06b4..ea39d9a 100644
              }
          }
 
-@@ -3034,7 +3029,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -2934,6 +2947,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+     }
+
+     private fun showIpMismatchNotification() {
++        if (BuildConfig.STOPSCROLL_G0) return // Upstream advisory opens unsupported routing controls.
+         ui {
+             // NOTIF_CHANNEL_ID_FIREWALL_ALERTS, make sure it exists on this path too.
+             if (isAtleastO()) {
+@@ -3034,7 +3048,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
          networkLifecycleObserver.stop()
          GlobalProxyHandler.stop()
          wgProxyPingController.stopAll()
@@ -471,7 +605,7 @@ index a0c06b4..ea39d9a 100644
          // stop the inapp billing handler if it exists
          //InAppBillingHandler.endConnection()
          try {
-@@ -3180,7 +3175,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -3180,7 +3194,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
                  )
 
              // val mtu = mtu() // get mtu from the underlyingnetworks
@@ -480,7 +614,7 @@ index a0c06b4..ea39d9a 100644
 
              // set the PendingIntent to an activity for users to configure the vpn connection.
              // if it is not set, the button to configure will not be shown in system-managed dialogs
-@@ -3192,8 +3187,8 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -3192,8 +3206,8 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
              val noRoutes = !has4 && !has6
 
              builderRoutes = Pair(has4, has6)
@@ -491,7 +625,7 @@ index a0c06b4..ea39d9a 100644
 
              // setup the gateway addr
              if (has4 || noRoutes) {
-@@ -3400,7 +3395,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -3400,7 +3414,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
 
      private fun addRoute6(b: Builder): Builder {
          // TODO: as of now, vpn lockdown mode is not handled, check if this is required
@@ -500,7 +634,7 @@ index a0c06b4..ea39d9a 100644
              Logger.i(LOG_TAG_VPN, "addRoute6: privateIps is true, adding routes")
              // exclude LAN traffic, add only unicast routes
              // add only unicast routes
-@@ -3434,7 +3429,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -3434,7 +3448,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
 
      private fun addRoute4(b: Builder): Builder {
          // TODO: as of now, vpn lockdown mode is not handled, check if this is required
@@ -509,7 +643,7 @@ index a0c06b4..ea39d9a 100644
              Logger.i(LOG_TAG_VPN, "addRoute4: privateIps is true, adding routes")
              // https://developer.android.com/reference/android/net/VpnService.Builder.html#addRoute(java.lang.String,%20int)
              // Adds a route to the VPN's routing table. The VPN will forward all traffic to the
-@@ -3664,10 +3659,11 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -3664,10 +3678,11 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
          withContext(CoroutineName(s) + Dispatchers.Main) { f() }
 
      override fun onQuery(origin: String, uidGostr: String, fqdn: String, qtype: Long): DNSOpts {
@@ -522,7 +656,7 @@ index a0c06b4..ea39d9a 100644
      }
 
      private fun isCaptivePortal(): Boolean {
-@@ -3858,17 +3854,19 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+@@ -3858,17 +3873,19 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
          probableDomains: String?,
          blocklists: String?,
          isAlg: Boolean
@@ -549,6 +683,33 @@ index a0c06b4..ea39d9a 100644
 
      // no need of go2kt here as it is called from go and performs db operations with no return value
      // requires go2kt if there any calls to go functions
+@@ -4698,7 +4715,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+
+     @RequiresApi(VERSION_CODES.Q)
+     private fun handleFirewallBubbleIfNeeded() {
+-        if (!persistentState.firewallBubbleEnabled) {
++        if (BuildConfig.STOPSCROLL_G0 || !persistentState.firewallBubbleEnabled) {
+             Logger.w(TAG, "Bubble disabled by user")
+             unobserveBubbleBlockedConns()
+             BubbleHelper.dismissBubble(this)
+@@ -4772,7 +4789,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+     private fun makeFirewallBlockedConnsObserver(): Observer<Int> {
+         return Observer { t ->
+             // If user disabled bubble (or it was auto-disabled), stop observing.
+-            if (!persistentState.firewallBubbleEnabled) {
++            if (BuildConfig.STOPSCROLL_G0 || !persistentState.firewallBubbleEnabled) {
+                 try {
+                     BubbleHelper.dismissBubble(this)
+                     removeBubbleObserver()
+@@ -4790,7 +4807,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
+
+                 // updateBubble can flip the toggle off (permission revoked). If that happened,
+                 // stop observing and clean up.
+-                if (!persistentState.firewallBubbleEnabled) {
++                if (BuildConfig.STOPSCROLL_G0 || !persistentState.firewallBubbleEnabled) {
+                     BubbleHelper.dismissBubble(this)
+                     removeBubbleObserver()
+                 }
 diff --git a/app/src/main/java/com/celzero/bravedns/service/VpnController.kt b/app/src/main/java/com/celzero/bravedns/service/VpnController.kt
 index d032e94..6ef1a78 100644
 --- a/app/src/main/java/com/celzero/bravedns/service/VpnController.kt
@@ -943,10 +1104,10 @@ index 0000000..31da01f
 +}
 diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/G0Vpn.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Vpn.kt
 new file mode 100644
-index 0000000..3f256ac
+index 0000000..fa83d74
 --- /dev/null
 +++ b/app/src/main/java/com/celzero/bravedns/stopscroll/G0Vpn.kt
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,146 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package com.celzero.bravedns.stopscroll
 +
@@ -996,7 +1157,7 @@ index 0000000..3f256ac
 +    private var bootCount = -1
 +    fun clock() = ClockSample(System.currentTimeMillis(), SystemClock.elapsedRealtime(), bootCount)
 +    private val workers = Executors.newSingleThreadExecutor()
-+    lateinit var controller: StopscrollController
++    lateinit var controller: DailyController
 +        private set
 +    private val timers = AndroidTimers { context }
 +    private fun endProcess(): Nothing {
@@ -1013,7 +1174,7 @@ index 0000000..3f256ac
 +    fun restore(app: Context) {
 +        context = app.applicationContext
 +        bootCount = Settings.Global.getInt(app.contentResolver, Settings.Global.BOOT_COUNT, -1)
-+        controller = StopscrollController(StateStore(File(app.filesDir, "stopscroll/state.json")), {
++        controller = DailyController(StopscrollController(StateStore(File(app.filesDir, "stopscroll/state.json")), {
 +            val prefs = app.getSharedPreferences("stopscroll-g0", Context.MODE_PRIVATE)
 +            val raw = prefs.getString("policy", null)
 +            val legacyFile = File(app.applicationInfo.dataDir, "shared_prefs/stopscroll-g0.xml")
@@ -1024,7 +1185,7 @@ index 0000000..3f256ac
 +            JournalState.initial(ZoneId.systemDefault(), clock(), legacyPolicy(raw))
 +        }, ::clock, cutoff, timers) {
 +            PlatformProtection(false, VpnController.isAlwaysOn(app), VpnController.isVpnLockdown(), exempt())
-+        }
++        })
 +        cutoff.onDue = ::reconcileAsync
 +        // A trusted calendar adjustment can move the daily boundary before the armed elapsed
 +        // deadline. Revoke an expired snapshot before any serialized disk or status work.
@@ -1041,6 +1202,7 @@ index 0000000..3f256ac
 +
 +    fun configure(state: PersistentState) {
 +        state.braveMode = AppConfig.BraveMode.DNS_FIREWALL.mode
++        state.prefAutoStartBootUp = true
 +        state.logsEnabled = false
 +        state.blocklistEnabled = false
 +        state.allowBypass = false
@@ -1076,7 +1238,7 @@ index 0000000..3f256ac
 +    }
 +
 +    override fun tick(elapsedMs: Long, action: () -> Unit): () -> Unit {
-+        val future = ticks.schedule(action, delayTo(elapsedMs), MILLISECONDS)
++        val future = ticks.schedule({ action(); G0Vpn.controller.refreshEnding() }, delayTo(elapsedMs), MILLISECONDS)
 +        return { future.cancel(false) }
 +    }
 +
@@ -1086,7 +1248,8 @@ index 0000000..3f256ac
 +        val channel = "stopscroll_session"
 +        manager.createNotificationChannel(NotificationChannel(channel, "Stopscroll sessions", NotificationManager.IMPORTANCE_DEFAULT))
 +        val notification = Notification.Builder(context, channel).setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
-+            .setContentTitle("Stopscroll").setContentText("Session for $site ends in two minutes")
++            .setContentTitle("Stopscroll").setContentText("Отрезок для $site закончится через две минуты")
++            .setContentIntent(StopscrollNotifications.open(context))
 +            .setTimeoutAfter(120000).setAutoCancel(true).build()
 +        manager.notify(site, 1, notification)
 +    }
@@ -2070,6 +2233,65 @@ index 0000000..f8d5579
 +        } catch (_: OutcomeSuperseded) { failed() }
 +    }
 +}
+diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/StopscrollNotifications.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/StopscrollNotifications.kt
+new file mode 100644
+index 0000000..f744ded
+--- /dev/null
++++ b/app/src/main/java/com/celzero/bravedns/stopscroll/StopscrollNotifications.kt
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import android.app.Notification
++import android.app.PendingIntent
++import android.content.Context
++import android.content.Intent
++import android.os.SystemClock
++import java.time.Instant
++import java.time.ZoneId
++import java.time.format.DateTimeFormatter
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++internal data class SessionEnd(val elapsedMs: Long, val timezone: ZoneId)
++
++/** Process-local notification projection. The controller remains the only journal and policy writer. */
++internal class DailyController(private val core: StopscrollController) {
++    private val nearest = MutableStateFlow<SessionEnd?>(null)
++    val ending = nearest.asStateFlow()
++
++    fun execute(request: RpcRequest) = core.execute(request).also { refreshEnding() }
++    fun reconcile() { core.reconcile(); refreshEnding() }
++
++    @Synchronized fun refreshEnding() {
++        val snap = try { core.snapshot() } catch (_: IllegalStateException) { null }
++        nearest.value = snap?.sites?.values?.mapNotNull { it.session?.deadlineMs }?.minOrNull()?.let {
++            SessionEnd(it, snap.timezone)
++        }
++    }
++}
++
++internal object StopscrollNotifications {
++    private const val DAILY = "com.celzero.bravedns.stopscroll.StopscrollActivity"
++    fun open(context: Context): PendingIntent {
++        val intent = Intent().setClassName(context.packageName, DAILY)
++            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
++        return PendingIntent.getActivity(context, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
++    }
++
++    fun service(context: Context, channel: String, end: SessionEnd?): Notification {
++        val until = end?.let {
++            val left = it.elapsedMs - SystemClock.elapsedRealtime()
++            if (left <= 0) null else Instant.ofEpochMilli(System.currentTimeMillis() + left)
++                .atZone(it.timezone).format(DateTimeFormatter.ofPattern("HH:mm:ss z"))
++        }
++        return Notification.Builder(context, channel).setSmallIcon(com.celzero.bravedns.R.drawable.ic_notification_icon)
++            .setContentTitle("Stopscroll · служба VPN")
++            .setContentText(if (until == null) "Открыть состояние защиты" else "Ближайший конец отрезка в $until")
++            .setContentIntent(open(context)).setOngoing(true).setOnlyAlertOnce(true)
++            .setVisibility(Notification.VISIBILITY_PRIVATE).build()
++    }
++}
 diff --git a/app/src/main/java/com/celzero/bravedns/stopscroll/VpnDescriptor.kt b/app/src/main/java/com/celzero/bravedns/stopscroll/VpnDescriptor.kt
 new file mode 100644
 index 0000000..259ebd2
@@ -2127,16 +2349,39 @@ index 2c71613..1480128 100644
          val appMode = appConfig.getBraveMode()
 
          // when the active network is behind a captive portal, route every query to the system
+diff --git a/app/src/main/java/com/celzero/bravedns/util/Utilities.kt b/app/src/main/java/com/celzero/bravedns/util/Utilities.kt
+index f49a600..a97e71b 100644
+--- a/app/src/main/java/com/celzero/bravedns/util/Utilities.kt
++++ b/app/src/main/java/com/celzero/bravedns/util/Utilities.kt
+@@ -54,6 +54,7 @@ import android.widget.Toast
+ import androidx.appcompat.content.res.AppCompatResources
+ import androidx.core.content.getSystemService
+ import androidx.lifecycle.LifecycleCoroutineScope
++import com.celzero.bravedns.stopscroll.StopscrollNotifications
+ import com.celzero.bravedns.BuildConfig
+ import com.celzero.bravedns.R
+ import com.celzero.bravedns.RethinkDnsApplication.Companion.DEBUG
+@@ -917,6 +918,9 @@ object Utilities {
+         flag: Int,
+         mutable: Boolean
+     ): PendingIntent {
++        if (BuildConfig.STOPSCROLL_G0 && intent.component?.packageName == context.packageName) {
++            return StopscrollNotifications.open(context)
++        }
+         return if (isAtleastS()) {
+             val sFlag = flag or if (mutable) PendingIntent.FLAG_MUTABLE else PendingIntent.FLAG_IMMUTABLE
+             PendingIntent.getActivity(context, 0, intent, sFlag)
 diff --git a/app/src/stopscrollRelease/AndroidManifest.xml b/app/src/stopscrollRelease/AndroidManifest.xml
 new file mode 100644
-index 0000000..e319ada
+index 0000000..2536466
 --- /dev/null
 +++ b/app/src/stopscrollRelease/AndroidManifest.xml
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,30 @@
 +<?xml version="1.0" encoding="utf-8"?>
 +<manifest xmlns:android="http://schemas.android.com/apk/res/android"
 +    xmlns:tools="http://schemas.android.com/tools">
 +    <uses-permission android:name="android.permission.WAKE_LOCK" />
++    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 +    <application android:label="Stopscroll" tools:replace="android:label">
 +        <provider
 +            android:name="com.celzero.bravedns.stopscroll.UsbControlProvider"
@@ -2144,9 +2389,10 @@ index 0000000..e319ada
 +            android:exported="true"
 +            android:grantUriPermissions="false" />
 +        <activity
-+            android:name="com.celzero.bravedns.stopscroll.G0VpnActivity"
++            android:name="com.celzero.bravedns.stopscroll.StopscrollActivity"
 +            android:exported="true"
-+            android:excludeFromRecents="true">
++            android:launchMode="singleTop"
++            android:theme="@android:style/Theme.Material.Light.NoActionBar">
 +            <intent-filter>
 +                <action android:name="android.intent.action.MAIN" />
 +                <category android:name="android.intent.category.LAUNCHER" />
@@ -2154,6 +2400,10 @@ index 0000000..e319ada
 +        </activity>
 +        <activity-alias android:name=".ui.activity.LauncherAliasAppLock" tools:node="remove" />
 +        <activity-alias android:name=".ui.LauncherAliasHome" tools:node="remove" />
++        <activity android:name=".ui.activity.AppLockActivity" tools:node="remove" />
++        <service android:name=".service.BraveTileService" tools:node="remove" />
++        <service android:name=".util.BackgroundAccessibilityService" tools:node="remove" />
++        <receiver android:name=".receiver.NotificationActionReceiver" tools:node="remove" />
 +        <receiver android:name=".receiver.VpnControlReceiver" tools:node="remove" />
 +    </application>
 +</manifest>
@@ -2171,60 +2421,58 @@ index 0000000..09c828f
 +
 +The Stopscroll source distribution includes the native build script under
 +android/native/build-firestack.sh and input hashes in android/upstream.lock.json.
-diff --git a/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/G0VpnActivity.kt b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/G0VpnActivity.kt
+diff --git a/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/DailyStatus.kt b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/DailyStatus.kt
 new file mode 100644
-index 0000000..49287a1
+index 0000000..b0f7552
 --- /dev/null
-+++ b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/G0VpnActivity.kt
-@@ -0,0 +1,50 @@
++++ b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/DailyStatus.kt
+@@ -0,0 +1,48 @@
 +// SPDX-License-Identifier: Apache-2.0
 +package com.celzero.bravedns.stopscroll
 +
-+import android.app.Activity
-+import android.app.AlertDialog
-+import android.content.Intent
-+import android.net.VpnService
-+import android.os.Bundle
-+import com.celzero.bravedns.R
-+import com.celzero.bravedns.service.VpnController
++import com.google.gson.JsonObject
++import java.time.ZoneId
++import java.util.UUID
 +
-+/** VPN permission must be granted by the device owner through Android's consent activity. */
-+class G0VpnActivity : Activity() {
-+    override fun onCreate(savedInstanceState: Bundle?) {
-+        super.onCreate(savedInstanceState)
-+        if (savedInstanceState != null) return
-+        AlertDialog.Builder(this)
-+            .setTitle(R.string.stopscroll_g0_title)
-+            .setMessage(getString(R.string.stopscroll_g0_resolver, G0Vpn.resolverUrl))
-+            .setPositiveButton(android.R.string.ok) { _, _ ->
-+                val prepare = VpnService.prepare(this)
-+                if (prepare == null) {
-+                    startVpn()
-+                } else {
-+                    @Suppress("DEPRECATION")
-+                    startActivityForResult(prepare, REQUEST_VPN)
-+                }
-+            }
-+            .setNegativeButton(android.R.string.cancel) { _, _ -> finish() }
-+            .setOnCancelListener { finish() }
-+            .show()
-+    }
++internal object DailyCommands {
++    fun status() = RpcRequest(UUID.randomUUID().toString(), "status", JsonObject())
 +
-+    @Deprecated("Android compatibility callback for the system VPN consent screen")
-+    @Suppress("DEPRECATION")
-+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-+        super.onActivityResult(requestCode, resultCode, data)
-+        if (requestCode != REQUEST_VPN) return
-+        if (resultCode == RESULT_OK) startVpn() else finish()
-+    }
++    fun session(site: String, revision: Long, open: Boolean, minutes: Int? = null) =
++        RpcRequest(UUID.randomUUID().toString(), if (open) "session.open" else "session.close", JsonObject().apply {
++            addProperty("site", site)
++            if (open) addProperty("minutes", minutes)
++        }, revision)
++}
 +
-+    private fun startVpn() {
-+        VpnController.start(this)
-+        finish()
-+    }
++internal data class DailySite(val limited: Boolean, val budgetMin: Int, val remaining: Int,
++                              val reserved: Int, val end: Long?)
++internal data class DailyStatus(
++    val revision: Long, val applied: Long?, val state: String, val reason: String?, val tunnel: Boolean,
++    val alwaysOn: Boolean, val lockdown: Boolean, val exempt: Boolean, val preferred: String,
++    val zone: ZoneId, val day: String, val reset: Int, val defaultMin: Int,
++    val wallMs: Long, val elapsedMs: Long, val sites: Map<String, DailySite>
++) {
++    fun endWall(deadline: Long) = wallMs + (deadline - elapsedMs)
 +
 +    companion object {
-+        private const val REQUEST_VPN = 1
++        fun from(reply: RpcReply): DailyStatus {
++            val r = reply.json
++            val d = r.getAsJsonObject("data")
++            val p = d.getAsJsonObject("protection")
++            val clock = d.getAsJsonObject("clock")
++            val sites = d.getAsJsonObject("sites").entrySet().associate { (id, raw) ->
++                val s = raw.asJsonObject
++                val deadline = s["session"].takeUnless { it.isJsonNull }?.asJsonObject?.get("deadline_elapsed_ms")?.asLong
++                id to DailySite(s["mode"].asString == "limited", s["budget_min"].asInt, s["remaining_sec"].asInt,
++                    s["reserved_sec"].asInt, deadline)
++            }
++            return DailyStatus(r["revision"].asLong, r["applied_revision"].takeUnless { it.isJsonNull }?.asLong,
++                p["state"].asString, p["reason"].takeUnless { it.isJsonNull }?.asString, p["tunnel"].asBoolean,
++                p["always_on"].asBoolean, p["lockdown"].asBoolean, p["ignoring_battery_optimizations"].asBoolean,
++                p["preferred_state"].asString, ZoneId.of(d["timezone"].asString), d["day_id"].asString,
++                d["reset_hour"].asInt, d["default_session_min"].asInt, clock["wall_ms"].asLong,
++                clock["elapsed_ms"].asLong, sites)
++        }
 +    }
 +}
 diff --git a/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/RpcCodec.kt b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/RpcCodec.kt
@@ -2430,6 +2678,287 @@ index 0000000..91bf00b
 +        }
 +    }
 +}
+diff --git a/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/StopscrollActivity.kt b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/StopscrollActivity.kt
+new file mode 100644
+index 0000000..aa79388
+--- /dev/null
++++ b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/StopscrollActivity.kt
+@@ -0,0 +1,275 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import android.Manifest
++import android.app.Activity
++import android.app.AlertDialog
++import android.content.Intent
++import android.content.pm.PackageManager
++import android.graphics.Typeface
++import android.net.Uri
++import android.net.VpnService
++import android.os.Build
++import android.os.Bundle
++import android.os.SystemClock
++import android.provider.Settings
++import android.text.InputType
++import android.view.View
++import android.widget.Button
++import android.widget.EditText
++import android.widget.LinearLayout
++import android.widget.ScrollView
++import android.widget.TextView
++import com.celzero.bravedns.service.VpnController
++import java.time.Instant
++import java.time.format.DateTimeFormatter
++import java.util.Locale
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.isActive
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.withContext
++
++/** The launcher consumes the same revisioned transactions as USB. External intents never select
++ * an operation, arguments or site. Only an explicit tap can start a session or request consent. */
++class StopscrollActivity : Activity() {
++    internal var execute: (RpcRequest) -> RpcReply = { G0Vpn.controller.execute(it) }
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
++    private var visible: Job? = null
++    private val reads = Mutex()
++    private var mutation = false
++    private var generation = 0L
++    private var state: DailyStatus? = null
++    private val rows = linkedMapOf<String, Row>()
++    private lateinit var column: LinearLayout
++    private lateinit var protection: TextView
++    private lateinit var settings: TextView
++    private lateinit var day: TextView
++    private lateinit var message: TextView
++    private lateinit var groups: LinearLayout
++    private lateinit var empty: TextView
++    private lateinit var start: Button
++    private lateinit var battery: Button
++    private lateinit var notifications: Button
++
++    private inner class Row(val id: String) {
++        val container = LinearLayout(this@StopscrollActivity).apply { orientation = LinearLayout.VERTICAL }
++        val name = text(container, id, 19, true)
++        val balance = text(container, "", 16)
++        val action = button(container, "") { choose(id) }
++    }
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++        column = LinearLayout(this).apply {
++            orientation = LinearLayout.VERTICAL
++            val pad = (20 * resources.displayMetrics.density).toInt()
++            setPadding(pad, pad, pad, pad)
++        }
++        setContentView(ScrollView(this).apply { addView(column) })
++        text(column, "Stopscroll", 28, true)
++        protection = text(column, "Проверяем защиту…", 21, true)
++        settings = text(column, "", 15)
++        day = text(column, "", 16)
++        message = text(column, "", 16).apply { accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE }
++        text(column, "Сайты", 22, true)
++        empty = text(column, "", 16)
++        groups = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; column.addView(this) }
++        text(column, "Настройка VPN", 22, true)
++        text(column, "Разрешённые DNS-запросы обрабатывает ${G0Vpn.resolverUrl}.", 15)
++        start = button(column, "Запустить VPN") { prepareVpn() }
++        button(column, "Постоянный VPN и блокировка без VPN") { launchSystem(Intent(Settings.ACTION_VPN_SETTINGS)) }
++        battery = button(column, "Исключить Stopscroll из оптимизации батареи") {
++            launchSystem(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
++        }
++        notifications = button(column, "Разрешить уведомления об отрезках") {
++            if (Build.VERSION.SDK_INT >= 33)
++                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), NOTICE)
++        }
++        button(column, "О приложении") {
++            AlertDialog.Builder(this).setTitle("Stopscroll")
++                .setMessage("VPN основан на RethinkDNS и Firestack. Бюджет телефона хранится на этом устройстве.")
++                .setPositiveButton(android.R.string.ok, null).show()
++        }
++    }
++
++    private fun text(parent: LinearLayout, label: String, size: Int, bold: Boolean = false) =
++        TextView(this).apply {
++            text = label
++            textSize = size.toFloat()
++            if (bold) setTypeface(typeface, Typeface.BOLD)
++            val space = (resources.displayMetrics.density * (if (bold) 12 else 4)).toInt()
++            setPadding(0, space, 0, space)
++            parent.addView(this)
++        }
++
++    private fun button(parent: LinearLayout, label: String, click: () -> Unit) = Button(this).apply {
++        text = label
++        isAllCaps = false
++        setOnClickListener { click() }
++        parent.addView(this)
++    }
++
++    override fun onResume() {
++        super.onResume()
++        notifications.visibility = if (Build.VERSION.SDK_INT >= 33 &&
++            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
++            View.VISIBLE else View.GONE
++        visible = scope.launch {
++            while (isActive) {
++                refresh()
++                // Only while visible. Countdown rendering uses elapsed time without journal I/O.
++                repeat(5) { delay(1000); renderRows() }
++            }
++        }
++    }
++
++    override fun onPause() { visible?.cancel(); visible = null; super.onPause() }
++    override fun onDestroy() { scope.cancel(); super.onDestroy() }
++
++    private suspend fun refresh() = reads.withLock {
++        val stamp = generation
++        val result = withContext(Dispatchers.IO) { execute(DailyCommands.status()) }
++        if (stamp != generation || mutation) return@withLock
++        if (!result.ok) {
++            state = null
++            protection.text = "Состояние защиты неизвестно"
++            settings.text = result.json.getAsJsonObject("error")["message"].asString
++            day.text = ""
++            start.visibility = View.VISIBLE
++            battery.visibility = View.VISIBLE
++        } else {
++            state = DailyStatus.from(result)
++            renderState(requireNotNull(state))
++        }
++        renderRows()
++    }
++
++    private fun renderState(s: DailyStatus) {
++        val label = when (s.state) {
++            "active" -> "Защита активна"
++            "degraded" -> "Фильтр работает с ошибкой"
++            "stopped" -> "VPN остановлен"
++            else -> "Нет подтверждённой защиты"
++        }
++        protection.text = label
++        fun yes(value: Boolean) = if (value) "да" else "нет"
++        settings.text = listOfNotNull(
++            "Туннель — ${yes(s.tunnel)}  ·  постоянный VPN — ${yes(s.alwaysOn)}",
++            "Блокировка без VPN — ${yes(s.lockdown)}  ·  исключение батареи — ${yes(s.exempt)}",
++            "DNS Preferred — ${s.preferred}",
++            "Ревизия сохранена ${s.revision}, применена ${s.applied ?: "—"}", s.reason
++        ).joinToString("\n")
++        day.text = String.format(Locale.ROOT, "День бюджета %s\nСброс в %02d:00 · %s", s.day, s.reset, s.zone.id)
++        start.visibility = if (s.tunnel) View.GONE else View.VISIBLE
++        battery.visibility = if (s.exempt) View.GONE else View.VISIBLE
++    }
++
++    private fun renderRows() {
++        val s = state
++        val sites = s?.sites.orEmpty()
++        for (id in rows.keys.toList()) if (!sites.containsKey(id)) groups.removeView(rows.remove(id)!!.container)
++        empty.text = if (s != null && sites.isEmpty()) "Групп пока нет. Правила можно импортировать с компьютера по USB." else ""
++        empty.visibility = if (empty.text.isEmpty()) View.GONE else View.VISIBLE
++        if (s == null) return
++        val elapsed = SystemClock.elapsedRealtime()
++        for ((id, site) in sites) {
++            val row = rows.getOrPut(id) { Row(id).also { groups.addView(it.container) } }
++            val end = site.end
++            val actualReserve = if (end == null) 0 else ((end - elapsed).coerceAtLeast(0) / 1000)
++                .toInt().coerceAtMost(site.reserved)
++            val remaining = (site.remaining - site.reserved + actualReserve).coerceAtLeast(0)
++            row.balance.text = when {
++                !site.limited -> "Постоянный запрет"
++                end == null -> "Остаток ${duration(remaining)} из ${site.budgetMin} мин · отрезок закрыт"
++                else -> {
++                    val endTime = Instant.ofEpochMilli(s.endWall(end)).atZone(s.zone).format(DateTimeFormatter.ofPattern("HH:mm:ss"))
++                    "Остаток ${duration(remaining)}, в отрезке ${duration(actualReserve)} · конец в $endTime"
++                }
++            }
++            row.action.visibility = if (site.limited) View.VISIBLE else View.GONE
++            row.action.text = if (end == null) "Открыть отрезок" else "Закрыть отрезок"
++            row.action.isEnabled = !mutation && (end != null || (remaining > 0 && s.state == "active"))
++        }
++    }
++
++    private fun duration(seconds: Int) = String.format(Locale.ROOT, "%d:%02d", seconds / 60, seconds % 60)
++
++    private fun choose(id: String) {
++        val s = state ?: return
++        val site = s.sites[id] ?: return
++        if (!site.limited || mutation) return
++        if (site.end != null) {
++            submit(DailyCommands.session(id, s.revision, open = false))
++            return
++        }
++        val input = EditText(this).apply {
++            inputType = InputType.TYPE_CLASS_NUMBER
++            hint = "По умолчанию ${s.defaultMin} мин"
++            contentDescription = "Длительность в минутах"
++            isSingleLine = true
++        }
++        val dialog = AlertDialog.Builder(this).setTitle("Отрезок для $id").setView(input)
++            .setPositiveButton("Открыть", null).setNegativeButton(android.R.string.cancel, null).create()
++        dialog.setOnShowListener {
++            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
++                val typed = input.text.toString().trim()
++                val min = typed.toIntOrNull()
++                if (typed.isNotEmpty() && (min == null || min !in 1..1440)) {
++                    input.error = "Введите от 1 до 1440 минут"; return@setOnClickListener
++                }
++                dialog.dismiss()
++                submit(DailyCommands.session(id, s.revision, open = true, minutes = min))
++            }
++        }
++        dialog.show()
++    }
++
++    private fun submit(request: RpcRequest) {
++        if (mutation) return
++        mutation = true
++        generation++
++        renderRows()
++        message.text = ""
++        scope.launch {
++            try {
++                val reply = withContext(Dispatchers.IO) { execute(request) }
++                if (!reply.ok) {
++                    val err = reply.json.getAsJsonObject("error")
++                    message.text = "${err["code"].asString} · ${err["message"].asString}"
++                }
++            } finally { mutation = false; generation++; renderRows() }
++            refresh()
++        }
++    }
++
++    private fun launchSystem(intent: Intent) {
++        try { startActivity(intent) } catch (_: RuntimeException) {
++            message.text = "Экран недоступен. Откройте настройки системы."
++        }
++    }
++
++    private fun prepareVpn() {
++        try {
++            val consent = VpnService.prepare(this)
++            if (consent == null) VpnController.start(this)
++            else @Suppress("DEPRECATION") startActivityForResult(consent, CONSENT)
++        } catch (_: IllegalStateException) { message.text = "Проверьте выбранный VPN в настройках системы." }
++    }
++
++    @Deprecated("System VPN consent result")
++    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
++        super.onActivityResult(requestCode, resultCode, data)
++        if (requestCode != CONSENT) return
++        if (resultCode == RESULT_OK) VpnController.start(this)
++        else message.text = "Разрешение VPN не получено."
++    }
++
++    private companion object { const val CONSENT = 1; const val NOTICE = 2 }
++}
 diff --git a/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProvider.kt b/app/src/stopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProvider.kt
 new file mode 100644
 index 0000000..0fd7170
@@ -2546,23 +3075,21 @@ index 0000000..0fd7170
 +}
 diff --git a/app/src/stopscrollRelease/keepRules/stopscroll.keep b/app/src/stopscrollRelease/keepRules/stopscroll.keep
 new file mode 100644
-index 0000000..5f21215
+index 0000000..d76e04b
 --- /dev/null
 +++ b/app/src/stopscrollRelease/keepRules/stopscroll.keep
 @@ -0,0 +1,2 @@
 +-keep class com.celzero.bravedns.stopscroll.UsbControlProvider { *; }
-+-keep class com.celzero.bravedns.stopscroll.G0VpnActivity { *; }
++-keep class com.celzero.bravedns.stopscroll.StopscrollActivity { *; }
 diff --git a/app/src/stopscrollRelease/res/values/stopscroll.xml b/app/src/stopscrollRelease/res/values/stopscroll.xml
 new file mode 100644
-index 0000000..bb28ea8
+index 0000000..2b348ea
 --- /dev/null
 +++ b/app/src/stopscrollRelease/res/values/stopscroll.xml
-@@ -0,0 +1,6 @@
+@@ -0,0 +1,4 @@
 +<resources>
 +    <string name="app_name" translatable="false">Stopscroll</string>
 +    <string name="app_name_small_case" translatable="false">stopscroll</string>
-+    <string name="stopscroll_g0_title" translatable="false">Start Stopscroll VPN</string>
-+    <string name="stopscroll_g0_resolver" translatable="false">Stopscroll G0 test build based on RethinkDNS and Firestack.\n\nDNS over HTTPS: %1$s</string>
 +</resources>
 diff --git a/app/src/test/java/com/celzero/bravedns/service/BraveVPNServiceLifecycleTest.kt b/app/src/test/java/com/celzero/bravedns/service/BraveVPNServiceLifecycleTest.kt
 index 9090842..3cc95ec 100644
@@ -3808,6 +4335,254 @@ index a5cd01e..3ed77f1 100644
 
          assertTrue(opts.tidcsv.contains(Backend.BlockAll))
          assertFalse(opts.noblock)
+diff --git a/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/DailyLifecycleTest.kt b/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/DailyLifecycleTest.kt
+new file mode 100644
+index 0000000..6ed447f
+--- /dev/null
++++ b/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/DailyLifecycleTest.kt
+@@ -0,0 +1,130 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import android.app.Application
++import android.app.Notification
++import android.content.Intent
++import android.os.SystemClock
++import com.celzero.bravedns.util.Utilities
++import java.io.File
++import java.time.ZoneId
++import org.junit.Assert.*
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++import org.robolectric.Shadows.shadowOf
++import org.robolectric.annotation.Config
++
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [33], manifest = Config.NONE, application = Application::class)
++class DailyLifecycleTest {
++    @get:Rule val folder = TemporaryFolder()
++    private val journal get() = File(folder.root, "stopscroll/state.json")
++    private var clock = ClockSample(1783850400000, 7000, 12)
++    private val zone = ZoneId.of("Europe/Belgrade")
++
++    /** Each instance owns a different native target, timers, controller and file handle. Only the
++     * journal file, simulated OS clock and platform permission survive process replacement. */
++    private inner class Process {
++        val target = TestTunnel()
++        val alarms = TestTimers()
++        var warningAttempts = 0
++        val timers = object : SessionTimers by alarms {
++            override fun warn(site: String) { warningAttempts++; throw SecurityException("POST_NOTIFICATIONS denied") }
++        }
++        val engine = EngineAdapter({ clock }, timers)
++        val client = DailyController(StopscrollController(StateStore(journal),
++            { JournalState.initial(zone, clock, examplePolicy()) }, { clock }, engine, timers,
++            { PlatformProtection(false, true, true, true) }))
++        init { engine.onDue = client::reconcile }
++        fun bindAlwaysOn() {
++            engine.register(target.owner)
++            engine.attach(target)
++            engine.installPreferred(target) {}
++            client.reconcile()
++        }
++        fun status() = DailyStatus.from(client.execute(DailyCommands.status()))
++    }
++
++    private fun advance(seconds: Long) {
++        clock = clock.copy(wallMs = clock.wallMs + seconds * 1000, elapsedMs = clock.elapsedMs + seconds * 1000)
++    }
++
++    @Test fun sameBootRestartRestoresOriginalDeadlineOnlyAfterNewProtectedServiceBinds() {
++        val first = Process()
++        first.bindAlwaysOn()
++        assertTrue(first.client.execute(DailyCommands.session("video", 0, true, 5)).ok)
++        val end = first.client.ending.value!!
++        advance(81)
++        val next = Process()
++        next.client.reconcile()
++        val before = next.status()
++        assertEquals("stopped", before.state)
++        assertNull(before.applied)
++        assertEquals(zone, before.zone)
++        assertEquals(219, before.sites.getValue("video").reserved)
++        next.bindAlwaysOn()
++        assertEquals("active", next.status().state)
++        assertEquals(end, next.client.ending.value)
++        assertEquals(end.elapsedMs, next.status().sites.getValue("video").end)
++        assertFalse(next.engine.receipt(next.target)!!.snapshot.blocks("video.example.org", clock))
++        assertTrue(next.client.execute(DailyCommands.session("video", 1, false)).ok)
++        assertNull(next.client.ending.value)
++    }
++
++    @Test fun firstUnlockedProcessAfterRebootChargesFullReserveAndPublishesClosedRules() {
++        val old = Process()
++        old.bindAlwaysOn()
++        assertTrue(old.client.execute(DailyCommands.session("video", 0, true, 5)).ok)
++        clock = clock.copy(wallMs = clock.wallMs + 90_000, bootCount = 13, elapsedMs = 4000)
++        val unlocked = Process()
++        unlocked.client.reconcile()
++        assertNull(unlocked.client.ending.value)
++        val closed = unlocked.status()
++        assertEquals("stopped", closed.state)
++        assertEquals(zone, closed.zone)
++        assertEquals(0, closed.sites.getValue("video").reserved)
++        assertEquals(45 * 60 - 300, closed.sites.getValue("video").remaining)
++        unlocked.bindAlwaysOn()
++        assertEquals("active", unlocked.status().state)
++        assertTrue(unlocked.engine.receipt(unlocked.target)!!.snapshot.blocks("video.example.org", clock))
++    }
++
++    @Test fun deniedWarningStillSweepsAtDeadlineWithoutActivityOrStatus() {
++        val p = Process()
++        p.bindAlwaysOn()
++        assertTrue(p.client.execute(DailyCommands.session("video", 0, true, 3)).ok)
++        advance(60)
++        p.client.reconcile()
++        assertEquals(1, p.warningAttempts)
++        val sweeps = p.target.sweeps
++        val alarm = p.alarms.cutoff!!
++        advance(120)
++        alarm()
++        assertTrue(p.target.sweeps > sweeps)
++        assertNull(p.client.ending.value)
++        assertTrue(p.engine.receipt(p.target)!!.snapshot.blocks("video.example.org", clock))
++        assertNull(StateStore(journal).read().accounts.getValue("video").session)
++    }
++
++    @Test fun notificationAndInternalConfigureIntentsOpenDailyScreenWithoutSettingsActions() {
++        val context = RuntimeEnvironment.getApplication()
++        val n = StopscrollNotifications.service(context, "test", SessionEnd(SystemClock.elapsedRealtime() + 60000, zone))
++        assertTrue(n.extras.getCharSequence(Notification.EXTRA_TEXT).toString().contains("конец"))
++        assertTrue(n.actions.isNullOrEmpty())
++        val oldSettings = Intent().setClassName(context.packageName, "com.celzero.bravedns.ui.activity.AppLockActivity")
++        val routed = Utilities.getActivityPendingIntent(context, oldSettings, 0, false)
++        listOf(n.contentIntent, routed).forEach {
++            assertTrue(it.isImmutable)
++            val dest = shadowOf(it).savedIntent
++            assertEquals(StopscrollActivity::class.java.name, dest.component!!.className)
++            assertEquals(context.packageName, dest.component!!.packageName)
++            assertNull(dest.extras)
++        }
++        val empty = StopscrollNotifications.service(context, "test", null)
++        assertFalse(empty.extras.getCharSequence(Notification.EXTRA_TEXT).toString().contains("конец"))
++    }
++}
+diff --git a/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/DailyScreenTest.kt b/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/DailyScreenTest.kt
+new file mode 100644
+index 0000000..20817f4
+--- /dev/null
++++ b/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/DailyScreenTest.kt
+@@ -0,0 +1,46 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import com.google.gson.JsonObject
++import org.junit.Assert.*
++import org.junit.Test
++
++class DailyScreenTest {
++    @Test fun schemaStatusUsesItsOwnClockTimezoneAndActualReserve() {
++        val data = strictJson("""
++            {"policy_hash":"abc","timezone":"Europe/Belgrade","day_id":"2026-11-18","reset_hour":4,
++            "default_session_min":15,"clock":{"wall_ms":1795003200000,"elapsed_ms":20000,"boot_count":42},
++            "protection":{"state":"degraded","tunnel":true,"always_on":true,"lockdown":true,
++            "ignoring_battery_optimizations":false,"preferred_state":"ready","reason":"VPN protection is incomplete"},
++            "sites":{"video":{"mode":"limited","budget_min":45,"remaining_sec":2580,"reserved_sec":480,
++            "session":{"start_elapsed_ms":0,"deadline_elapsed_ms":500000}},"news":{"mode":"blocked",
++            "budget_min":0,"remaining_sec":0,"reserved_sec":0,"session":null}}}
++        """).obj()
++        val reply = RpcReply(JsonObject().apply {
++            addProperty("ok",true); addProperty("revision",7); addProperty("applied_revision",null as Number?)
++            add("data",data)
++        })
++        val daily = DailyStatus.from(reply)
++        assertEquals("degraded", daily.state)
++        assertEquals("Europe/Belgrade", daily.zone.id)
++        assertNull(daily.applied)
++        assertEquals(2580, daily.sites.getValue("video").remaining)
++        assertEquals(480, daily.sites.getValue("video").reserved)
++        assertEquals(1795003680000L, daily.endWall(daily.sites.getValue("video").end!!))
++        assertFalse(daily.sites.getValue("news").limited)
++        assertFalse(daily.exempt)
++    }
++
++    @Test fun touchesUseDisplayedRevisionFreshUuidAndExactFiveOperationProtocol() {
++        val open = DailyCommands.session("video", 9L, open = true)
++        assertEquals("session.open", open.op)
++        assertEquals(9L, open.expectedRevision)
++        assertTrue(open.args["minutes"].isJsonNull)
++        val selected = DailyCommands.session("video", 9L, open = true, minutes = 7)
++        assertEquals(7, selected.args["minutes"].asInt)
++        val close = DailyCommands.session("video", 10L, open = false)
++        assertEquals("session.close", close.op)
++        assertEquals(setOf("site"), close.args.keySet())
++        assertEquals(3, setOf(open.requestId, selected.requestId, close.requestId).size)
++    }
++}
+diff --git a/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/DailyStartupTest.kt b/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/DailyStartupTest.kt
+new file mode 100644
+index 0000000..5317729
+--- /dev/null
++++ b/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/DailyStartupTest.kt
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import android.app.Application
++import android.content.Intent
++import androidx.work.ListenableWorker
++import androidx.work.testing.TestListenableWorkerBuilder
++import com.celzero.bravedns.receiver.BraveAutoStartReceiver
++import com.celzero.bravedns.scheduler.BootStartWorker
++import com.celzero.bravedns.service.PersistentState
++import com.celzero.bravedns.service.VpnController
++import io.mockk.*
++import kotlinx.coroutines.runBlocking
++import org.junit.Assert.assertEquals
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.koin.core.context.startKoin
++import org.koin.core.context.stopKoin
++import org.koin.dsl.module
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++import org.robolectric.annotation.Config
++
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [33], manifest = Config.NONE, application = Application::class)
++class DailyStartupTest {
++    @Test fun bootAndUnlockEnqueueRecoveryAndAlwaysOnDefersServiceStartToTheOs() {
++        val app = RuntimeEnvironment.getApplication()
++        val prefs = mockk<PersistentState>(relaxed = true)
++        startKoin { modules(module { single { prefs } }) }
++        mockkObject(BootStartWorker.Companion, VpnController)
++        try {
++            every { prefs.prefAutoStartBootUp } returns true
++            every { BootStartWorker.enqueue(any(), any()) } just Runs
++            val receiver = BraveAutoStartReceiver()
++            receiver.onReceive(app, Intent(Intent.ACTION_BOOT_COMPLETED))
++            receiver.onReceive(app, Intent(Intent.ACTION_USER_UNLOCKED))
++            receiver.onReceive(app, Intent(Intent.ACTION_LOCKED_BOOT_COMPLETED))
++            verify(exactly = 1) { BootStartWorker.enqueue(app, BootStartWorker.BOOT_COMPLETE_EVENT) }
++            verify(exactly = 1) { BootStartWorker.enqueue(app, BootStartWorker.USER_UNLOCKED_EVENT) }
++            confirmVerified(BootStartWorker.Companion)
++
++            every { VpnController.state() } returns mockk { every { activationRequested } returns true }
++            every { VpnController.isAlwaysOn(app) } returns true
++            val worker = TestListenableWorkerBuilder<BootStartWorker>(app).build()
++            assertEquals(ListenableWorker.Result.success(), runBlocking { worker.doWork() })
++            verify(exactly = 1) { VpnController.isAlwaysOn(app) }
++            verify(exactly = 0) { VpnController.start(any(), any()) }
++        } finally {
++            unmockkObject(BootStartWorker.Companion, VpnController)
++            stopKoin()
++        }
++    }
++}
 diff --git a/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/RpcCodecTest.kt b/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/RpcCodecTest.kt
 new file mode 100644
 index 0000000..ebec488
@@ -4075,6 +4850,132 @@ index 0000000..ebec488
 +            mutate(invalid)
 +            assertThrows(PolicyException::class.java) { RpcCodec.encodeReply(id, invalid) }
 +        }
++    }
++}
+diff --git a/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/StopscrollActivityTest.kt b/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/StopscrollActivityTest.kt
+new file mode 100644
+index 0000000..ed4b364
+--- /dev/null
++++ b/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/StopscrollActivityTest.kt
+@@ -0,0 +1,120 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.celzero.bravedns.stopscroll
++
++import android.app.Application
++import android.content.Intent
++import android.os.Looper
++import android.os.SystemClock
++import android.provider.Settings
++import android.view.View
++import android.view.ViewGroup
++import android.widget.Button
++import android.widget.EditText
++import android.widget.TextView
++import java.io.File
++import java.time.Duration
++import java.time.ZoneId
++import java.util.concurrent.ConcurrentLinkedQueue
++import java.util.concurrent.TimeUnit
++import org.junit.Assert.*
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++import org.junit.runner.RunWith
++import org.robolectric.Robolectric
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.Shadows.shadowOf
++import org.robolectric.annotation.Config
++import org.robolectric.shadows.ShadowAlertDialog
++
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [33], manifest = Config.NONE, application = Application::class)
++class StopscrollActivityTest {
++    @get:Rule val folder = TemporaryFolder()
++    private fun descendants(view: View): Sequence<View> = sequence {
++        yield(view)
++        if (view is ViewGroup) for (i in 0 until view.childCount) yieldAll(descendants(view.getChildAt(i)))
++    }
++    private fun waitFor(predicate: () -> Boolean) {
++        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
++        while (true) {
++            shadowOf(Looper.getMainLooper()).idle()
++            if (predicate()) return
++            assertTrue("UI did not publish state", System.nanoTime() < deadline)
++            Thread.sleep(5)
++        }
++    }
++
++    @Test fun visibleScreenTracksUsbEditsAndTapsUseTheDisplayedRevisionOffMain() {
++        val zone = ZoneId.of("Europe/Belgrade")
++        val clock = { ClockSample(1783850400000L + SystemClock.elapsedRealtime(), SystemClock.elapsedRealtime(), 12) }
++        val timers = TestTimers()
++        val target = TestTunnel()
++        val engine = EngineAdapter(clock, timers)
++        engine.register(target.owner)
++        engine.attach(target)
++        engine.installPreferred(target) {}
++        val core = DailyController(StopscrollController(StateStore(File(folder.root, "s/state.json")),
++            { JournalState.initial(zone, clock(), examplePolicy()) }, clock, engine, timers, { target.platform() }))
++        val requests = ConcurrentLinkedQueue<RpcRequest>()
++        val launch = Intent().putExtra("op", "session.open").putExtra("site", "video")
++        val activity = Robolectric.buildActivity(StopscrollActivity::class.java, launch)
++        val screen = activity.get()
++        screen.execute = { request ->
++            check(Looper.myLooper() != Looper.getMainLooper())
++            requests.add(request)
++            core.execute(request)
++        }
++        activity.create().start().resume()
++        val contents = screen.findViewById<View>(android.R.id.content)
++        fun button(label: String) = descendants(contents).filterIsInstance<Button>()
++            .firstOrNull { it.visibility == View.VISIBLE && it.text.toString() == label }
++        fun contains(text: String) = descendants(contents).filterIsInstance<TextView>().any { text in it.text.toString() }
++        try {
++            waitFor { button("Открыть отрезок")?.isEnabled == true }
++            assertTrue(contains("Защита активна"))
++            assertTrue(contains("04:00 · Europe/Belgrade"))
++            assertTrue(requests.all { it.op == "status" })
++
++            // A USB edit while the chooser is open cannot silently change its expected revision.
++            button("Открыть отрезок")!!.performClick()
++            shadowOf(Looper.getMainLooper()).idle()
++            val chooser = ShadowAlertDialog.getLatestAlertDialog()
++            assertTrue(core.execute(DailyCommands.session("video", 0, true, 5)).ok)
++            chooser.getButton(android.app.AlertDialog.BUTTON_POSITIVE).performClick()
++            waitFor { contains("CONFLICT") && button("Закрыть отрезок")?.isEnabled == true }
++            assertEquals(0L, requests.first { it.op == "session.open" }.expectedRevision)
++            button("Закрыть отрезок")!!.performClick()
++            waitFor { button("Открыть отрезок")?.isEnabled == true && contains("применена 2") }
++            assertEquals(1L, requests.first { it.op == "session.close" }.expectedRevision)
++
++            button("Открыть отрезок")!!.performClick()
++            shadowOf(Looper.getMainLooper()).idle()
++            val selected = ShadowAlertDialog.getLatestAlertDialog()
++            descendants(selected.window!!.decorView).filterIsInstance<EditText>().single().setText("3")
++            selected.getButton(android.app.AlertDialog.BUTTON_POSITIVE).performClick()
++            waitFor { button("Закрыть отрезок")?.isEnabled == true && contains("применена 3") }
++            val submitted = requests.filter { it.op == "session.open" }
++            assertEquals(3, submitted.last().args["minutes"].asInt)
++            assertNotEquals(submitted.first().requestId, submitted.last().requestId)
++
++            // The visible activity learns the remote close without a new tap or resuming.
++            assertTrue(core.execute(DailyCommands.session("video", 3, false)).ok)
++            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(6))
++            waitFor { contains("применена 4") && button("Открыть отрезок") != null }
++        } finally { activity.pause().stop().destroy() }
++    }
++
++    @Test fun setupLinksUseSystemVpnSettingsAndOnlyThisPackagesBatteryExemption() {
++        val activity = Robolectric.buildActivity(StopscrollActivity::class.java).create()
++        val screen = activity.get()
++        val buttons = descendants(screen.findViewById(android.R.id.content)).filterIsInstance<Button>().toList()
++        buttons.single { it.text == "Постоянный VPN и блокировка без VPN" }.performClick()
++        assertEquals(Settings.ACTION_VPN_SETTINGS, shadowOf(screen).nextStartedActivity.action)
++        buttons.single { it.text == "Исключить Stopscroll из оптимизации батареи" }.performClick()
++        val battery = shadowOf(screen).nextStartedActivity
++        assertEquals(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, battery.action)
++        assertEquals("package:${screen.packageName}", battery.dataString)
++        activity.destroy()
 +    }
 +}
 diff --git a/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProviderTest.kt b/app/src/testStopscrollRelease/java/com/celzero/bravedns/stopscroll/UsbControlProviderTest.kt
