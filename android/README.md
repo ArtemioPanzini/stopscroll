@@ -5,11 +5,24 @@ limits. The phone has its own budgets, timezone and 04:00 reset. Once configured
 use the Stopscroll screen to open and close sessions. Elapsed time in a session
 counts while the phone sleeps. USB is only needed for manual administration.
 
-The G0 prototype was tested on Android 13 with Wi-Fi IPv4. A separate app and
-Chrome confirmed that the VPN blocked fresh requests, cut existing flows and
-kept working in Doze. The daily-limit release still needs device acceptance,
-including a signed upgrade, reboot, Doze and operation with the cable unplugged.
-Mobile data, roaming and IPv6 are outside the verified scope.
+Release `30000071` was installed and manually tested on Android 13 with Wi-Fi
+IPv4. A separate app confirmed allowed HTTPS, scoped exceptions, denial of
+provider access, TCP/UDP closure, early-close refunds, and replay without a second
+reservation or refund. Minute deadlines cut native traffic 17 ms after the due
+time while awake, 42 ms in forced Doze, and 11 ms with Wi-Fi disabled. These are
+measurements from this device, rather than latency guarantees for other phones.
+The Doze sample was taken after the deadline without intervening ADB commands;
+notification permission was denied. With the cable unplugged, the owner also
+confirmed that X and YouTube were blocked while an ordinary website loaded.
+Wi-Fi recovery, an upgrade with an active
+session, reboot accounting, and concurrent phone-screen/USB changes passed.
+Chrome HTTP/3 requests received fresh responses while a session was open and
+received no HTTP responses after close, immediately and on a later attempt,
+without clearing browser data or bypassing service workers.
+
+Mobile data, roaming and real IPv6 remain outside the verified scope. The 04:00
+rollover and DST cases have host-test coverage; the physical run did not change
+the phone clock or wait through those transitions.
 
 ## Build from source
 
@@ -153,6 +166,35 @@ needs separate-app network tests. For a Doze deadline test, compare the
 elapsed-time trigger and native cutoff with the deadline while leaving the
 phone asleep through the deadline. A status request after the phone wakes
 can't establish when the existing flows were cut.
+
+## Manual device acceptance
+
+These commands run only when explicitly invoked. They do not install an app,
+watch USB connections, or synchronize policies in the background. Build and
+install the release and the separate test-only [probe](tests/probe/) first.
+Enable the setup protections above and close existing sessions before running a
+case. The helper verifies the installed APK against the local release receipt.
+Its Wi-Fi profile requires mobile data and roaming to remain disabled.
+
+```sh
+python3 android/tests/device_acceptance.py basic
+python3 android/tests/device_acceptance.py tcp
+python3 android/tests/device_acceptance.py udp
+python3 android/tests/device_acceptance.py deadline
+python3 android/tests/device_acceptance.py doze
+python3 android/tests/device_acceptance.py wifi
+```
+
+The network cases temporarily add an isolated test group for an external fixture.
+They remove their own group using a revision check, preserve configuration and
+spent budgets, and stop for manual inspection if a mutation or cleanup cannot be
+confirmed. Doze temporarily sleeps the screen and simulates an unplugged battery;
+Wi-Fi temporarily disables Wi-Fi. Keep the cable attached until cleanup finishes.
+Private mode-0600 reports default to the Stopscroll configuration directory;
+`--report` must name a new file outside Git worktrees. Do not publish real device
+reports or policy exports. `basic` and `tcp` passed through this public runner on
+the target phone; the other physical scenarios were measured with a private
+manual harness against the same signed APK.
 
 ## Android host tests
 
