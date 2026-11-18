@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock
 from stopscroll.daemon import Daemon, bootstrap
 from stopscroll.engine import Engine
+from stopscroll.model import Pending, Session
 from stopscroll.seed import initial_state
 from stopscroll import store
 
@@ -40,6 +41,37 @@ class DaemonTests(unittest.TestCase):
         self.assertFalse(self.d.handle({'cmd':'status'},99999,T)['ok'])
         self.assertTrue(self.d.handle({'cmd':'status'},0,T)['ok'])
         self.assertEqual(self.call(cmd='status')['status']['delay_min'],45)
+    def test_export_sites_is_authenticated_and_read_only(self):
+        self.state.owner_uid = 1001
+        self.state.spent_sec['youtube'] = 120
+        self.state.bonus_min['youtube'] = 4
+        self.state.sessions['youtube'] = Session(T, T + 120)
+        self.state.pending.append(Pending(1, {'kind': 'remove_site', 'site': 'youtube'}, 30, 'queued'))
+        self.state.telegram_channels['example'] = []
+        before = self.state.to_dict()
+        request = {'cmd': 'export-sites'}
+
+        self.assertEqual(self.d.handle(request, 1002, T), {'ok': False, 'error': 'нет доступа'})
+        owner = self.d.handle(request, 1001, T)
+        self.assertEqual(owner, self.d.handle(request, 0, T))
+        self.assertEqual(set(owner), {'ok', 'policy'})
+        self.assertTrue(owner['ok'])
+        policy = owner['policy']
+        self.assertEqual(set(policy), {'schema', 'reset_hour', 'default_session_min', 'sites'})
+        self.assertEqual(policy['sites'], before['sites'])
+        policy['sites']['youtube']['domains'].clear()
+        self.assertEqual(self.state.to_dict(), before)
+        self.save.assert_not_called()
+        self.assertEqual(self.system.mock_calls, [])
+    def test_export_sites_preserves_legacy_values_for_import_validation(self):
+        self.state.sites['youtube'].domains.append('https://www.example.org/path')
+        before = self.state.to_dict()
+        reply = self.call(cmd='export-sites')
+        self.assertTrue(reply['ok'])
+        self.assertEqual(reply['policy']['sites'], before['sites'])
+        self.assertEqual(self.state.to_dict(), before)
+        self.save.assert_not_called()
+        self.assertEqual(self.system.mock_calls, [])
     def test_open_close(self):
         self.assertTrue(self.call(cmd='open',site='youtube',minutes=10)['ok'])
         self.save.assert_called_once(); self.system.sync.assert_called_once()
@@ -87,10 +119,14 @@ class SocketTests(unittest.IsolatedAsyncioTestCase):
                     if Path(path).exists(): break
                     await asyncio.sleep(.01)
                 self.assertEqual(Path(path).stat().st_mode & 0o777,0o666)
-                for line,ok in [(b'{oops\n',False),(b'{"cmd":"status"}\n',True)]:
+                for line,ok in [(b'{oops\n',False),(b'{"cmd":"status"}\n',True),
+                                (b'{"cmd":"export-sites"}\n',True)]:
                     reader,writer=await asyncio.open_unix_connection(path)
                     writer.write(line); await writer.drain()
-                    self.assertEqual(json.loads(await reader.readline())['ok'],ok)
+                    reply = json.loads(await reader.readline())
+                    self.assertEqual(reply['ok'],ok)
+                    if b'export-sites' in line:
+                        self.assertEqual(reply['policy'], state.export_sites())
                     writer.close(); await writer.wait_closed()
                 reader,writer=await asyncio.open_unix_connection(path)
                 writer.write(b'{"cmd":"subscribe"}\n'); await writer.drain()
@@ -104,7 +140,7 @@ class SocketTests(unittest.IsolatedAsyncioTestCase):
                 state.owner_uid=99999
                 if os.getuid()!=0:
                     reader,writer=await asyncio.open_unix_connection(path)
-                    writer.write(b'{"cmd":"status"}\n'); await writer.drain()
+                    writer.write(b'{"cmd":"export-sites"}\n'); await writer.drain()
                     self.assertEqual(json.loads(await reader.readline())['error'],'нет доступа')
                     writer.close(); await writer.wait_closed()
             finally:

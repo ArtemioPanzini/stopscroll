@@ -101,6 +101,10 @@ class Daemon:
             if cmd == 'status':
                 result['status'] = self.engine.status(now)
                 result['status']['telegram_policy_pending'] = self._telegram_dirty
+            elif cmd == 'export-sites':
+                if set(req) != {'cmd'}:
+                    raise ValueError('Некорректная команда экспорта сайтов')
+                result['policy'] = self.engine.state.export_sites()
             elif cmd == 'doctor':
                 result['checks'] = self.doctor()
             elif cmd in ('open', 'close'):

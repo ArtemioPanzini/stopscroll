@@ -64,6 +64,23 @@ class State:
     def to_dict(self) -> dict:
         return asdict(self)
 
+    def export_sites(self) -> dict:
+        """Copy the site configuration without desktop runtime or enforcement state."""
+        return {
+            'schema': 1,
+            'reset_hour': self.reset_hour,
+            'default_session_min': self.default_session_min,
+            'sites': {
+                name: {
+                    'mode': site.mode,
+                    'budget_min': site.budget_min,
+                    'domains': site.domains.copy(),
+                    'exceptions': site.exceptions.copy(),
+                }
+                for name, site in self.sites.items()
+            },
+        }
+
     @classmethod
     def from_dict(cls, d: dict) -> 'State':
         # The recovery journal was added to v1; old installed states remain valid.
